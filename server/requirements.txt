@@ -1,0 +1,30 @@
+# Flux 后端依赖（固定快照）
+#
+# 快照日期：2026-09-30
+# 说明：以下版本号为本机由 pip 于上述日期从 PyPI 解析并通过实测（pytest 全绿 + uvicorn 启动探活 + alembic upgrade head）
+#      的版本，不是"最新版"声明。升级前请重新跑一遍 scripts/verify.sh。
+
+# --- 运行时 ---
+fastapi==0.142.0
+uvicorn[standard]==0.54.0
+pydantic==2.13.5
+pydantic-settings==2.15.0
+SQLAlchemy==2.0.54
+alembic==1.20.0
+asyncpg==0.31.0
+redis==8.1.0
+# 模型供应商适配器用手写 httpx 调用上游 HTTP API（不用官方 SDK），故列为运行时依赖
+httpx==0.28.1
+# 官方 Python SDK，自带 runtime 可执行，不需要系统 Node
+deepseek-harness-sdk==0.1.5rc1
+# DSH loader patch（YAML）生成：注入 MCP 客户端插件配置
+PyYAML==6.0.3
+# 上下文原文库的存储层压缩（FLUX_CONTEXT_MECHANISM §3.5），完全无损。
+# 缺失时 flux.core.context.store 自动退到标准库 lzma（同样无损），故不是硬依赖。
+zstandard>=0.23
+
+# --- 测试与开发 ---
+pytest==9.1.1
+pytest-asyncio==1.4.0
+aiosqlite==0.22.1
+ruff==0.16.9

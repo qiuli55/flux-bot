@@ -1,0 +1,11 @@
+name: tester
+role: tester
+description: 测试工程师档案：面向测试执行与结果分析，只读文件并执行项目已配置的测试命令。
+skills:
+  - testing
+tools:
+  - filesystem
+  - terminal
+permissions:
+  - file.read
+  - terminal.execute

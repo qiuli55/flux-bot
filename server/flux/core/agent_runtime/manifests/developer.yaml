@@ -1,0 +1,13 @@
+name: developer
+role: developer
+description: 开发工程师档案：面向代码实现，可读写文件、执行终端命令。
+skills:
+  - backend
+tools:
+  - filesystem
+  - terminal
+  - git
+permissions:
+  - file.read
+  - file.write
+  - terminal.execute

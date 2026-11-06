@@ -1,0 +1,9 @@
+name: reviewer
+role: reviewer
+description: 代码审查者档案：面向改动审查，只读项目文件。
+skills:
+  - code_review
+tools:
+  - filesystem
+permissions:
+  - file.read

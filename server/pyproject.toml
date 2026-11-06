@@ -1,0 +1,65 @@
+[project]
+name = "flux"
+version = "0.1.0"
+description = "Flux 后端（Agent Runtime / Task Engine / Model Gateway / Connector）"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.142",
+    "uvicorn[standard]>=0.54",
+    "pydantic>=2.13",
+    "pydantic-settings>=2.15",
+    "SQLAlchemy>=2.0.54",
+    "alembic>=1.20",
+    "asyncpg>=0.31",
+    "redis>=8.1",
+    # 模型供应商适配器手写 httpx 调用上游 HTTP API（不用官方 SDK），属运行时依赖
+    "httpx>=0.28",
+    # 官方 Python SDK，自带 runtime 可执行，不需要系统 Node（集成方案 §10）
+    "deepseek-harness-sdk==0.1.5rc1",
+    # Agent Manifest 使用 YAML 声明（主规格 §6.2）
+    "PyYAML>=6.0",
+    # 上下文原文库的存储层压缩（FLUX_CONTEXT_MECHANISM §3.5）：文本 3–8×、日志 10×+，
+    # 完全无损。装不上时 `flux.core.context.store` 自动退到标准库 lzma，功能不受影响。
+    "zstandard>=0.23",
+    # 读取用户 ~/.codex/config.toml 的 MCP 声明：3.11+ 用标准库 tomllib，3.10 需 tomli
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.1",
+    "pytest-asyncio>=1.4",
+    "aiosqlite>=0.22",
+    "ruff>=0.16",
+]
+
+[project.scripts]
+# Server CLI（NEXT_PHASE_OPTIMIZATION §9）：装包后可直接 `flux doctor`；
+# 未装包时等价入口为 `python -m flux.cli`。
+flux = "flux.cli.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["flux*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["B008"]  # FastAPI 的 Depends() 作为默认参数是框架约定
+
+[tool.ruff.lint.per-file-ignores]
+# 该文件内嵌 HTML/CSS/JS 单行字符串，拆行会改变渲染输出
+"flux/core/design_render.py" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+# 供应商适配器测试需要 async def 用例（httpx.AsyncClient + MockTransport）
+asyncio_mode = "auto"

@@ -1,0 +1,11 @@
+name: tech-lead
+role: tech_lead
+description: 技术负责人档案：面向需求拆解与方案设计，只读项目文件。
+skills:
+  - planning
+  - architecture
+tools:
+  - filesystem
+  - git
+permissions:
+  - file.read

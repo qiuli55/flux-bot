@@ -1,0 +1,24 @@
+# 运行期数据：Bot 定义、任务记录、记忆、DSH 会话
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# 配置与密钥
+.env
+*.local
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# 构建产物
+remote-artifacts/
+dist/
+build/

@@ -1,0 +1,18 @@
+services:
+  flux-bot:
+    build: .
+    image: flux-bot:latest
+    container_name: flux-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8600:8600"
+    volumes:
+      # Bot 定义、例程、任务记录、记忆、DSH 会话全部在这一个卷里
+      - ./data:/data
+    # 单机常驻服务：给 Bot 跑任务留出足够文件句柄
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
