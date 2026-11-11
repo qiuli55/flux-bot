@@ -84,7 +84,7 @@ class Bot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     #: 自动暂停的原因；用户手动恢复时清空
     paused_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    #: 每日 token 预算（按 UTC 自然日）。NULL 或 0 = 不限制；
+    #: 每日 token 预算（按 FLUX_TIMEZONE 的自然日）。NULL 或 0 = 不限制；
     #: 已用量不落库，直接从 usage_records 按当日聚合（账本是唯一权威，天然幂等）。
     token_budget: Mapped[int | None] = mapped_column(Integer, nullable=True)
     #: 失败时是否主动通知用户（写 bot_notifications）

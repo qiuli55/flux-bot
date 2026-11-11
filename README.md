@@ -26,6 +26,11 @@ docker compose up -d --build
 curl http://127.0.0.1:8600/api/v1/health
 ```
 
+### 定时与时区
+
+Bot 的 cron（`0 9 * * *`）和例程、每日 token 预算重置都按 `FLUX_TIMEZONE` 解释，默认 UTC。
+例如设置 `FLUX_TIMEZONE=Asia/Shanghai` 后，`0 9 * * *` 在本地 09:00 触发，预算也在本地零点重置。
+
 ### 鉴权与网络暴露
 
 **`FLUX_AUTH_TOKEN` 是必填项。** 没有它时 Bot 节点会 fail-closed：只接受本机回环直连

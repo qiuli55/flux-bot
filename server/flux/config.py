@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import re
 from functools import lru_cache
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # backend/flux/config.py -> backend/flux -> backend -> 仓库根
@@ -23,11 +26,47 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _fallback_timezone_from_tz(cls, data: object) -> object:
+        """FLUX_TIMEZONE 未提供时，沿用标准 `TZ` 环境变量（合法 IANA 名称）。"""
+        if not isinstance(data, dict):
+            return data
+        # pydantic-settings 会把显式 env / .env / 构造参数合并进 data；没有该键
+        # 就说明 FLUX_TIMEZONE 未设置（或与默认值相同而被剥离）。此时才看 TZ。
+        if "timezone" not in data and "FLUX_TIMEZONE" not in os.environ:
+            tz = (os.environ.get("TZ") or "").strip().removeprefix(":")
+            if tz:
+                try:
+                    ZoneInfo(tz)
+                except (ZoneInfoNotFoundError, ValueError):
+                    pass
+                else:
+                    data = {**data, "timezone": tz}
+        return data
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, value: str) -> str:
+        """启动即校验时区名；非法值给出明确指向 FLUX_TIMEZONE 的错误。"""
+        name = (value or "").strip() or "UTC"
+        try:
+            ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(
+                f"FLUX_TIMEZONE 不是合法的 IANA 时区名：{name!r}（例：Asia/Shanghai）"
+            ) from exc
+        return name
+
     # --- 应用 ---
     app_name: str = "Flux"
     env: str = "local"
     log_level: str = "INFO"
     api_v1_prefix: str = "/api/v1"
+    # Bot 的 cron 表达式与每日 token 预算重置都按这个 IANA 时区解释（如 Asia/Shanghai）。
+    # 未设置 FLUX_TIMEZONE 时会回退到标准环境变量 TZ（仅当其值是合法 IANA 名称）；
+    # 两者都没有则使用 UTC。非法名称会在启动加载配置时直接报错。
+    timezone: str = "UTC"
     # REST 面单用户令牌（公网暴露前置，见 flux.api.auth）。留空 = 关闭鉴权，
     # 本地开发与桌面端（同机直连）零配置可用；公网部署必须显式设置。
     auth_token: str | None = None

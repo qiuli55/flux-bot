@@ -16,6 +16,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo
 
 from flux.core.agent_runtime.runtimes.base import DEFAULT_RUNTIME
 from flux.core.bot.cron import CronSchedule, parse_cron
@@ -67,10 +68,12 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _day_start(value: datetime) -> datetime:
-    """UTC 自然日起点：预算窗口按天重置，不用额外落库。"""
+def _day_start(value: datetime, tz: ZoneInfo | None = None) -> datetime:
+    """配置时区的自然日起点（本地午夜转换成 UTC），预算窗口据此重置。"""
+    zone = tz or ZoneInfo("UTC")
     moment = _as_utc(value) or _utcnow()
-    return moment.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_local = moment.astimezone(zone).replace(hour=0, minute=0, second=0, microsecond=0)
+    return start_local.astimezone(timezone.utc)
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -110,6 +113,8 @@ class BotService:
         initial_delay_seconds: float = 5.0,
     ) -> None:
         self._container = container
+        # cron 与每日预算统一按配置时区解释；Settings 加载时已校验过 IANA 名称。
+        self._tz = ZoneInfo(container.settings.timezone)
         self._repo = BotRepository(container.session_factory)  # type: ignore[attr-defined]
         self._routines = BotRoutineRepository(container.session_factory)  # type: ignore[attr-defined]
         self._notifications = BotNotificationRepository(
@@ -136,8 +141,10 @@ class BotService:
         return await self._repo.get(bot_id)
 
     async def tokens_used_today(self, *, now: datetime | None = None) -> dict[uuid.UUID, int]:
-        """每个 Bot 今天（UTC 自然日）已用的 token；账本按 `tasks.bot_id` 归因。"""
-        return await self._container.billing.tokens_by_bot_since(_day_start(now or _utcnow()))
+        """每个 Bot 今天（配置时区的自然日）已用的 token；账本按 `tasks.bot_id` 归因。"""
+        return await self._container.billing.tokens_by_bot_since(
+            _day_start(now or _utcnow(), self._tz)
+        )
 
     # --- 配置 ---
 
@@ -756,7 +763,7 @@ class BotService:
         if not text:
             return None
         try:
-            return parse_cron(text)
+            return parse_cron(text, tz=self._tz)
         except ValueError as exc:
             raise BadRequestError(
                 f"schedule 不是合法的 cron：{exc}", details={"schedule": text}

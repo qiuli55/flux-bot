@@ -68,6 +68,8 @@ def _bot_dict(container: Container, bot: Bot, *, tokens_used: int = 0) -> dict[s
     data["workspace_path"] = str(container.bots.workspace_path(bot))
     # 每日预算的实时用量：账本是唯一权威，按需聚合，不额外落库
     data["tokens_used_today"] = tokens_used
+    # cron 与预算窗口按这个时区解释，前端展示 next_run_at 时不用再猜。
+    data["timezone"] = container.settings.timezone
     return data
 
 

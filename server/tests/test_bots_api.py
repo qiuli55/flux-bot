@@ -53,6 +53,7 @@ _BOT_KEYS = {
     "paused_reason",
     "token_budget",
     "tokens_used_today",
+    "timezone",
     "notify_on_failure",
     "event_triggers",
     "allowed_tools",

@@ -4,12 +4,17 @@ Bot 的定时是「常驻进程按 next_run_at 取到期任务」，只需要两
 校验表达式合法、算出下一次触发时间。语义按 Vixie cron：
 `*`、`a`、`a-b`、`*/n`、`a-b/n`、逗号列表；周几 0/7 都是周日；
 「日」与「周」都受限时取并集（任一命中即触发）。
+
+时区：cron 字段按配置的 IANA 时区（默认 UTC）的「本地墙钟」解释，结果统一
+返回 aware UTC datetime。DST 切换按墙钟语义处理：春季不存在的本地时间跳过，
+秋季重复的本地时间只按 fold=0 触发一次。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone, tzinfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 __all__ = ["CronSchedule", "parse_cron"]
 
@@ -24,6 +29,21 @@ _FIELDS = (
 
 #: 最多向后找 8 年：覆盖 2 月 29 日这类闰年表达式
 _MAX_DAYS = 366 * 8
+
+_UTC = timezone.utc
+
+
+def _coerce_tz(value: str | tzinfo | None) -> tzinfo:
+    """把时区名（或 tzinfo）规范成可用于 datetime 的 tzinfo。"""
+    if value is None:
+        return _UTC
+    if isinstance(value, str):
+        name = value.strip() or "UTC"
+        try:
+            return ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"未知时区：{name!r}") from exc
+    return value
 
 
 def _parse_field(spec: str, *, name: str, lo: int, hi: int) -> tuple[set[int], bool]:
@@ -68,7 +88,7 @@ def _parse_field(spec: str, *, name: str, lo: int, hi: int) -> tuple[set[int], b
 
 @dataclass(frozen=True)
 class CronSchedule:
-    """一条已校验的 cron 表达式。"""
+    """一条已校验的 cron 表达式（字段按 `tz` 的本地墙钟解释）。"""
 
     expression: str
     minutes: frozenset[int]
@@ -78,6 +98,7 @@ class CronSchedule:
     weekdays: frozenset[int]
     day_wildcard: bool
     weekday_wildcard: bool
+    tz: tzinfo = field(default_factory=lambda: _UTC)
 
     def _day_matches(self, day: date) -> bool:
         day_ok = day.day in self.days
@@ -88,33 +109,46 @@ class CronSchedule:
             return day_ok or weekday_ok
         return day_ok and weekday_ok
 
-    def next_after(self, base: datetime) -> datetime:
-        """返回严格晚于 `base` 的下一次触发时刻（UTC、秒与微秒归零）。"""
+    def next_after(self, base: datetime, tz: str | tzinfo | None = None) -> datetime:
+        """返回严格晚于 `base` 的下一次触发时刻（UTC、秒与微秒归零）。
+
+        默认使用解析时绑定的时区；显式传 `tz` 可临时覆盖。计算在本地墙钟上
+        逐日/逐时/逐分推进：不存在的本地时间（春季前跳）跳过，重复的本地时间
+        （秋季回拨）只取 fold=0 的第一次，避免同一墙钟触发两次。
+        """
+        zone = _coerce_tz(tz) if tz is not None else self.tz
         if base.tzinfo is None:
-            base = base.replace(tzinfo=timezone.utc)
-        cursor = base.astimezone(timezone.utc).replace(second=0, microsecond=0) + timedelta(
-            minutes=1
-        )
+            base = base.replace(tzinfo=_UTC)
+        base_utc = base.astimezone(_UTC)
+        local_base = base_utc.astimezone(zone)
+        start_day = local_base.date()
         hours = sorted(self.hours)
         minutes = sorted(self.minutes)
-        for _ in range(_MAX_DAYS + 1):
-            day = cursor.date()
-            if day.month in self.months and self._day_matches(day):
-                for hour in hours:
-                    if hour < cursor.hour:
+        for offset in range(_MAX_DAYS + 1):
+            day = start_day + timedelta(days=offset)
+            if day.month not in self.months or not self._day_matches(day):
+                continue
+            for hour in hours:
+                for minute in minutes:
+                    local = datetime(
+                        day.year, day.month, day.day, hour, minute, tzinfo=zone, fold=0
+                    )
+                    # 春季前跳的本地时间不存在：往返转换后墙钟会变，直接跳过。
+                    roundtrip = local.astimezone(_UTC).astimezone(zone)
+                    if roundtrip.replace(tzinfo=None) != local.replace(tzinfo=None):
                         continue
-                    for minute in minutes:
-                        if hour == cursor.hour and minute < cursor.minute:
-                            continue
-                        return datetime(
-                            day.year, day.month, day.day, hour, minute, tzinfo=timezone.utc
-                        )
-            cursor = datetime(day.year, day.month, day.day, tzinfo=timezone.utc) + timedelta(days=1)
+                    moment = local.astimezone(_UTC)
+                    if moment > base_utc:
+                        return moment
         raise ValueError(f"cron 表达式在 8 年内没有触发时间：{self.expression}")
 
 
-def parse_cron(expression: str) -> CronSchedule:
-    """解析并校验 5 段 cron；非法时抛 ValueError（调用方转 400）。"""
+def parse_cron(expression: str, tz: str | tzinfo | None = None) -> CronSchedule:
+    """解析并校验 5 段 cron；非法时抛 ValueError（调用方转 400）。
+
+    `tz` 是 cron 字段解释所用的 IANA 时区（默认 UTC），会随 schedule 一起保存；
+    之后调用 `next_after()` 无需再传。
+    """
     parts = expression.split()
     if len(parts) != 5:
         raise ValueError(f"cron 必须是 5 段（分 时 日 月 周），收到 {len(parts)} 段：{expression}")
@@ -138,4 +172,5 @@ def parse_cron(expression: str) -> CronSchedule:
         weekdays=frozenset(weekdays),
         day_wildcard=day_wildcard,
         weekday_wildcard=weekday_wildcard,
+        tz=_coerce_tz(tz),
     )

@@ -105,7 +105,7 @@ class BotCreateRequest(BaseModel):
     schedule: str | None = Field(default=None, max_length=64)
     #: 连续失败多少次自动暂停；0 = 永不自动暂停
     failure_threshold: int = Field(default=3, ge=0, le=20)
-    #: 每日 token 预算（UTC 自然日）；留空或 0 = 无上限
+    #: 每日 token 预算（按 FLUX_TIMEZONE 的自然日）；留空或 0 = 无上限
     token_budget: int | None = Field(default=None, ge=0, le=1_000_000_000)
     #: 开工失败时是否主动通知（写一条 bot_notifications）
     notify_on_failure: bool = True

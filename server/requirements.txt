@@ -19,6 +19,9 @@ httpx==0.28.1
 deepseek-harness-sdk==0.1.5rc1
 # DSH loader patch（YAML）生成：注入 MCP 客户端插件配置
 PyYAML==6.0.3
+# IANA 时区数据库：python:*-slim 基础镜像可能不带系统 zoneinfo，
+# 缺失时 FLUX_TIMEZONE=Asia/Shanghai 等非 UTC 名称会在启动校验阶段失败。
+tzdata>=2024.1
 # 上下文原文库的存储层压缩（FLUX_CONTEXT_MECHANISM §3.5），完全无损。
 # 缺失时 flux.core.context.store 自动退到标准库 lzma（同样无损），故不是硬依赖。
 zstandard>=0.23
