@@ -30,6 +30,9 @@ SPEC_TABLES = {
     "virtual_changes",
     "connectors",
     "connector_logs",
+    # 外部连接器：本地账号 ↔ GitHub 身份绑定（迁移 c8e4a1f72b93）。
+    # 令牌以密钥库信封加密落库，接口与日志只暴露身份与 scopes。
+    "github_connections",
     "usage_records",
     # §11.2 之外的新增表：官方套餐额度快照（计费 P0）。
     # 官方接口只给套餐总量、没有任务归因，快照负责把百分比钉在时间轴上用于对账与闸门判定。
