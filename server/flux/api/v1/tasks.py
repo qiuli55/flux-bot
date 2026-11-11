@@ -15,7 +15,7 @@ from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import StreamingResponse
 
 from flux.api.deps import get_container
@@ -27,6 +27,8 @@ from flux.core.agent_runtime.trace import summarize_trace
 from flux.core.attachment_store import UploadedFile, resolve_uploads, size_label
 from flux.core.context.budget import history_message_limit
 from flux.core.event.bus import Events
+from flux.core.github.service import ACCOUNT_HEADER, normalize_account_key
+from flux.core.github.tools import GITHUB_TOOLS, run_github_tool
 from flux.core.group.avatar import normalize_avatar
 from flux.core.model_gateway.base import ChatMessage
 from flux.core.task_engine.assistant import validate_confirmation_items
@@ -432,6 +434,7 @@ async def create_task_handoff(
 async def create_task_message(
     task_id: str,
     payload: TaskMessageCreateRequest,
+    request: Request,
     container: Container = Depends(get_container),
 ) -> dict[str, object]:
     """发一条消息并取回助手的真实回复。
@@ -477,6 +480,32 @@ async def create_task_message(
     prompt_text = content or _attachments_brief(files)
     if files and content:
         prompt_text = content + "\n\n" + _attachments_brief(files)
+    # 外部连接器按本地账号隔离：请求头声明账号，只在这个账号真的连了 GitHub 时
+    # 才把工具交给模型；没连时明确要求它引导用户去账户页连接，禁止编造仓库数据。
+    account_key = normalize_account_key(request.headers.get(ACCOUNT_HEADER))
+    github_connected = await container.github.is_connected(account_key)
+
+    async def _run_github(name: str, arguments: dict[str, Any]) -> Any:
+        return await run_github_tool(container.github, account_key, name, arguments)
+
+    github_kwargs: dict[str, Any] = (
+        {
+            "tools": list(GITHUB_TOOLS),
+            "tool_runner": _run_github,
+            "tools_note": (
+                "当前账号已连接 GitHub。用户问到仓库、代码、Issue、PR、提交或 Actions 时，"
+                "先调用 github_* 工具查真实数据再回答；不要凭猜测编造仓库名、数量或状态。"
+            ),
+        }
+        if github_connected
+        else {
+            "tools_note": (
+                "当前账号还没有连接 GitHub。用户如果问仓库、代码、Issue、PR 等 GitHub 数据，"
+                "明确告诉对方先到「账户 → 连接器 → GitHub」完成连接，然后才能查询；"
+                "不得编造任何仓库或提交数据。"
+            )
+        }
+    )
     try:
         # 任务选了自己的模型时，这一轮对话也用它回答（与后续 Agent 执行同一通道）
         channel = await container.key_vault.channel_for_task(task)
@@ -492,6 +521,7 @@ async def create_task_message(
             on_delta=_on_delta,
             channel=channel,
             model=(task.model or "").strip(),
+            **github_kwargs,
         )
     except Exception as exc:  # noqa: BLE001 - 先通知正在看的客户端，再按原样抛给调用方
         await container.task_stream.publish(task_uuid, "assistant_error", {"error": str(exc)[:500]})

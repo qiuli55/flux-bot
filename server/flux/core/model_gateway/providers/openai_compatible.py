@@ -61,9 +61,28 @@ class OpenAICompatibleProvider(ModelProviderBase):
 
     async def chat(self, messages: list[ChatMessage], **kwargs: Any) -> ChatResult:
         self._ensure_configured()
-
         payload = self._build_payload(messages, stream=False, **kwargs)
+        return await self._complete(payload, kwargs)
 
+    async def chat_with_tools(
+        self,
+        messages: list[ChatMessage],
+        *,
+        tools: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> ChatResult:
+        """带工具定义的对话：模型可以返回 tool_calls，由调用方执行后再回灌。"""
+        self._ensure_configured()
+        payload = self._build_payload(messages, stream=False, tools=tools, **kwargs)
+        return await self._complete(payload, kwargs, with_tools=True)
+
+    async def _complete(
+        self,
+        payload: dict[str, Any],
+        kwargs: dict[str, Any],
+        *,
+        with_tools: bool = False,
+    ) -> ChatResult:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -100,7 +119,8 @@ class OpenAICompatibleProvider(ModelProviderBase):
                 f"供应商 {self.provider} 上游响应缺少 choices",
                 details={"provider": str(self.provider), "status": None},
             )
-        content = choices[0].get("message", {}).get("content") or ""
+        message = choices[0].get("message") or {}
+        content = message.get("content") or ""
 
         raw_usage = data.get("usage") or {}
         usage = TokenUsage(
@@ -115,6 +135,7 @@ class OpenAICompatibleProvider(ModelProviderBase):
             latency_ms=latency_ms,
             cost=self.calculate_cost(usage),
             raw=data,
+            tool_calls=_parse_tool_calls(message.get("tool_calls")) if with_tools else (),
         )
 
     async def stream(self, messages: list[ChatMessage], **kwargs: Any) -> AsyncIterator[str]:
@@ -160,13 +181,21 @@ class OpenAICompatibleProvider(ModelProviderBase):
                 await client.aclose()
 
     def _build_payload(
-        self, messages: list[ChatMessage], *, stream: bool, **kwargs: Any
+        self,
+        messages: list[ChatMessage],
+        *,
+        stream: bool,
+        tools: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": resolve_model_name(kwargs, self.model_name),
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "messages": [_message_payload(m) for m in messages],
             "stream": stream,
         }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
         # 不给上限就整条字段都不下发，让模型用自己的默认输出上限；不填兜底值以免截断长输出
         max_tokens = kwargs.get("max_tokens")
         if max_tokens is not None:
@@ -175,6 +204,48 @@ class OpenAICompatibleProvider(ModelProviderBase):
         if temperature is not None:
             payload["temperature"] = temperature
         return payload
+
+
+def _message_payload(message: ChatMessage) -> dict[str, Any]:
+    """把 ChatMessage 还原成上游要的消息体（工具调用与工具结果都要原样带回）。"""
+    item: dict[str, Any] = {"role": message.role, "content": message.content}
+    if message.tool_calls:
+        item["tool_calls"] = list(message.tool_calls)
+    if message.tool_call_id:
+        item["tool_call_id"] = message.tool_call_id
+    if message.name:
+        item["name"] = message.name
+    return item
+
+
+def _parse_tool_calls(raw: Any) -> tuple[dict[str, Any], ...]:
+    """把上游 tool_calls 规整成可回传、可执行的最小形状；缺 id 时补一个稳定的。"""
+    if not isinstance(raw, list):
+        return ()
+    calls: list[dict[str, Any]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function") or {}
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+        arguments = function.get("arguments")
+        calls.append(
+            {
+                "id": str(item.get("id") or f"call_{index}"),
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments
+                    if isinstance(arguments, str)
+                    else json.dumps(arguments or {}, ensure_ascii=False),
+                },
+            }
+        )
+    return tuple(calls)
 
 
 def _openai_stream_text(line: str) -> str | None:

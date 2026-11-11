@@ -18,8 +18,13 @@ from flux.services.cost_service.calculator import compute_cost
 
 @dataclass(frozen=True)
 class ChatMessage:
-    role: str  # system / user / assistant
+    role: str  # system / user / assistant / tool
     content: str
+    #: assistant 消息里模型发起的工具调用（OpenAI 格式，原样回传给上游）
+    tool_calls: tuple[dict[str, Any], ...] = ()
+    #: role=tool 时对应的调用 id
+    tool_call_id: str = ""
+    name: str = ""
 
 
 def resolve_model_name(kwargs: dict[str, Any], default: str) -> str:
@@ -59,6 +64,8 @@ class ChatResult:
     latency_ms: int
     cost: float | None = None
     raw: dict[str, Any] = field(default_factory=dict)
+    #: 模型要求调用的工具（OpenAI 格式）；空 = 这是最终文本回复
+    tool_calls: tuple[dict[str, Any], ...] = ()
 
 
 class ModelProviderBase(ABC):
@@ -81,6 +88,13 @@ class ModelProviderBase(ABC):
         """是否具备调用条件（例如密钥/端点已配置）。未配置的 Provider 不参与路由。"""
 
     # --- 通用实现，子类可按需覆写 ---
+
+    async def chat_with_tools(
+        self, messages: list[ChatMessage], *, tools: list[dict[str, Any]], **kwargs: Any
+    ) -> ChatResult:
+        """带工具定义的对话。默认实现忽略 tools（不支持工具调用的供应商照常作答）。"""
+        _ = tools
+        return await self.chat(messages, **kwargs)
 
     async def stream(self, messages: list[ChatMessage], **kwargs: Any) -> AsyncIterator[str]:
         """流式对话。

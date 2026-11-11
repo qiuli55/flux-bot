@@ -18,7 +18,7 @@ from typing import Any
 
 from flux.core.agent_runtime.model_catalog import KEY_PROVIDERS, PROVIDER_OPENAI_COMPATIBLE
 from flux.core.agent_runtime.runtimes.base import ModelChannel
-from flux.core.model_gateway.base import ChatMessage, TokenUsage
+from flux.core.model_gateway.base import ChatMessage, ModelProviderBase, TokenUsage
 from flux.core.model_gateway.providers.registry import build_channel_provider
 from flux.core.model_gateway.router import ModelRouter
 from flux.errors import ValidationError
@@ -40,12 +40,17 @@ CONFIRMATION_DIMENSIONS: tuple[str, ...] = (
 #: 某维度尚未有结论时的占位值（不是编造的内容，是"这里还没定"）。
 CONFIRMATION_UNKNOWN = "待确认"
 
+#: 一轮用户消息里最多允许几轮工具调用（防止模型来回查同一份数据）
+_MAX_TOOL_ROUNDS = 3
+#: 单个工具结果回灌给模型的字符上限
+_TOOL_OUTPUT_CHARS = 6000
+
 #: 结构化输出的协议说明。字段名与前端渲染一一对应：
 #: questions → 需要用户补充的问题，confirmation → 需求确认六维度，steps → 执行计划步骤。
 SYSTEM_PROMPT = """你是 Flux，一个 AI 软件工程平台的执行助手，正在与用户确认一项开发任务。
 
 任务描述：{description}
-{context}
+{context}{tools_note}
 把用户的需求整理清楚，并给出下一步执行计划。
 
 只输出一个 JSON 对象（不要用 markdown 代码块包裹），字段如下：
@@ -120,6 +125,9 @@ class TaskAssistant:
         on_delta: Callable[[str], Awaitable[None]] | None = None,
         channel: ModelChannel | None = None,
         model: str = "",
+        tools: list[dict[str, Any]] | None = None,
+        tool_runner: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None,
+        tools_note: str = "",
     ) -> AssistantTurn:
         """调用模型生成一轮回复。history 为早前的对话（只含纯文本消息，升序）。
 
@@ -132,6 +140,7 @@ class TaskAssistant:
         system = SYSTEM_PROMPT.format(
             description=description,
             context=f"项目上下文（来自 Project Brain）：\n{context}\n" if context else "",
+            tools_note=f"{tools_note}\n" if tools_note else "",
             dimensions="、".join(CONFIRMATION_DIMENSIONS),
         )
         messages = [ChatMessage(role="system", content=system)]
@@ -143,6 +152,16 @@ class TaskAssistant:
         override = (
             build_channel_provider(channel, model=model) if channel is not None and model else None
         )
+
+        if tools and tool_runner is not None:
+            instance = override if override is not None else self._router.select()
+            return await self._respond_with_tools(
+                messages=messages,
+                instance=instance,
+                tools=tools,
+                tool_runner=tool_runner,
+                on_delta=on_delta,
+            )
 
         if on_delta is None:
             result = (
@@ -242,6 +261,113 @@ class TaskAssistant:
             },
             latency_ms=latency_ms,
         )
+
+    async def _respond_with_tools(
+        self,
+        *,
+        messages: list[ChatMessage],
+        instance: ModelProviderBase,
+        tools: list[dict[str, Any]],
+        tool_runner: Callable[[str, dict[str, Any]], Awaitable[Any]],
+        on_delta: Callable[[str], Awaitable[None]] | None,
+    ) -> AssistantTurn:
+        """非流式的工具循环：模型发起调用 → 服务端执行 → 结果回灌，最多 3 轮。
+
+        工具调用阶段没有可展示的增量，所以最终只把整理好的 reply 一次性推给前端；
+        这比让用户先看到"正在查仓库"再看到正文更稳，也不会出现协议外壳泄漏。
+        """
+        started = time.perf_counter()
+        provider_name = str(instance.provider)
+        model_name = instance.model_name
+        input_tokens = 0
+        output_tokens = 0
+        content = ""
+        working = list(messages)
+
+        for _ in range(_MAX_TOOL_ROUNDS):
+            result = await instance.chat_with_tools(working, tools=tools)
+            provider_name, model_name = str(result.provider), result.model
+            input_tokens += result.usage.input_tokens
+            output_tokens += result.usage.output_tokens
+            if not result.tool_calls:
+                content = result.content
+                break
+
+            working.append(
+                ChatMessage(
+                    role="assistant",
+                    content=result.content or "",
+                    tool_calls=result.tool_calls,
+                )
+            )
+            for call in result.tool_calls:
+                function = call.get("function") or {}
+                name = str(function.get("name") or "")
+                arguments = _tool_arguments(function.get("arguments"))
+                try:
+                    output: Any = {"ok": True, "data": await tool_runner(name, arguments)}
+                except Exception as exc:  # noqa: BLE001 - 工具失败要让模型自己解释，不能中断整轮
+                    logger.warning("GitHub 工具执行失败 name=%s error=%s", name, exc)
+                    output = {"ok": False, "error": str(exc)[:500]}
+                working.append(
+                    ChatMessage(
+                        role="tool",
+                        content=json.dumps(output, ensure_ascii=False, default=str)[
+                            :_TOOL_OUTPUT_CHARS
+                        ],
+                        tool_call_id=str(call.get("id") or ""),
+                        name=name,
+                    )
+                )
+
+        if not content:
+            # 轮次用尽仍是工具调用（或空内容）：不带工具再要一次自然语言结论
+            result = await instance.chat(working)
+            provider_name, model_name = str(result.provider), result.model
+            input_tokens += result.usage.input_tokens
+            output_tokens += result.usage.output_tokens
+            content = result.content
+
+        reply, questions, confirmation, steps = parse_turn(content)
+        secure_input = parse_secure_input(content)
+        if on_delta is not None and reply:
+            await on_delta(reply)
+        logger.info(
+            "Solo 助手回复（工具） provider=%s model=%s questions=%d confirmation=%d steps=%d",
+            provider_name,
+            model_name,
+            len(questions),
+            len(confirmation),
+            len(steps),
+        )
+        return AssistantTurn(
+            reply=reply,
+            questions=questions,
+            confirmation=confirmation,
+            steps=steps,
+            secure_input=secure_input,
+            provider=provider_name,
+            model=model_name,
+            usage={
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            },
+            latency_ms=int((time.perf_counter() - started) * 1000),
+        )
+
+
+def _tool_arguments(raw: Any) -> dict[str, Any]:
+    """模型给的参数是 JSON 字符串；解析失败按空对象处理，由工具自己报缺字段。"""
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def visible_reply_prefix(raw: str) -> str:
