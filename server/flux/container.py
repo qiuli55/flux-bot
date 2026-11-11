@@ -630,10 +630,10 @@ class Container:
         except ValueError:
             return ModelProvider.LOCAL
 
-    async def dispose(self) -> None:
+    async def dispose(self, *, close_terminal_sessions: bool = True) -> None:
         # 退出时先停看护循环并清理仍在跑的 Agent 进程树，再释放连接（P2-15 §2.5）
         await self.human_pty.shutdown()
-        await self.terminal.shutdown()
+        await self.terminal.shutdown(close_sessions=close_terminal_sessions)
         await self.code_intel.shutdown()
         await self.completion.shutdown()
         # CLI runtime 的常驻进程（声明 reusable_process 的，如 opencode serve）不在

@@ -18,17 +18,22 @@ import argparse
 import asyncio
 import json
 import os
+import socket
+import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import func, select, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from flux.config import REPO_ROOT, Settings, get_settings
 from flux.container import Container
 from flux.core.mcp.tools import ALL_TOOLS, FORBIDDEN_TOOL_NAMES, TOOLS, ToolContext
-from flux.db.session import check_database
+from flux.db.session import check_database, create_engine
 from flux.enums import RecoveryResolution, TaskStatus, VirtualChangeStatus
 from flux.errors import (
     AIOSError,
@@ -195,7 +200,9 @@ async def _run(args: argparse.Namespace, settings: Settings) -> tuple[dict[str, 
                 return await _cmd_agents_connect(container, args), 0
             return await _cmd_agents_remove(container, args), 0
     finally:
-        await container.dispose()
+        # doctor 是只读自检：数据库可能正是不可达的那个对象，退出时不再查/改会话表，
+        # 否则失败报告已经产出后还会再卡在一条没有超时的数据库查询上。
+        await container.dispose(close_terminal_sessions=args.command != "doctor")
     raise BadRequestError(f"未知命令：{args.command}")
 
 
@@ -215,10 +222,17 @@ async def _cmd_doctor(container: Container) -> tuple[dict[str, Any], int]:
     checks: list[dict[str, Any]] = []
 
     db_url = _redact_url(settings.database_url)
-    db_ok = await check_database(container.engine)
+    # 探针单独建引擎：连接超时交给 asyncpg，协程层再用 wait_for 兜底；
+    # 否则不可达主机（尤其是 DNS 解析卡住）会让 doctor 一直挂到进程被杀。
+    timeout = max(0.1, settings.doctor_db_timeout_seconds)
+    probe_engine = create_engine(settings.database_url, connect_timeout=timeout)
+    try:
+        db_ok = await _database_probe(probe_engine, settings.database_url, timeout)
+        alembic = await _bounded(_alembic_version(probe_engine), timeout) if db_ok else None
+    finally:
+        await probe_engine.dispose()
     checks.append(_check("database", db_ok, "error", db_url if db_ok else f"无法连接：{db_url}"))
 
-    alembic = await _alembic_version(container)
     checks.append(
         _check(
             "migrations",
@@ -280,9 +294,55 @@ async def _agents_check(container: Container, db_ok: bool) -> dict[str, Any]:
     return _check("agents", True, "info", f"{container.agents.count()} 个 Agent 档案")
 
 
-async def _alembic_version(container: Container) -> str | None:
+def _host_resolves(host: str, port: int, timeout: float) -> bool:
+    """在守护线程里做 DNS 解析，避免 asyncpg 把线程池卡到进程退出。
+
+    `loop.getaddrinfo` 在超时后线程仍会继续阻塞，而 asyncio.run 结束时会等待默认
+    线程池收尾——这会让不可达主机即使设了连接超时也能拖死整个 CLI。解析线程设为
+    daemon 后，超时即放弃等待，进程不再被它挂住。
+    """
+    outcome: list[bool] = []
+    done = threading.Event()
+
+    def _resolve() -> None:
+        try:
+            socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except Exception:
+            outcome.append(False)
+        else:
+            outcome.append(True)
+        finally:
+            done.set()
+
+    threading.Thread(target=_resolve, name="flux-doctor-dns", daemon=True).start()
+    if not done.wait(timeout):
+        return False
+    return bool(outcome and outcome[0])
+
+
+async def _database_probe(engine: AsyncEngine, database_url: str, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    if not database_url.startswith("sqlite"):
+        url = make_url(database_url)
+        if url.host and not _host_resolves(url.host, url.port or 5432, timeout):
+            return False
+    remaining = max(0.05, deadline - time.monotonic())
     try:
-        async with container.engine.connect() as conn:
+        return await asyncio.wait_for(check_database(engine), timeout=remaining)
+    except (TimeoutError, asyncio.TimeoutError):
+        return False
+
+
+async def _bounded(awaitable: Any, timeout: float) -> Any:
+    try:
+        return await asyncio.wait_for(awaitable, timeout=timeout)
+    except (TimeoutError, asyncio.TimeoutError):
+        return None
+
+
+async def _alembic_version(engine: AsyncEngine) -> str | None:
+    try:
+        async with engine.connect() as conn:
             result = await conn.execute(text("SELECT version_num FROM alembic_version"))
             return result.scalar_one_or_none()
     except Exception:

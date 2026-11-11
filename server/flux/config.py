@@ -91,6 +91,9 @@ class Settings(BaseSettings):
     # --- 存储（主规格 §11.1）---
     database_url: str = "sqlite+aiosqlite:///./flux.db"
     redis_url: str = "redis://localhost:6379/0"
+    # doctor 的数据库探针上限（秒）。除了在协程层用 asyncio.wait_for 兜底，
+    # 还会作为 asyncpg 的连接超时，避免不可达主机把 `flux doctor` 拖住。
+    doctor_db_timeout_seconds: float = 5.0
 
     # --- 模型供应商（主规格 §5.3）---
     # 仅供 Flux 侧基础设施调用（T2 压缩、扫描摘要等），不是 Agent 的模型通道；
