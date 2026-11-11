@@ -34,6 +34,8 @@ from flux.models.bot_routine import BotRoutine
 from flux.models.task import Task
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from flux.container import Container
 
 logger = get_logger(__name__)
@@ -122,6 +124,8 @@ class BotService:
         self._event_last: dict[uuid.UUID, datetime] = {}
         #: 事件触发协程的强引用，避免 create_task 后被 GC 提前回收
         self._event_jobs: set[asyncio.Task[Any]] = set()
+        #: 每个 Bot 的「查忙 + 起一轮」锁：只覆盖开工准备，不覆盖整轮运行
+        self._launch_locks: dict[uuid.UUID, asyncio.Lock] = {}
 
     # --- 查询 ---
 
@@ -398,8 +402,6 @@ class BotService:
             last = self._event_last.get(bot.id)
             if last is not None and (moment - last).total_seconds() < _EVENT_COOLDOWN_SECONDS:
                 continue
-            if await self._repo.is_busy(bot.id):
-                continue
             if await self._budget_block(bot, now=moment) is not None:
                 logger.info("Bot %s 今日 token 已用完，跳过事件 %s", bot.id, event)
                 continue
@@ -407,9 +409,11 @@ class BotService:
             instruction = f"[事件触发] {event}：{summary}"
             if description:
                 instruction = f"{instruction}\n\n{description}"
-            self._event_last[bot.id] = moment
             try:
-                await self._launch(bot, instruction=instruction, now=moment)
+                task = await self._launch_if_idle(bot, instruction=instruction, now=moment)
+                if task is None:
+                    continue
+                self._event_last[bot.id] = moment
                 logger.info("Bot %s 被事件 %s 触发开工", bot.id, event)
             except Exception as exc:  # noqa: BLE001 - 单个 Bot 失败不影响其他 Bot
                 logger.warning("Bot %s 事件触发开工失败：%s", bot.id, exc)
@@ -441,23 +445,15 @@ class BotService:
         """
         bot = await self._repo.get(bot_id)
         bot = await self._settle_previous(bot)
-        if await self._repo.is_busy(bot.id):
-            raise ConflictError(
-                f"Bot {bot.name} 上一轮还没跑完，等它结束再触发",
-                details={"bot_id": str(bot.id)},
-            )
-        blocked = await self._budget_block(bot, now=_utcnow())
-        if blocked is not None:
-            budget, used = blocked
-            raise ConflictError(
-                f"Bot {bot.name} 今日 token 已用 {used}，达到上限 {budget}；调高预算或等明天再跑",
-                details={
-                    "bot_id": str(bot.id),
-                    "token_budget": budget,
-                    "tokens_used_today": used,
-                },
-            )
-        return await self._launch(bot, instruction=instruction, now=_utcnow())
+        task = await self._launch_if_idle(
+            bot,
+            instruction=instruction,
+            now=_utcnow(),
+            conflict_on_busy=True,
+            check_budget=True,
+        )
+        assert task is not None  # conflict_on_busy 保证要么开工、要么抛 ConflictError
+        return task
 
     async def tick(self, now: datetime | None = None) -> list[str]:
         """扫一轮到期的 Bot，返回本次开工的任务 id。异常不外抛（后台循环不该死）。"""
@@ -474,15 +470,6 @@ class BotService:
             try:
                 if bot.status != BotStatus.ACTIVE.value or bot.next_run_at is None:
                     continue
-                if await self._repo.is_busy(bot.id):
-                    # 上一轮还在跑：跳过本轮，顺延到下一个触发点
-                    cron = self._cron(bot.schedule)
-                    await self._repo.update(
-                        bot.id,
-                        {"next_run_at": cron.next_after(moment) if cron else None},
-                    )
-                    logger.info("Bot %s 上一轮未结束，跳过本次定时", bot.id)
-                    continue
                 blocked = await self._budget_block(bot, now=moment)
                 if blocked is not None:
                     # 预算超了也照样推进下一次触发：否则每轮 tick 都会重新扫到它
@@ -495,7 +482,16 @@ class BotService:
                         "Bot %s 今日 token 已用 %s/%s，跳过本次定时", bot.id, blocked[1], blocked[0]
                     )
                     continue
-                task = await self._launch(bot, instruction=None, now=moment)
+                task = await self._launch_if_idle(bot, instruction=None, now=moment)
+                if task is None:
+                    # 上一轮还在跑（或刚被其他路径抢到锁开工）：跳过本轮，顺延到下一个触发点
+                    cron = self._cron(bot.schedule)
+                    await self._repo.update(
+                        bot.id,
+                        {"next_run_at": cron.next_after(moment) if cron else None},
+                    )
+                    logger.info("Bot %s 上一轮未结束，跳过本次定时", bot.id)
+                    continue
                 started.append(str(task.id))
             except Exception as exc:  # noqa: BLE001 - 单个 Bot 失败不影响其他 Bot
                 logger.warning("Bot %s 定时开工失败：%s", bot.id, exc)
@@ -522,17 +518,30 @@ class BotService:
         if bot.status != BotStatus.ACTIVE.value:
             await self._routines.update(routine.id, {"next_run_at": next_run_at})
             return None
-        if await self._repo.is_busy(bot.id):
-            await self._routines.update(routine.id, {"next_run_at": next_run_at})
-            logger.info("Bot %s 上一轮未结束，跳过例程 %s", bot.id, routine.name)
-            return None
         if await self._budget_block(bot, now=moment) is not None:
             await self._routines.update(routine.id, {"next_run_at": next_run_at})
             logger.info("Bot %s 今日 token 已用完，跳过例程 %s", bot.id, routine.name)
             return None
-        # 先推进例程时间再起 Run：起 Run 期间再扫到也不会重复开工
-        await self._routines.update(routine.id, {"next_run_at": next_run_at, "last_run_at": moment})
-        return await self._launch(bot, instruction=routine.instruction, now=moment, routine=routine)
+
+        async def _advance(*, last_run: bool = True) -> None:
+            values: dict[str, Any] = {"next_run_at": next_run_at}
+            if last_run:
+                values["last_run_at"] = moment
+            await self._routines.update(routine.id, values)
+
+        async def _skip_busy() -> None:
+            await _advance(last_run=False)
+            logger.info("Bot %s 上一轮未结束，跳过例程 %s", bot.id, routine.name)
+
+        # 先推进例程时间再起 Run：起 Run 期间再扫到也不会重复开工。
+        return await self._launch_if_idle(
+            bot,
+            instruction=routine.instruction,
+            now=moment,
+            routine=routine,
+            on_busy=_skip_busy,
+            before_launch=_advance,
+        )
 
     async def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -629,6 +638,56 @@ class BotService:
             return Path(bot.workspace).expanduser()
         dsh_home = Path(self._container.settings.dsh_home).expanduser()
         return dsh_home / "bots" / str(bot.id) / "workspace"
+
+    async def _launch_if_idle(
+        self,
+        bot: Bot,
+        *,
+        instruction: str | None,
+        now: datetime,
+        routine: BotRoutine | None = None,
+        conflict_on_busy: bool = False,
+        check_budget: bool = False,
+        on_busy: Callable[[], Awaitable[None]] | None = None,
+        before_launch: Callable[[], Awaitable[None]] | None = None,
+    ) -> Task | None:
+        """在 Bot 级锁内重读忙闲，再决定是否开工（check-then-act 必须原子）。
+
+        锁覆盖到任务行已落库、Bot 的 last_task_id 已更新且 `is_busy` 可见为止，
+        随后立即释放：整轮运行期间不再占锁，其他入口只需看到「忙」就会跳过。
+        """
+        lock = self._launch_locks.get(bot.id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._launch_locks[bot.id] = lock
+        async with lock:
+            if await self._repo.is_busy(bot.id):
+                if conflict_on_busy:
+                    raise ConflictError(
+                        f"Bot {bot.name} 上一轮还没跑完，等它结束再触发",
+                        details={"bot_id": str(bot.id)},
+                    )
+                if on_busy is not None:
+                    await on_busy()
+                return None
+            if check_budget:
+                blocked = await self._budget_block(bot, now=now)
+                if blocked is not None:
+                    budget, used = blocked
+                    if conflict_on_busy:
+                        raise ConflictError(
+                            f"Bot {bot.name} 今日 token 已用 {used}，达到上限 {budget}；"
+                            "调高预算或等明天再跑",
+                            details={
+                                "bot_id": str(bot.id),
+                                "token_budget": budget,
+                                "tokens_used_today": used,
+                            },
+                        )
+                    return None
+            if before_launch is not None:
+                await before_launch()
+            return await self._launch(bot, instruction=instruction, now=now, routine=routine)
 
     async def _launch(
         self,
