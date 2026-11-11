@@ -241,6 +241,9 @@ class Settings(BaseSettings):
     supervisor_run_timeout_seconds: float = 0.0
 
     # --- Bot 模式（常驻 Bot）---
+    # Bot 独立服务监听的端口（entrypoint.sh / Dockerfile 用 FLUX_BOT_PORT 传入）。
+    # Bot 节点据此在未显式配置 FLUX_DSH_MCP_URL 时推导同机 MCP 端点。
+    bot_port: int = 8600
     # 后台调度 worker：按 next_run_at 扫到期 Bot 并开工。测试里关掉，避免与用例抢时序。
     bot_scheduler_enabled: bool = True
     # 轮询间隔（秒）：cron 的最小粒度是分钟，30 秒足够且不会压垮 SQLite。

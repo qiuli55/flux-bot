@@ -21,7 +21,8 @@ RUN chmod +x /entrypoint.sh
 # 数据与 DSH 家目录都落在挂载卷里，容器重建不丢 Bot 与例程
 ENV FLUX_DATABASE_URL=sqlite+aiosqlite:////data/flux.db \
     FLUX_DSH_HOME=/data/dsh-home \
-    FLUX_BOT_PORT=8600
+    FLUX_BOT_PORT=8600 \
+    FLUX_DSH_MCP_URL=http://127.0.0.1:8600/mcp
 
 VOLUME ["/data"]
 EXPOSE 8600

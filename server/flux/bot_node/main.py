@@ -10,6 +10,7 @@ Flux 主服务里的对话、设计工作室、IDE、终端、助理等能力不
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI
 
@@ -36,8 +37,10 @@ from flux.config import Settings, get_settings
 from flux.container import Container
 from flux.core.agent_runtime.llm_stream_tap import llm_stream_tap
 from flux.core.mcp.server import router as mcp_router
-from flux.logging import configure_logging
+from flux.logging import configure_logging, get_logger
 from flux.version import VERSION
+
+logger = get_logger(__name__)
 
 # Bot 能用的业务路由。顺序只影响 OpenAPI 里的排列，不改变行为。
 _BOT_ROUTERS = (
@@ -58,13 +61,53 @@ _BOT_ROUTERS = (
 )
 
 
+def resolve_bot_settings(settings: Settings) -> Settings:
+    """Bot 节点的生效配置：MCP 端点默认指向自己实际监听的端口。
+
+    `Settings.dsh_mcp_url` 的默认值属于原始 Flux 主应用（8000），Bot 节点监听
+    8600；若直接把默认值注入 DSH，模型请求与流式旁路都会打到无人监听的端口。
+    只有显式配置的 FLUX_DSH_MCP_URL（含 .env / 构造参数）才覆盖推导结果。
+    """
+    if "dsh_mcp_url" in settings.model_fields_set:
+        return settings
+    return settings.model_copy(update={"dsh_mcp_url": f"http://127.0.0.1:{settings.bot_port}/mcp"})
+
+
+def _url_port(url: str) -> int | None:
+    """取 URL 的显式端口；未写端口时按 scheme 补默认值。解析失败返回 None。"""
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    if parsed.port is not None:
+        return parsed.port
+    if parsed.scheme == "http":
+        return 80
+    if parsed.scheme == "https":
+        return 443
+    return None
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
-    app_settings = settings or get_settings()
+    app_settings = resolve_bot_settings(settings or get_settings())
     configure_logging(app_settings.log_level, app_settings.log_dir_path)
     container = Container(app_settings)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        # MCP 端点与 Bot 监听端口不一致时，DSH 的模型请求与流式旁路会打到死端口。
+        # 这里只告警不阻断：测试/单机排查可能有意让二者不同。
+        mcp_port = _url_port(app_settings.dsh_mcp_url)
+        if mcp_port is not None and mcp_port != app_settings.bot_port:
+            logger.warning(
+                "DSH MCP URL 端口 %s 与 Bot 监听端口 FLUX_BOT_PORT=%s 不一致"
+                "（FLUX_DSH_MCP_URL=%s）；请确认二者指向同一实例",
+                mcp_port,
+                app_settings.bot_port,
+                app_settings.dsh_mcp_url,
+            )
         # Bot 开工要认 agent 档案与令牌，启动时先重建内存注册表。
         await container.agents.load_from_db()
         await container.agent_tokens.migrate_legacy_tokens()
