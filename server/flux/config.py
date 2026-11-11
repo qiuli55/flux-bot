@@ -306,6 +306,16 @@ class Settings(BaseSettings):
     supervisor_wechat_history_limit: int = 12
     supervisor_wechat_knowledge_limit: int = 6
 
+    # --- 外部连接器（GitHub）---
+    # OAuth App 的 client_id（public，不含密钥）；设备码流程（Device Flow）必须在
+    # OAuth App 设置里勾选 Enable Device Flow 才能用。连接记录按本地账号隔离。
+    github_client_id: str = "Ov23li4zYbYUuu07mqB0"
+    # 申请的最小权限：repo = 读写私有仓库（列表/issue/PR 只读接口用），read:user = 读资料
+    github_scopes: str = "repo read:user"
+    github_api_base: str = "https://api.github.com"
+    github_oauth_base: str = "https://github.com"
+    github_timeout_seconds: float = 20.0
+
     # --- 密钥库（API Key Vault）---
     # 加密 API Key 的主密钥；留空 = 首次启动时在 key_vault_key_file 自动生成并 0600 落盘。
     # 主密钥丢失后已存 key 无法解密，只能重新录入（接口不会返回乱码明文）。

@@ -41,6 +41,7 @@ from flux.core.context.trust import VerificationLedger
 from flux.core.event.bus import EventBus, Events
 from flux.core.git_integration.client import GitClient
 from flux.core.git_integration.service import GitService
+from flux.core.github.service import GitHubConnectorService
 from flux.core.group.orchestrator import GroupOrchestrator
 from flux.core.group.repository import GroupRepository
 from flux.core.ide_completion import (
@@ -138,6 +139,8 @@ class Container:
     memory: MemoryService = field(init=False)
     task_repo: TaskRepository = field(init=False)
     key_vault: KeyVaultService = field(init=False)
+    #: 外部连接器（GitHub）：按本地账号隔离的 OAuth 连接 + 只读 REST 工具
+    github: GitHubConnectorService = field(init=False)
     task_runs: TaskRunBridge = field(init=False)
     #: Agent 切换（执行中排队、本轮收尾后生效、交接卡）
     agent_switch: AgentSwitchService = field(init=False)
@@ -215,6 +218,12 @@ class Container:
         self.task_repo = TaskRepository(self.session_factory)  # type: ignore[attr-defined]
         # 密钥库：Agent 模型通道的 API Key（加密落库），与任务级 model / api_key_id 配合解析
         self.key_vault = KeyVaultService(self.session_factory, self.settings)  # type: ignore[attr-defined]
+        # 外部连接器：令牌复用同一把密钥库主密钥加密，按本地账号隔离
+        self.github = GitHubConnectorService(
+            self.session_factory,  # type: ignore[attr-defined]
+            self.settings,
+            self.key_vault,
+        )
         # 提案的权威存储在 virtual_changes 表（实施计划 ④），进程重启后审核队列不丢
         self.proposal_repo = ProposalRepository(self.session_factory)  # type: ignore[attr-defined]
         # Apply 批日志（P0-1）：每次 apply_many 一行，先于磁盘操作落库；

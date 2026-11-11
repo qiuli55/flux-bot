@@ -309,6 +309,13 @@ class KeyVaultService:
 
     # --- 加密 ---
 
+    def seal_text(self, value: str) -> bytes:
+        """用同一把主密钥加密任意文本（外部连接器令牌复用，避免再实现一套主密钥管理）。"""
+        return self._seal(value)
+
+    def open_text(self, ciphertext: bytes) -> str:
+        return self._open(ciphertext)
+
     def _box_or_create(self) -> SecretBox:
         with self._box_lock:
             if self._box is None:

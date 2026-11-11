@@ -16,6 +16,7 @@ from flux.models.bot_notification import BotNotification
 from flux.models.bot_routine import BotRoutine
 from flux.models.connector import ConnectorConfig, ConnectorLog
 from flux.models.context import ContextBlob, ContextStep, ContextStepToken
+from flux.models.github import GithubConnection
 from flux.models.group import (
     ChatGroup,
     ChatGroupEpoch,
@@ -79,6 +80,7 @@ __all__ = [
     "ContextBlob",
     "ContextStep",
     "ContextStepToken",
+    "GithubConnection",
     "ImportedCapability",
     "KnowledgeChunk",
     "KnowledgeDocument",
