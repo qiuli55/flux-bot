@@ -17,7 +17,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from flux.core.agent_runtime.model_catalog import KEY_PROVIDERS, PROVIDER_OPENAI_COMPATIBLE
+from flux.core.agent_runtime.runtimes.base import ModelChannel
 from flux.core.model_gateway.base import ChatMessage, TokenUsage
+from flux.core.model_gateway.providers.registry import build_channel_provider
 from flux.core.model_gateway.router import ModelRouter
 from flux.errors import ValidationError
 from flux.logging import get_logger
@@ -116,11 +118,16 @@ class TaskAssistant:
         history: list[ChatMessage] | None = None,
         context: str | None = None,
         on_delta: Callable[[str], Awaitable[None]] | None = None,
+        channel: ModelChannel | None = None,
+        model: str = "",
     ) -> AssistantTurn:
         """调用模型生成一轮回复。history 为早前的对话（只含纯文本消息，升序）。
 
         `on_delta` 非空时走流式：把模型输出里用户可见的回复部分（JSON 协议的
         `reply` 字段或纯文本）按增量回调出去，前端据此逐字渲染气泡。
+
+        `channel` 非空时用任务选定的密钥库通道与模型作答（与 Agent 执行同一口径）；
+        留空则走平台默认的 ModelRouter。
         """
         system = SYSTEM_PROMPT.format(
             description=description,
@@ -131,8 +138,18 @@ class TaskAssistant:
         messages.extend((history or [])[-self._max_history :])
         messages.append(ChatMessage(role="user", content=message))
 
+        # 任务选了自己的模型时，这一轮回复也走同一条通道，否则用户会看到
+        # 「界面显示 grok，实际回复来自平台默认 deepseek」的错位。
+        override = (
+            build_channel_provider(channel, model=model) if channel is not None and model else None
+        )
+
         if on_delta is None:
-            result = await self._router.chat(messages)
+            result = (
+                await override.chat(messages)
+                if override is not None
+                else await self._router.chat(messages)
+            )
             reply, questions, confirmation, steps = parse_turn(result.content)
             secure_input = parse_secure_input(result.content)
             logger.info(
@@ -159,7 +176,7 @@ class TaskAssistant:
                 latency_ms=result.latency_ms,
             )
 
-        instance = self._router.select()
+        instance = override if override is not None else self._router.select()
         started = time.perf_counter()
         raw = ""
         shown = ""
@@ -188,7 +205,11 @@ class TaskAssistant:
             if raw:
                 raise
             logger.warning("助手流式调用失败，回退非流式 provider=%s", provider_name, exc_info=True)
-            result = await self._router.chat(messages)
+            result = (
+                await override.chat(messages)
+                if override is not None
+                else await self._router.chat(messages)
+            )
             raw = result.content
             provider_name, model_name = str(result.provider), result.model
             usage = result.usage

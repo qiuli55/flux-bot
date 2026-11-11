@@ -478,6 +478,8 @@ async def create_task_message(
     if files and content:
         prompt_text = content + "\n\n" + _attachments_brief(files)
     try:
+        # 任务选了自己的模型时，这一轮对话也用它回答（与后续 Agent 执行同一通道）
+        channel = await container.key_vault.channel_for_task(task)
         turn = await container.assistant.respond(
             description=task.description,
             message=prompt_text,
@@ -488,6 +490,8 @@ async def create_task_message(
             ],
             context=context,
             on_delta=_on_delta,
+            channel=channel,
+            model=(task.model or "").strip(),
         )
     except Exception as exc:  # noqa: BLE001 - 先通知正在看的客户端，再按原样抛给调用方
         await container.task_stream.publish(task_uuid, "assistant_error", {"error": str(exc)[:500]})
