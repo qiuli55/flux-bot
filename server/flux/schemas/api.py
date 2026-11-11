@@ -247,9 +247,10 @@ class TaskModelRequest(BaseModel):
     """切换任务的执行模型：必须是该 Agent runtime 支持的模型。
 
     `key_id` 非空表示模型来自密钥库；留空 = 原生模型。
+    `model` 留空表示清掉任务级覆盖，回到 Agent 默认模型（App 的「跟随默认」）。
     """
 
-    model: str = Field(min_length=1, max_length=128)
+    model: str = Field(default="", max_length=128)
     key_id: str | None = Field(default=None, max_length=64)
 
 
