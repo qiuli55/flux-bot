@@ -29,5 +29,7 @@ zstandard>=0.23
 # --- 测试与开发 ---
 pytest==9.1.1
 pytest-asyncio==1.4.0
+# CI 用 --timeout 防止单个用例挂死整条流水线（本地也用它兜住 doctor 之类的外部探针）
+pytest-timeout==2.4.0
 aiosqlite==0.22.1
 ruff==0.16.9
