@@ -24,6 +24,7 @@ from flux.schemas.api import (
     BotRoutineUpdateRequest,
     BotRunRequest,
     BotUpdateRequest,
+    TaskModelRequest,
 )
 
 router = APIRouter(prefix="/bots", tags=["bots"])
@@ -257,6 +258,24 @@ async def update_bot(
     """部分更新：只改请求里出现的字段（exclude_unset 保留「没传」与「传 null」的区别）。"""
     changes = payload.model_dump(exclude_unset=True)
     bot = await container.bots.update(_bot_id(bot_id), changes)
+    return ok(await _bot_payload(container, bot))
+
+
+@router.post("/{bot_id}/model")
+async def set_bot_model(
+    bot_id: str,
+    payload: TaskModelRequest,
+    container: Container = Depends(get_container),
+) -> dict[str, object]:
+    """切换 Bot 的默认执行模型；`model` 留空 = 回到平台默认。
+
+    单列一个接口而不是走 PATCH：App 的 HttpURLConnection 对 PATCH 支持不稳，
+    切换模型只需要改 model / key_id 两个字段。
+    """
+    bot = await container.bots.update(
+        _bot_id(bot_id),
+        {"model": payload.model, "key_id": payload.key_id},
+    )
     return ok(await _bot_payload(container, bot))
 
 
