@@ -27,6 +27,7 @@ from flux.core.agent_runtime.session_repository import TaskRuntimeSessionReposit
 from flux.core.agent_runtime.trace import RunTraceRecorder
 from flux.core.agent_runtime.trace_repository import RunTraceRepository
 from flux.core.billing.service import BillingService
+from flux.core.bot.conversation import BotConversationService
 from flux.core.bot.service import BotService
 from flux.core.capability_import.repository import ImportedCapabilityRepository
 from flux.core.capability_import.scanners import AgentScanner
@@ -171,6 +172,8 @@ class Container:
     task_run_service: TaskRunService = field(init=False)
     #: Bot 模式：常驻 Bot 的生命周期编排与定时触发（对话模式不经过它）
     bots: BotService = field(init=False)
+    #: Bot 对话轮次：持久化 turn + 每 Bot 串行后台队列（legacy 对话也复用其助理逻辑）
+    bot_conversation: BotConversationService = field(init=False)
     # IDE 行内补全（AI_COMPLETION_SPEC）：偏好/当前 Agent 落盘 + 模型解析 + 流式生成
     completion_prefs: CompletionPrefsStore = field(init=False)
     completion_resolver: CompletionModelResolver = field(init=False)
@@ -448,6 +451,8 @@ class Container:
             self,
             interval_seconds=self.settings.bot_scheduler_interval_seconds,  # type: ignore[attr-defined]
         )
+        # Bot 对话：一轮落一条 bot_turns，后台按 Bot 串行调用同一个助手逻辑。
+        self.bot_conversation = BotConversationService(self)
         # 上游瞬时故障（429 / ReadTimeout）自动续跑一轮：事件桥只做判定与冷却，
         # 真正重新起 Run 交给 TaskRunService（沿用任务自己的 Agent / 模型 / 权限模式）。
         self.task_runs.set_retry_handler(self._auto_retry_task)
@@ -631,6 +636,8 @@ class Container:
             return ModelProvider.LOCAL
 
     async def dispose(self, *, close_terminal_sessions: bool = True) -> None:
+        # Bot 对话 worker 先停：它要写 bot_turns / task_messages，不能跑在 dispose 之后。
+        await self.bot_conversation.shutdown()
         # 退出时先停看护循环并清理仍在跑的 Agent 进程树，再释放连接（P2-15 §2.5）
         await self.human_pty.shutdown()
         await self.terminal.shutdown(close_sessions=close_terminal_sessions)

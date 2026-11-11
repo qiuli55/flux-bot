@@ -186,6 +186,18 @@ class BotMemoryCreateRequest(BaseModel):
     relevance: BotMemoryRelevance = BotMemoryRelevance.DIRECT
 
 
+class BotTurnCreateRequest(BaseModel):
+    """给 Bot 发一条对话消息（异步轮次）。
+
+    HTTP 只落 queued 就返回；客户端用 GET /bots/{id}/turns/{turn_id} 长轮询结果。
+    `client_turn_id` 是幂等键：网络重试带同一个值不会产生第二轮。
+    """
+
+    content: str = Field(min_length=1, max_length=20_000)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=5)
+    client_turn_id: str | None = Field(default=None, max_length=128)
+
+
 class TaskMessageCreateRequest(BaseModel):
     """发一条任务消息（任务执行中心的对话输入）。
 

@@ -146,6 +146,19 @@ class BotService:
             _day_start(now or _utcnow(), self._tz)
         )
 
+    async def budget_block(
+        self, bot: Bot, *, now: datetime | None = None
+    ) -> tuple[int, int] | None:
+        """预算是否已用完：返回 (上限, 今日已用)，无上限或未超额返回 None。
+
+        对话轮次与定时/手动开工共用同一份预算口径，避免两套账。
+        """
+        return await self._budget_block(bot, now=_as_utc(now) or _utcnow())
+
+    async def set_chat_task_id(self, bot_id: uuid.UUID, task_id: uuid.UUID) -> Bot:
+        """记住 Bot 的唯一对话任务（懒创建后回写，供后续轮次复用）。"""
+        return await self._repo.update(bot_id, {"chat_task_id": task_id})
+
     # --- 配置 ---
 
     async def create(

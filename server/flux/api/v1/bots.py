@@ -6,14 +6,19 @@ Bot 与「对话」共用同一套执行链路：每次开工都落一条 tasks 
 
 from __future__ import annotations
 
+import json
 import uuid
+from collections.abc import AsyncIterator
+from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query, Response
+from fastapi.responses import StreamingResponse
 
 from flux.api.deps import get_container
 from flux.api.response import ok
 from flux.container import Container
+from flux.core.attachment_store import resolve_uploads
 from flux.enums import BotMemoryRelevance, BotStatus, TaskStatus
 from flux.errors import BadRequestError, NotFoundError
 from flux.models.bot import Bot
@@ -23,6 +28,7 @@ from flux.schemas.api import (
     BotRoutineCreateRequest,
     BotRoutineUpdateRequest,
     BotRunRequest,
+    BotTurnCreateRequest,
     BotUpdateRequest,
     TaskModelRequest,
 )
@@ -60,6 +66,49 @@ def _group_uuid(value: str) -> uuid.UUID:
         return uuid.UUID(value)
     except ValueError as exc:
         raise BadRequestError("group_id 不是合法的 UUID", details={"group_id": value}) from exc
+
+
+def _turn_id(value: str) -> uuid.UUID:
+    """路径参数非法时按「Turn 不存在」处理（与任务/记忆的 404 语义一致）。"""
+    try:
+        return uuid.UUID(value)
+    except ValueError as exc:
+        raise NotFoundError(f"Turn {value} 不存在", details={"turn_id": value}) from exc
+
+
+def _parse_message_uuid(value: str) -> uuid.UUID:
+    """对话翻页游标里的消息 id；非法时按请求错误拒绝。"""
+    try:
+        return uuid.UUID(value)
+    except ValueError as exc:
+        raise BadRequestError("before_id 不是合法的消息 id", details={"before_id": value}) from exc
+
+
+def _turn_before(value: str | None) -> datetime | None:
+    """分页游标：`before` 是上一页最后一条的 created_at（ISO 8601）。
+
+    为方便客户端，也支持直接传上一页最后一条的 turn id（见 endpoint 里的解析）。
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise BadRequestError("before 必须是 ISO 8601 时间", details={"before": value}) from exc
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+async def _resolve_turn_before(
+    container: Container, bot: Bot, value: str | None
+) -> datetime | None:
+    if not value:
+        return None
+    try:
+        turn_uuid = uuid.UUID(value)
+    except ValueError:
+        return _turn_before(value)
+    turn = await container.bot_conversation.get_turn(bot.id, turn_uuid)
+    return turn.created_at
 
 
 def _bot_dict(container: Container, bot: Bot, *, tokens_used: int = 0) -> dict[str, Any]:
@@ -328,6 +377,161 @@ async def list_bot_tasks(
         raise BadRequestError("limit 必须在 1~200 之间", details={"limit": limit})
     tasks = await container.task_repo.list(bot_id=target.id, status=wanted, limit=limit)
     return ok([t.to_dict() for t in tasks], metadata={"count": len(tasks)})
+
+
+@router.post("/{bot_id}/turns")
+async def create_bot_turn(
+    bot_id: str,
+    payload: BotTurnCreateRequest,
+    response: Response,
+    container: Container = Depends(get_container),
+) -> dict[str, object]:
+    """给 Bot 发一条对话消息：入队后立即返回 202（重放 client_turn_id 返回 200）。
+
+    预算在开始前检查；超限返回 409，错误码 `budget_exhausted`（与手动开工一致）。
+    Bot 暂停时同样 409，恢复后才能继续对话。
+    """
+    bot = await container.bots.get(_bot_id(bot_id))
+    files = resolve_uploads(container.settings, payload.attachment_ids)
+    turn, created = await container.bot_conversation.create_turn(
+        bot,
+        content=payload.content,
+        files=files,
+        client_turn_id=payload.client_turn_id,
+    )
+    response.status_code = 202 if created else 200
+    return ok({"turn": await container.bot_conversation.turn_payload(turn)})
+
+
+@router.get("/{bot_id}/turns")
+async def list_bot_turns(
+    bot_id: str,
+    limit: int = 50,
+    before: str | None = None,
+    container: Container = Depends(get_container),
+) -> dict[str, object]:
+    """最近的 Bot 对话轮次（按创建时间倒序）；before 为上一页最后一条的 created_at。"""
+    bot = await container.bots.get(_bot_id(bot_id))
+    if limit < 1 or limit > 200:
+        raise BadRequestError("limit 必须在 1~200 之间", details={"limit": limit})
+    turns = await container.bot_conversation.list_turns(
+        bot.id, limit=limit, before=await _resolve_turn_before(container, bot, before)
+    )
+    payloads = [await container.bot_conversation.turn_payload(turn) for turn in turns]
+    return ok(
+        payloads,
+        metadata={
+            "count": len(payloads),
+            "next_before": payloads[-1]["created_at"] if payloads else None,
+        },
+    )
+
+
+@router.get("/{bot_id}/turns/{turn_id}")
+async def get_bot_turn(
+    bot_id: str,
+    turn_id: str,
+    wait: float = Query(default=0, ge=0, le=30),
+    container: Container = Depends(get_container),
+) -> dict[str, object]:
+    """查询一轮对话；`wait` 秒内等待状态变化（长轮询），终态立即返回。"""
+    target_bot = _bot_id(bot_id)
+    target_turn = _turn_id(turn_id)
+    await container.bots.get(target_bot)
+    turn = await container.bot_conversation.wait_for_turn(
+        target_bot, target_turn, wait_seconds=wait
+    )
+    return ok({"turn": await container.bot_conversation.turn_payload(turn)})
+
+
+@router.get("/{bot_id}/turns/{turn_id}/stream")
+async def stream_bot_turn(
+    bot_id: str,
+    turn_id: str,
+    after_seq: int = 0,
+    container: Container = Depends(get_container),
+) -> StreamingResponse:
+    """一轮对话的 SSE 增量（assistant_start / delta / message / error）。
+
+    `bot_turns` 仍是真相源；这里只是把 task_stream 中带同一 turn_id 的事件转发出去。
+    回合已结束时先补缓冲再关闭连接，避免客户端连上来后一直等不到收尾。
+    """
+    target_bot = _bot_id(bot_id)
+    target_turn = _turn_id(turn_id)
+    if after_seq < 0:
+        raise BadRequestError("after_seq 不能为负数", details={"after_seq": after_seq})
+    await container.bots.get(target_bot)
+    turn = await container.bot_conversation.get_turn(target_bot, target_turn)
+    terminal = {"completed", "failed", "cancelled"}
+
+    def _format(event: Any) -> str:
+        data = json.dumps(event.to_dict(), ensure_ascii=False)
+        return f"id: {event.seq}\nevent: turn.event\ndata: {data}\n\n"
+
+    async def generate() -> AsyncIterator[str]:
+        if turn.status in terminal:
+            for event in container.task_stream.poll(turn.task_id, after_seq=after_seq):
+                if event.data.get("turn_id") == str(target_turn):
+                    yield _format(event)
+            return
+        async for event in container.task_stream.stream(turn.task_id, after_seq=after_seq):
+            if event is None:
+                yield ": keep-alive\n\n"
+                continue
+            if event.data.get("turn_id") != str(target_turn):
+                continue
+            yield _format(event)
+            if event.type in ("assistant_message", "assistant_error"):
+                current = await container.bot_conversation.get_turn(target_bot, target_turn)
+                if current.status in terminal:
+                    return
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/{bot_id}/conversation")
+async def get_bot_conversation(
+    bot_id: str,
+    limit: int = 50,
+    before_id: str | None = None,
+    container: Container = Depends(get_container),
+) -> dict[str, object]:
+    """Bot 当前对话任务的消息（seq 升序）；还没有对话时返回空列表。
+
+    `before_id` 可传消息 seq（向上翻页游标），也可传一条消息的 UUID
+    （服务端换算成它的 seq），两种客户端都容易用。
+    """
+    bot = await container.bots.get(_bot_id(bot_id))
+    if limit < 1 or limit > 200:
+        raise BadRequestError("limit 必须在 1~200 之间", details={"limit": limit})
+    before_seq: int | None = None
+    if before_id:
+        if before_id.isdigit():
+            before_seq = int(before_id)
+        elif bot.chat_task_id is not None:
+            message = await container.task_repo.get_message(
+                bot.chat_task_id, _parse_message_uuid(before_id)
+            )
+            if message is not None:
+                before_seq = message.seq
+    chat_task_id, messages = await container.bot_conversation.conversation(
+        bot, limit=limit, before_id=before_seq
+    )
+    return ok(
+        {
+            "chat_task_id": str(chat_task_id) if chat_task_id is not None else None,
+            "messages": [message.to_dict() for message in messages],
+        },
+        metadata={"count": len(messages)},
+    )
 
 
 @router.get("/{bot_id}/memories")

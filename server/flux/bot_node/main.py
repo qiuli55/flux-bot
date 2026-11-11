@@ -132,6 +132,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Bot 开工要认 agent 档案与令牌，启动时先重建内存注册表。
         await container.agents.load_from_db()
         await container.agent_tokens.migrate_legacy_tokens()
+        # 单进程部署：上一进程遗留的 Bot 对话 turn 不会自动续跑，统一收成 interrupted。
+        await container.bot_conversation.recover_interrupted()
         # 上一轮进程被杀时中断的工作区 Apply 需要按磁盘事实恢复，否则 Bot 的改动会卡在 applying。
         await container.workspace.recover_interrupted_applies()
         if app_settings.dsh_enabled:

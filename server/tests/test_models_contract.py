@@ -130,6 +130,9 @@ SPEC_TABLES = {
     # 以及开工失败等主动通知（read_at 为空即未读）。
     "bot_routines",
     "bot_notifications",
+    # Bot 对话轮次（迁移 e4f1a2b3c4d5）：一轮用户消息 → 助手回复的持久化状态，
+    # 同时承担 client_turn_id 幂等与重启后的 interrupted 恢复。
+    "bot_turns",
 }
 
 

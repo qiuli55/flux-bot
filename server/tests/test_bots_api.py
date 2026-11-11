@@ -44,6 +44,7 @@ _BOT_KEYS = {
     "next_run_at",
     "last_run_at",
     "last_task_id",
+    "chat_task_id",
     "last_settled_task_id",
     "failure_threshold",
     "consecutive_failures",
