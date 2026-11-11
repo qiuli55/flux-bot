@@ -316,6 +316,19 @@ class Settings(BaseSettings):
     github_oauth_base: str = "https://github.com"
     github_timeout_seconds: float = 20.0
 
+    # --- Bot 桌面（Hermes 云电脑 noVNC）---
+    # App 进入「Bot 桌面」时向服务端要入口参数。隧道地址会随隧道重启变化，所以放在
+    # 公开的 desktop.json 里由服务端代读；token / bridge_key 属于凭据，只从环境变量下发，
+    # 不进 App 源码（公开仓库不泄漏），轮换也不需要重新发版。
+    desktop_config_url: str = "https://flux.qiuli55.top/fluxbot-mobile/desktop.json"
+    # 桌面访问令牌与桥接密钥；留空 = 桌面能力不可用（接口返回 configured=false）
+    desktop_token: str | None = None
+    desktop_bridge_key: str | None = None
+    # desktop.json 读不到时的兜底地址（通常是上一次可用的隧道）
+    desktop_gateway: str | None = None
+    desktop_bridge_url: str | None = None
+    desktop_timeout_seconds: float = 10.0
+
     # --- 密钥库（API Key Vault）---
     # 加密 API Key 的主密钥；留空 = 首次启动时在 key_vault_key_file 自动生成并 0600 落盘。
     # 主密钥丢失后已存 key 无法解密，只能重新录入（接口不会返回乱码明文）。

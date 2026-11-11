@@ -38,6 +38,7 @@ from flux.core.context.redact import RedactionStore
 from flux.core.context.repository import ContextStepRepository
 from flux.core.context.store import ContentStore
 from flux.core.context.trust import VerificationLedger
+from flux.core.desktop.service import DesktopService
 from flux.core.event.bus import EventBus, Events
 from flux.core.git_integration.client import GitClient
 from flux.core.git_integration.service import GitService
@@ -141,6 +142,8 @@ class Container:
     key_vault: KeyVaultService = field(init=False)
     #: 外部连接器（GitHub）：按本地账号隔离的 OAuth 连接 + 只读 REST 工具
     github: GitHubConnectorService = field(init=False)
+    #: Bot 桌面入口参数：公开隧道地址 + 环境变量里的凭据
+    desktop: DesktopService = field(init=False)
     task_runs: TaskRunBridge = field(init=False)
     #: Agent 切换（执行中排队、本轮收尾后生效、交接卡）
     agent_switch: AgentSwitchService = field(init=False)
@@ -224,6 +227,8 @@ class Container:
             self.settings,
             self.key_vault,
         )
+        # Bot 桌面：只做公开隧道地址代读 + 凭据拼装，无状态
+        self.desktop = DesktopService(self.settings)
         # 提案的权威存储在 virtual_changes 表（实施计划 ④），进程重启后审核队列不丢
         self.proposal_repo = ProposalRepository(self.session_factory)  # type: ignore[attr-defined]
         # Apply 批日志（P0-1）：每次 apply_many 一行，先于磁盘操作落库；
