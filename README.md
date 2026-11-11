@@ -26,6 +26,27 @@ docker compose up -d --build
 curl http://127.0.0.1:8600/api/v1/health
 ```
 
+### 鉴权与网络暴露
+
+**`FLUX_AUTH_TOKEN` 是必填项。** 没有它时 Bot 节点会 fail-closed：只接受本机回环直连
+（`127.0.0.1` / `::1`，且没有 `X-Forwarded-For` 等转发头），其他请求一律 401。
+这会直接拦住创建 Bot、触发无人值守任务等会执行命令的接口。
+
+Docker Compose 默认把端口绑在宿主机回环上（`127.0.0.1:8600`），只有同机进程能访问。
+只有反向代理在另一台机器 / 需要局域网直连时，才把 `FLUX_BIND_ADDR` 改成 `0.0.0.0`：
+
+```bash
+FLUX_BIND_ADDR=0.0.0.0    # 此时必须同时设置 FLUX_AUTH_TOKEN
+```
+
+特别注意：**在 Docker 内，经发布端口进来的请求来自 docker 网关，不是回环地址。**
+因此即使从宿主机访问 `127.0.0.1:8600`，容器内看到的客户端也不是 loopback；
+没有配置 `FLUX_AUTH_TOKEN` 时这些请求会被 401 拒绝。`/api/v1/health` 是唯一免鉴权的
+探针接口，供 Docker `HEALTHCHECK` 使用。
+
+旧的无鉴权行为只能显式开启：`FLUX_ALLOW_NO_AUTH=true`。它仅适用于完全可信的内网，
+启动时会打印 WARNING；不要与公网暴露一起使用。
+
 ### 数据持久化
 
 数据全部落在挂载卷 `./data`，容器重建不会丢失：

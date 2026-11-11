@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     # REST 面单用户令牌（公网暴露前置，见 flux.api.auth）。留空 = 关闭鉴权，
     # 本地开发与桌面端（同机直连）零配置可用；公网部署必须显式设置。
     auth_token: str | None = None
+    # 未设置 auth_token 时的兜底策略（FLUX_ALLOW_NO_AUTH）：
+    #   None  = 旧行为（整体开放，仅 flux.main 保留，兼容既有测试）；
+    #   False = 仅允许同机回环直连，其余请求一律 401（Bot 节点默认，fail-closed）；
+    #   True  = 显式开放（仅限完全可信的内网，启动时告警）。
+    allow_no_auth: bool | None = None
     # Electron 桌面端用于“打开文件夹”的一次运行期能力令牌；普通 Web 客户端不能使用。
     desktop_control_token: str | None = None
     # 脱敏映射表（context_redactions）的加密密钥（FLUX_CONTEXT_MECHANISM §10.1）。

@@ -15,8 +15,11 @@ MCP 面本来就有 Agent 令牌，REST 面此前完全没有身份校验（只�
    `make run` + 本机浏览器、本机 CLI 探活都不必带令牌；
 3. 其余一律 401（`unauthenticated`，不区分"没带 / 带错 / 格式不对"——区分等于给探测信号）。
 
-`FLUX_AUTH_TOKEN` 留空 = 关掉第 1 条，保持本地开发零配置；账号云令牌（第 0 条）只认
-`FLUX_CLOUD_SECRET_KEY` 配上的那一个密钥。
+`FLUX_AUTH_TOKEN` 留空时由 `FLUX_ALLOW_NO_AUTH` 决定兜底策略：
+- 未显式设置（None）= 旧行为，整体开放（仅 flux.main 兼容，Bot 节点会把它收敛为 False）；
+- False = 只允许第 2 条的同机直连，其余请求 401（Bot 节点默认，fail-closed）；
+- True = 显式开放（仅限完全可信的内网，启动时告警）。
+账号云令牌（第 0 条）只认 `FLUX_CLOUD_SECRET_KEY` 配上的那一个密钥。
 
 第 2 条是**反向代理配置的硬约束**：反代必须转发 `X-Forwarded-For`（见 `deploy/nginx-flux.conf`
 里的 `proxy_set_header`），否则经代理进来的公网请求会以"回环 + 无转发头"的形态被误判为本地直连。
@@ -78,7 +81,7 @@ def require_rest_auth(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Security(bearer_scheme),
 ) -> None:
-    """`/api/v1` 的统一鉴权依赖。未配置 `FLUX_AUTH_TOKEN` 时整体跳过。"""
+    """`/api/v1` 的统一鉴权依赖（未配置令牌时的兜底策略见模块文档）。"""
     settings = get_container(request).settings
     provided = (
         credentials.credentials
@@ -91,7 +94,16 @@ def require_rest_auth(
 
     expected = (settings.auth_token or "").strip()
     if not expected:
-        return
+        # None = 旧 flux.main 行为（开放）；True = 显式开放；False = Bot 节点的 fail-closed。
+        if settings.allow_no_auth is not False:
+            return
+        if is_trusted_local(request):
+            return
+        raise AuthenticationError(
+            "未配置 FLUX_AUTH_TOKEN：Bot 节点只接受本机回环直连，其他请求一律拒绝。"
+            "请在 .env 设置 FLUX_AUTH_TOKEN；若部署在完全可信的内网，"
+            "可显式设置 FLUX_ALLOW_NO_AUTH=true 启用旧的无鉴权模式。"
+        )
     if is_trusted_local(request):
         return
     # 常量时间比对：不因"前缀对上了"而早退，不给计时侧信道。
