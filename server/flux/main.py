@@ -36,6 +36,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         nonlocal log_upload_task, memory_sync_task, billing_sync_task, context_sync_task
+        # 事件总线先起：Redis 后端在此订阅跨进程频道；连接失败只降级并告警，
+        # 不阻塞启动。进程内后端是空操作。
+        await container.bus.start()
         # P3-16：Agent 档案的权威在 agents 表，启动时重建内存注册表（canonical UUID 不因重启而变），
         # 并把历史"自由字符串"令牌迁移到 canonical id 上。
         await container.agents.load_from_db()
