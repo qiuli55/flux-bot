@@ -119,6 +119,8 @@ data/dsh-ws/              DSH 工作目录
 data/workspace/           Bot 读写文件的工作区
 ```
 
+进程以 uid 1000（用户 `flux`）运行，`./data` 卷必须对该用户可写（以 root 启动容器时 entrypoint 会自动 chown）。
+
 换机器时整目录拷走即可，不需要额外导出。其中 `data/home/.flux/key-vault.key` 是
 加密 API Key / GitHub Token 的主密钥，务必单独备份；也可以设置
 `FLUX_KEY_VAULT_SECRET`，这样不再依赖这个文件。

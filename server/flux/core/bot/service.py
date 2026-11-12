@@ -26,6 +26,7 @@ from flux.core.bot.routine_repository import BotRoutineRepository
 from flux.core.event.bus import WILDCARD, Events
 from flux.core.group.avatar import normalize_color, normalize_shape
 from flux.core.mcp.tools import ALL_TOOLS, FORBIDDEN_TOOL_NAMES, TOOLS
+from flux.core.virtual_workspace.path_guard import within_root
 from flux.enums import BotStatus, DecisionMode, PermissionMode, TaskStatus
 from flux.errors import BadRequestError, ConflictError, NotFoundError
 from flux.logging import get_logger
@@ -171,7 +172,7 @@ class BotService:
         agent_id: str | None = None,
         model: str | None = None,
         key_id: str | None = None,
-        permission_mode: PermissionMode = PermissionMode.UNATTENDED,
+        permission_mode: PermissionMode = PermissionMode.NORMAL,
         decision_mode: DecisionMode = DecisionMode.AUTO,
         workspace: str | None = None,
         schedule: str | None = None,
@@ -251,7 +252,7 @@ class BotService:
 
         if "permission_mode" in changes:
             raw = changes["permission_mode"]
-            values["permission_mode"] = str(raw or PermissionMode.UNATTENDED)
+            values["permission_mode"] = str(raw or PermissionMode.NORMAL)
         if "decision_mode" in changes:
             raw = changes["decision_mode"]
             values["decision_mode"] = str(raw or DecisionMode.AUTO)
@@ -588,7 +589,7 @@ class BotService:
     async def _settle_previous(self, bot: Bot, *, now: datetime | None = None) -> Bot:
         """把上一轮开工的终态计入健康统计（同一条任务只结算一次）。
 
-        无人值守的 Bot 没有可靠的完成回调，调度器每轮 tick 顺带结算即可：
+        Bot 没有可靠的完成回调，调度器每轮 tick 顺带结算即可：
         连续失败累积到阈值就把 Bot 自动暂停，避免无意义地反复重试。
         """
         task_id = bot.last_task_id
@@ -734,7 +735,7 @@ class BotService:
             project_id=None,
             agent_id=bot.agent_id,
             decision_mode=DecisionMode(bot.decision_mode or DecisionMode.AUTO),
-            permission_mode=PermissionMode(bot.permission_mode or PermissionMode.UNATTENDED),
+            permission_mode=PermissionMode(bot.permission_mode or PermissionMode.NORMAL),
             model=bot.model,
             api_key_id=bot.api_key_id,
             bot_name=bot.name,
@@ -789,7 +790,21 @@ class BotService:
         path = Path(text).expanduser()
         if not path.is_absolute():
             raise BadRequestError("workspace 必须是绝对路径", details={"workspace": text})
-        return str(path)
+        root_text = (self._container.settings.workspace_root or "").strip()
+        if not root_text:
+            raise BadRequestError(
+                "未配置 FLUX_WORKSPACE_ROOT，不能使用自定义工作目录；"
+                "请先为服务设置 FLUX_WORKSPACE_ROOT",
+                details={"workspace": text},
+            )
+        resolved = path.resolve()
+        root = Path(root_text).expanduser().resolve()
+        if not within_root(root, resolved):
+            raise BadRequestError(
+                "workspace 必须位于 FLUX_WORKSPACE_ROOT 之内",
+                details={"workspace": str(resolved), "workspace_root": str(root)},
+            )
+        return str(resolved)
 
     def _threshold(self, value: int | None) -> int:
         """连续失败阈值：0 表示永不自动暂停，范围 0~20。"""

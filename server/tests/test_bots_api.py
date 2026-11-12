@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import asyncio
-import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -84,11 +83,11 @@ def _create(client: TestClient, **overrides: object) -> dict:
 
 
 def test_create_bot_defaults(client: TestClient) -> None:
-    """默认：active、无人值守、无定时、工作目录按 <dsh_home>/bots/<id>/workspace 派生。"""
+    """默认：active、需人工审核、无定时、工作目录按 <dsh_home>/bots/<id>/workspace 派生。"""
     bot = _create(client)
     assert set(bot) == _BOT_KEYS
     assert bot["status"] == "active"
-    assert bot["permission_mode"] == "unattended"
+    assert bot["permission_mode"] == "normal"
     assert bot["decision_mode"] == "auto"
     assert bot["schedule"] is None
     assert bot["next_run_at"] is None
@@ -128,6 +127,65 @@ def test_create_bot_rejects_relative_workspace(client: TestClient) -> None:
     assert response.status_code == 400
 
 
+def test_create_bot_rejects_custom_workspace_without_root(
+    client: TestClient, tmp_path: Path
+) -> None:
+    response = client.post(
+        f"{PREFIX}/bots", json={"name": "无根工作区", "workspace": str(tmp_path / "workspace")}
+    )
+    assert response.status_code == 400
+    assert "FLUX_WORKSPACE_ROOT" in response.text
+
+
+def test_create_bot_accepts_workspace_under_root(
+    apply_client: TestClient, workspace_root: Path
+) -> None:
+    workspace = workspace_root / "bots" / "custom"
+    workspace.mkdir(parents=True)
+    bot = _create(apply_client, workspace=str(workspace))
+    assert bot["workspace"] == str(workspace.resolve())
+
+
+@pytest.mark.parametrize("outside", ["/etc", "sibling", "database_dir"])
+def test_create_bot_rejects_workspace_outside_root(
+    apply_client: TestClient, workspace_root: Path, outside: str
+) -> None:
+    if outside == "/etc":
+        workspace = Path("/etc")
+    elif outside == "sibling":
+        workspace = workspace_root.parent / "sibling"
+    else:
+        # workspace_root.parent 就是测试数据库 flux-test.db 所在目录
+        workspace = workspace_root.parent
+    response = apply_client.post(
+        f"{PREFIX}/bots", json={"name": "越界工作区", "workspace": str(workspace)}
+    )
+    assert response.status_code == 400, response.text
+
+
+def test_create_bot_allows_empty_workspace(apply_client: TestClient, workspace_root: Path) -> None:
+    for workspace in ("", None):
+        payload = {"name": "默认工作区", "workspace": workspace}
+        response = apply_client.post(f"{PREFIX}/bots", json=payload)
+        assert response.status_code == 200, response.text
+        assert response.json()["data"]["workspace"] is None
+
+
+def test_patch_bot_workspace_is_confined_to_root(
+    apply_client: TestClient, workspace_root: Path
+) -> None:
+    bot = _create(apply_client)
+    outside = apply_client.patch(
+        f"{PREFIX}/bots/{bot['id']}", json={"workspace": str(workspace_root.parent)}
+    )
+    assert outside.status_code == 400
+
+    inside = workspace_root / "patched"
+    accepted = apply_client.patch(f"{PREFIX}/bots/{bot['id']}", json={"workspace": str(inside)})
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["data"]["workspace"] == str(inside.resolve())
+
+
 def test_create_bot_unknown_agent_is_404(client: TestClient) -> None:
     response = client.post(f"{PREFIX}/bots", json={"name": "野 Agent", "agent_id": "no-such-agent"})
     assert response.status_code == 404
@@ -146,7 +204,7 @@ def test_patch_pause_clears_next_run(client: TestClient) -> None:
 
 
 def test_run_now_creates_bot_task_hidden_from_chat_list(client: TestClient) -> None:
-    bot = _create(client, workspace=str(Path(tempfile.gettempdir()) / "flux-bot-test"))
+    bot = _create(client)
     started = client.post(f"{PREFIX}/bots/{bot['id']}/run")
     assert started.status_code == 200, started.text
     payload = started.json()["data"]

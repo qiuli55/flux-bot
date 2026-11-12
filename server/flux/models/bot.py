@@ -41,10 +41,10 @@ class Bot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     agent_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     api_key_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
-    #: 无人值守的 Bot 默认免审核（PermissionMode.UNATTENDED）；
-    #: 需要人工把关的场景由用户显式改成 normal / plan。
+    #: 默认需要人工审核高风险工具调用（PermissionMode.NORMAL）；
+    #: 无人值守场景由用户显式改成 unattended / full。
     permission_mode: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="unattended", server_default="unattended"
+        String(16), nullable=False, default="normal", server_default="normal"
     )
     decision_mode: Mapped[str] = mapped_column(
         String(16), nullable=False, default="auto", server_default="auto"
@@ -116,7 +116,7 @@ class Bot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "avatar_color": self.avatar_color or "violet",
             "agent_id": str(self.agent_id) if self.agent_id is not None else None,
             "model": self.model,
-            "permission_mode": self.permission_mode or "unattended",
+            "permission_mode": self.permission_mode or "normal",
             "decision_mode": self.decision_mode or "auto",
             "workspace": self.workspace,
             "status": self.status or "active",
