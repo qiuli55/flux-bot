@@ -80,6 +80,15 @@ class Task(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     bot_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("bots.id", ondelete="SET NULL"), index=True, nullable=True
     )
+    # 后台子任务的父对话任务（通常是 bots.chat_task_id）。普通对话/开工任务为 NULL。
+    # 子任务自己的状态与结果通过父任务的 kind=subtask 消息对外可见，父任务被清理时
+    # 只把关联置空，子任务历史仍可查询（不级联删除执行记录）。
+    parent_task_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("tasks.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
     # 本轮执行的工作目录快照。Bot 每次开工时把它的独立目录写进来，
     # CLI runtime 据此把子进程 cwd 放到 bots/<id>/workspace，而不是全局工作区。
     workspace: Mapped[str | None] = mapped_column(String(512), nullable=True)
@@ -122,6 +131,9 @@ class Task(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "avatar_shape": self.avatar_shape or "circle",
             "avatar_color": self.avatar_color or "violet",
             "bot_id": str(self.bot_id) if self.bot_id is not None else None,
+            "parent_task_id": (
+                str(self.parent_task_id) if self.parent_task_id is not None else None
+            ),
         }
 
 
