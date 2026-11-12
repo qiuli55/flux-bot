@@ -538,6 +538,19 @@ class ConnectorExecuteRequest(BaseModel):
     agent_id: str | None = None
 
 
+class ConnectorInstallRequest(BaseModel):
+    """安装一个用户账号连接器。
+
+    - api_key 类连接器：必须提供 `api_key`；
+    - oauth 类连接器：本接口只做校验并提示改用对应登录流程（GitHub 为设备码登录）。
+    """
+
+    auth_type: str | None = Field(default=None, max_length=32)
+    api_key: str | None = Field(default=None, max_length=4096)
+    #: 不传时使用 catalog 定义里的默认 scopes。
+    scopes: list[str] | None = Field(default=None, max_length=64)
+
+
 class GitPathsRequest(BaseModel):
     paths: list[str] = Field(min_length=1, max_length=200)
 

@@ -16,6 +16,7 @@ from flux.models.bot_notification import BotNotification
 from flux.models.bot_routine import BotRoutine
 from flux.models.bot_turn import BotTurn
 from flux.models.connector import ConnectorConfig, ConnectorLog
+from flux.models.connector_installation import ConnectorInstallation
 from flux.models.context import ContextBlob, ContextStep, ContextStepToken
 from flux.models.device import Device, PairingCode
 from flux.models.github import GithubConnection
@@ -80,6 +81,7 @@ __all__ = [
     "ChatGroupMemory",
     "ChatGroupMessage",
     "ConnectorConfig",
+    "ConnectorInstallation",
     "ConnectorLog",
     "ContextBlob",
     "ContextStep",

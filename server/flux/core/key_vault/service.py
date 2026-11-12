@@ -388,6 +388,7 @@ class KeyVaultService:
                 for table, column in (
                     ("api_keys", "key_ciphertext"),
                     ("github_connections", "token_ciphertext"),
+                    ("connector_installations", "credential_ciphertext"),
                 ):
                     try:
                         row = conn.execute(
