@@ -82,6 +82,8 @@ def settings(tmp_path) -> Settings:
         # 同样显式钉死：开发机仓库根 .env 的鉴权令牌/工作区会让整批 REST 用例 401 或走错目录
         auth_token=None,
         desktop_control_token=None,
+        # 桌面入口测试不访问公网 desktop.json：默认置空，需要时用例注入 MockTransport
+        desktop_config_url="",
         workspace_root=None,
         # 不读开发机 ~/.flux 里的自定义套餐，避免扩展套餐影响内置断言
         billing_plans_file="",

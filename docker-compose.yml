@@ -7,7 +7,9 @@ services:
     env_file:
       - .env
     ports:
-      - "8600:8600"
+      # 默认只绑定宿主机回环：同机反向代理 / 本机浏览器可用，局域网不可直连。
+      # 需要跨机反代或局域网直连时再显式设置 FLUX_BIND_ADDR=0.0.0.0（此时必须配 FLUX_AUTH_TOKEN）。
+      - "${FLUX_BIND_ADDR:-127.0.0.1}:8600:8600"
     volumes:
       # Bot 定义、例程、任务记录、记忆、DSH 会话全部在这一个卷里
       - ./data:/data

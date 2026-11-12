@@ -16,6 +16,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from flux.core.agent_runtime.runtimes.base import DEFAULT_RUNTIME
 from flux.core.bot.cron import CronSchedule, parse_cron
@@ -25,6 +26,7 @@ from flux.core.bot.routine_repository import BotRoutineRepository
 from flux.core.event.bus import WILDCARD, Events
 from flux.core.group.avatar import normalize_color, normalize_shape
 from flux.core.mcp.tools import ALL_TOOLS, FORBIDDEN_TOOL_NAMES, TOOLS
+from flux.core.virtual_workspace.path_guard import within_root
 from flux.enums import BotStatus, DecisionMode, PermissionMode, TaskStatus
 from flux.errors import BadRequestError, ConflictError, NotFoundError
 from flux.logging import get_logger
@@ -34,6 +36,8 @@ from flux.models.bot_routine import BotRoutine
 from flux.models.task import Task
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from flux.container import Container
 
 logger = get_logger(__name__)
@@ -55,6 +59,13 @@ _EVENT_COOLDOWN_SECONDS = 60.0
 #: 白名单/触发表单的单条最大长度与条目数
 _MAX_LIST_ITEM_CHARS = 512
 _MAX_LIST_ITEMS = 64
+#: 漏跑补偿策略；skip 与旧行为一致（只开一轮，然后从当前时刻重新计时）。
+_MISSED_RUN_POLICIES = frozenset({"skip", "skip_silent", "catch_up"})
+_DEFAULT_MISSED_RUN_POLICY = "skip"
+#: catch_up 最多连续补跑的错过触发点；超过则直接跳到当前时刻之后，避免停机或
+#: 改系统时间后一次性触发大量带副作用的 Run。补跑是逐轮进行的，3 个槽位已够覆盖
+#: 一次短时重启，再往上收益很小、风险却放大。
+_MAX_CATCH_UP_SLOTS = 3
 #: 可配置的事件名（Events 里的字符串常量）
 _KNOWN_EVENTS = frozenset(
     value for value in vars(Events).values() if isinstance(value, str) and value != WILDCARD
@@ -65,10 +76,12 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _day_start(value: datetime) -> datetime:
-    """UTC 自然日起点：预算窗口按天重置，不用额外落库。"""
+def _day_start(value: datetime, tz: ZoneInfo | None = None) -> datetime:
+    """配置时区的自然日起点（本地午夜转换成 UTC），预算窗口据此重置。"""
+    zone = tz or ZoneInfo("UTC")
     moment = _as_utc(value) or _utcnow()
-    return moment.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_local = moment.astimezone(zone).replace(hour=0, minute=0, second=0, microsecond=0)
+    return start_local.astimezone(timezone.utc)
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -108,6 +121,8 @@ class BotService:
         initial_delay_seconds: float = 5.0,
     ) -> None:
         self._container = container
+        # cron 与每日预算统一按配置时区解释；Settings 加载时已校验过 IANA 名称。
+        self._tz = ZoneInfo(container.settings.timezone)
         self._repo = BotRepository(container.session_factory)  # type: ignore[attr-defined]
         self._routines = BotRoutineRepository(container.session_factory)  # type: ignore[attr-defined]
         self._notifications = BotNotificationRepository(
@@ -122,6 +137,8 @@ class BotService:
         self._event_last: dict[uuid.UUID, datetime] = {}
         #: 事件触发协程的强引用，避免 create_task 后被 GC 提前回收
         self._event_jobs: set[asyncio.Task[Any]] = set()
+        #: 每个 Bot 的「查忙 + 起一轮」锁：只覆盖开工准备，不覆盖整轮运行
+        self._launch_locks: dict[uuid.UUID, asyncio.Lock] = {}
 
     # --- 查询 ---
 
@@ -132,8 +149,23 @@ class BotService:
         return await self._repo.get(bot_id)
 
     async def tokens_used_today(self, *, now: datetime | None = None) -> dict[uuid.UUID, int]:
-        """每个 Bot 今天（UTC 自然日）已用的 token；账本按 `tasks.bot_id` 归因。"""
-        return await self._container.billing.tokens_by_bot_since(_day_start(now or _utcnow()))
+        """每个 Bot 今天（配置时区的自然日）已用的 token；账本按 `tasks.bot_id` 归因。"""
+        return await self._container.billing.tokens_by_bot_since(
+            _day_start(now or _utcnow(), self._tz)
+        )
+
+    async def budget_block(
+        self, bot: Bot, *, now: datetime | None = None
+    ) -> tuple[int, int] | None:
+        """预算是否已用完：返回 (上限, 今日已用)，无上限或未超额返回 None。
+
+        对话轮次与定时/手动开工共用同一份预算口径，避免两套账。
+        """
+        return await self._budget_block(bot, now=_as_utc(now) or _utcnow())
+
+    async def set_chat_task_id(self, bot_id: uuid.UUID, task_id: uuid.UUID) -> Bot:
+        """记住 Bot 的唯一对话任务（懒创建后回写，供后续轮次复用）。"""
+        return await self._repo.update(bot_id, {"chat_task_id": task_id})
 
     # --- 配置 ---
 
@@ -147,10 +179,12 @@ class BotService:
         agent_id: str | None = None,
         model: str | None = None,
         key_id: str | None = None,
-        permission_mode: PermissionMode = PermissionMode.UNATTENDED,
+        permission_mode: PermissionMode = PermissionMode.NORMAL,
         decision_mode: DecisionMode = DecisionMode.AUTO,
         workspace: str | None = None,
         schedule: str | None = None,
+        timezone: str | None = None,
+        missed_run_policy: str | None = None,
         failure_threshold: int = 3,
         token_budget: int | None = None,
         notify_on_failure: bool = True,
@@ -164,7 +198,9 @@ class BotService:
             raise BadRequestError("Bot 名称不能为空")
         agent_uuid = self._agent_uuid(agent_id)
         resolved_model, key_uuid = await self._resolve_model(agent_uuid, model=model, key_id=key_id)
-        cron = self._cron(schedule)
+        bot_timezone = self._clean_timezone(timezone)
+        policy = self._missed_policy(missed_run_policy)
+        cron = self._cron(schedule, tz=self._zone(bot_timezone))
         now = _utcnow()
         bot = await self._repo.create(
             name=cleaned,
@@ -180,6 +216,8 @@ class BotService:
             status=BotStatus.ACTIVE.value,
             schedule=cron.expression if cron else None,
             next_run_at=cron.next_after(now) if cron else None,
+            timezone=bot_timezone,
+            missed_run_policy=policy,
             failure_threshold=self._threshold(failure_threshold),
             token_budget=self._budget(token_budget),
             notify_on_failure=bool(notify_on_failure),
@@ -227,7 +265,7 @@ class BotService:
 
         if "permission_mode" in changes:
             raw = changes["permission_mode"]
-            values["permission_mode"] = str(raw or PermissionMode.UNATTENDED)
+            values["permission_mode"] = str(raw or PermissionMode.NORMAL)
         if "decision_mode" in changes:
             raw = changes["decision_mode"]
             values["decision_mode"] = str(raw or DecisionMode.AUTO)
@@ -250,10 +288,20 @@ class BotService:
         if "allowed_paths" in changes:
             values["allowed_paths"] = self._path_list(changes["allowed_paths"])
 
+        timezone_changed = "timezone" in changes
+        bot_timezone = (
+            self._clean_timezone(changes["timezone"]) if timezone_changed else bot.timezone
+        )
+        if timezone_changed:
+            values["timezone"] = bot_timezone
+        if "missed_run_policy" in changes:
+            values["missed_run_policy"] = self._missed_policy(changes["missed_run_policy"])
+
         schedule_changed = "schedule" in changes
-        cron = self._cron(bot.schedule)
+        zone = self._zone(bot_timezone)
+        cron = self._cron(bot.schedule, tz=zone)
         if schedule_changed:
-            cron = self._cron(changes["schedule"])
+            cron = self._cron(changes["schedule"], tz=zone)
             values["schedule"] = cron.expression if cron else None
 
         status_changed = changes.get("status") is not None
@@ -262,7 +310,7 @@ class BotService:
             values["status"] = status.value
         if status == BotStatus.PAUSED:
             values["next_run_at"] = None
-        elif schedule_changed or status_changed:
+        elif schedule_changed or timezone_changed or status_changed:
             values["next_run_at"] = cron.next_after(_utcnow()) if cron else None
             if status_changed:
                 # 手动恢复 = 重新计时：熔断计数与自动暂停原因一起清掉
@@ -272,6 +320,8 @@ class BotService:
         if not values:
             return bot
         updated = await self._repo.update(bot_id, values)
+        if timezone_changed:
+            await self._reschedule_routines(updated)
         if "event_triggers" in values:
             self._remember_triggers(updated)
         return updated
@@ -295,11 +345,11 @@ class BotService:
         schedule: str | None = None,
         enabled: bool = True,
     ) -> BotRoutine:
-        await self._repo.get(bot_id)
+        bot = await self._repo.get(bot_id)
         cleaned = (name or "").strip()
         if not cleaned:
             raise BadRequestError("例程名称不能为空")
-        cron = self._cron(schedule)
+        cron = self._cron(schedule, tz=self._zone_for(bot))
         return await self._routines.create(
             bot_id=bot_id,
             name=cleaned[:64],
@@ -317,6 +367,8 @@ class BotService:
             raise NotFoundError(
                 f"例程 {routine_id} 不属于 Bot {bot_id}", details={"routine_id": str(routine_id)}
             )
+        bot = await self._repo.get(bot_id)
+        zone = self._zone_for(bot)
         values: dict[str, Any] = {}
         if "name" in changes:
             name = (changes["name"] or "").strip()
@@ -327,7 +379,7 @@ class BotService:
             values["instruction"] = (changes["instruction"] or "").strip()[:8000]
         if "schedule" in changes:
             values["schedule"] = (
-                self._cron(changes["schedule"]).expression if changes["schedule"] else None
+                self._cron(changes["schedule"], tz=zone).expression if changes["schedule"] else None
             )
         if "enabled" in changes:
             values["enabled"] = bool(changes["enabled"])
@@ -335,11 +387,23 @@ class BotService:
         if "schedule" in values or "enabled" in values:
             enabled = bool(values.get("enabled", routine.enabled))
             schedule = values.get("schedule", routine.schedule)
-            cron = self._cron(schedule)
+            cron = self._cron(schedule, tz=zone)
             values["next_run_at"] = cron.next_after(_utcnow()) if cron and enabled else None
         if not values:
             return routine
         return await self._routines.update(routine_id, values)
+
+    async def _reschedule_routines(self, bot: Bot) -> None:
+        """Bot 时区变更后，启用中的例程从当前时刻按新时区重新计时。"""
+        zone = self._zone_for(bot)
+        now = _utcnow()
+        for routine in await self._routines.list_for_bot(bot.id):
+            if not routine.enabled:
+                continue
+            cron = self._cron(routine.schedule, tz=zone)
+            if cron is None:
+                continue
+            await self._routines.update(routine.id, {"next_run_at": cron.next_after(now)})
 
     async def delete_routine(self, bot_id: uuid.UUID, routine_id: uuid.UUID) -> None:
         routine = await self._routines.get(routine_id)
@@ -398,8 +462,6 @@ class BotService:
             last = self._event_last.get(bot.id)
             if last is not None and (moment - last).total_seconds() < _EVENT_COOLDOWN_SECONDS:
                 continue
-            if await self._repo.is_busy(bot.id):
-                continue
             if await self._budget_block(bot, now=moment) is not None:
                 logger.info("Bot %s 今日 token 已用完，跳过事件 %s", bot.id, event)
                 continue
@@ -407,9 +469,11 @@ class BotService:
             instruction = f"[事件触发] {event}：{summary}"
             if description:
                 instruction = f"{instruction}\n\n{description}"
-            self._event_last[bot.id] = moment
             try:
-                await self._launch(bot, instruction=instruction, now=moment)
+                task = await self._launch_if_idle(bot, instruction=instruction, now=moment)
+                if task is None:
+                    continue
+                self._event_last[bot.id] = moment
                 logger.info("Bot %s 被事件 %s 触发开工", bot.id, event)
             except Exception as exc:  # noqa: BLE001 - 单个 Bot 失败不影响其他 Bot
                 logger.warning("Bot %s 事件触发开工失败：%s", bot.id, exc)
@@ -441,23 +505,15 @@ class BotService:
         """
         bot = await self._repo.get(bot_id)
         bot = await self._settle_previous(bot)
-        if await self._repo.is_busy(bot.id):
-            raise ConflictError(
-                f"Bot {bot.name} 上一轮还没跑完，等它结束再触发",
-                details={"bot_id": str(bot.id)},
-            )
-        blocked = await self._budget_block(bot, now=_utcnow())
-        if blocked is not None:
-            budget, used = blocked
-            raise ConflictError(
-                f"Bot {bot.name} 今日 token 已用 {used}，达到上限 {budget}；调高预算或等明天再跑",
-                details={
-                    "bot_id": str(bot.id),
-                    "token_budget": budget,
-                    "tokens_used_today": used,
-                },
-            )
-        return await self._launch(bot, instruction=instruction, now=_utcnow())
+        task = await self._launch_if_idle(
+            bot,
+            instruction=instruction,
+            now=_utcnow(),
+            conflict_on_busy=True,
+            check_budget=True,
+        )
+        assert task is not None  # conflict_on_busy 保证要么开工、要么抛 ConflictError
+        return task
 
     async def tick(self, now: datetime | None = None) -> list[str]:
         """扫一轮到期的 Bot，返回本次开工的任务 id。异常不外抛（后台循环不该死）。"""
@@ -474,19 +530,22 @@ class BotService:
             try:
                 if bot.status != BotStatus.ACTIVE.value or bot.next_run_at is None:
                     continue
-                if await self._repo.is_busy(bot.id):
-                    # 上一轮还在跑：跳过本轮，顺延到下一个触发点
-                    cron = self._cron(bot.schedule)
-                    await self._repo.update(
-                        bot.id,
-                        {"next_run_at": cron.next_after(moment) if cron else None},
-                    )
-                    logger.info("Bot %s 上一轮未结束，跳过本次定时", bot.id)
-                    continue
+                cron = self._cron_for(bot, bot.schedule)
+                policy = bot.missed_run_policy or _DEFAULT_MISSED_RUN_POLICY
+                if policy == "skip_silent" and cron is not None and bot.next_run_at is not None:
+                    # 只在“至少错过一个完整槽位”时静默跳过。仅仅到期几秒
+                    # （调度循环的正常延迟）仍然要跑，否则 skip_silent 的 Bot 永远不会自动开工。
+                    overdue = _as_utc(bot.next_run_at)
+                    if overdue is not None and cron.next_after(overdue) <= moment:
+                        await self._repo.update(
+                            bot.id,
+                            {"next_run_at": cron.next_after(moment)},
+                        )
+                        logger.info("Bot %s 使用 skip_silent，静默跳过错过的定时", bot.id)
+                        continue
                 blocked = await self._budget_block(bot, now=moment)
                 if blocked is not None:
                     # 预算超了也照样推进下一次触发：否则每轮 tick 都会重新扫到它
-                    cron = self._cron(bot.schedule)
                     await self._repo.update(
                         bot.id,
                         {"next_run_at": cron.next_after(moment) if cron else None},
@@ -495,7 +554,20 @@ class BotService:
                         "Bot %s 今日 token 已用 %s/%s，跳过本次定时", bot.id, blocked[1], blocked[0]
                     )
                     continue
-                task = await self._launch(bot, instruction=None, now=moment)
+                task = await self._launch_if_idle(
+                    bot,
+                    instruction=None,
+                    now=moment,
+                    catch_up=policy == "catch_up",
+                )
+                if task is None:
+                    # 上一轮还在跑（或刚被其他路径抢到锁开工）：跳过本轮，顺延到下一个触发点
+                    await self._repo.update(
+                        bot.id,
+                        {"next_run_at": cron.next_after(moment) if cron else None},
+                    )
+                    logger.info("Bot %s 上一轮未结束，跳过本次定时", bot.id)
+                    continue
                 started.append(str(task.id))
             except Exception as exc:  # noqa: BLE001 - 单个 Bot 失败不影响其他 Bot
                 logger.warning("Bot %s 定时开工失败：%s", bot.id, exc)
@@ -511,28 +583,45 @@ class BotService:
 
     async def _tick_routine(self, routine: BotRoutine, moment: datetime) -> Task | None:
         """一个到期例程：先推进自身 next_run_at，再按 Bot 的可用状态决定是否开工。"""
-        cron = self._cron(routine.schedule)
-        next_run_at = cron.next_after(moment) if cron else None
         try:
             bot = await self._repo.get(routine.bot_id)
         except NotFoundError:
             # Bot 已删除：例程应随外键级联清理，这里只兜底跳过
-            await self._routines.update(routine.id, {"next_run_at": next_run_at})
+            cron = self._cron(routine.schedule)
+            await self._routines.update(
+                routine.id, {"next_run_at": cron.next_after(moment) if cron else None}
+            )
             return None
+        # 例程没有自己的时区，跟随父 Bot（Bot 未设置则继承 FLUX_TIMEZONE）。
+        cron = self._cron_for(bot, routine.schedule)
+        next_run_at = cron.next_after(moment) if cron else None
         if bot.status != BotStatus.ACTIVE.value:
             await self._routines.update(routine.id, {"next_run_at": next_run_at})
-            return None
-        if await self._repo.is_busy(bot.id):
-            await self._routines.update(routine.id, {"next_run_at": next_run_at})
-            logger.info("Bot %s 上一轮未结束，跳过例程 %s", bot.id, routine.name)
             return None
         if await self._budget_block(bot, now=moment) is not None:
             await self._routines.update(routine.id, {"next_run_at": next_run_at})
             logger.info("Bot %s 今日 token 已用完，跳过例程 %s", bot.id, routine.name)
             return None
-        # 先推进例程时间再起 Run：起 Run 期间再扫到也不会重复开工
-        await self._routines.update(routine.id, {"next_run_at": next_run_at, "last_run_at": moment})
-        return await self._launch(bot, instruction=routine.instruction, now=moment, routine=routine)
+
+        async def _advance(*, last_run: bool = True) -> None:
+            values: dict[str, Any] = {"next_run_at": next_run_at}
+            if last_run:
+                values["last_run_at"] = moment
+            await self._routines.update(routine.id, values)
+
+        async def _skip_busy() -> None:
+            await _advance(last_run=False)
+            logger.info("Bot %s 上一轮未结束，跳过例程 %s", bot.id, routine.name)
+
+        # 先推进例程时间再起 Run：起 Run 期间再扫到也不会重复开工。
+        return await self._launch_if_idle(
+            bot,
+            instruction=routine.instruction,
+            now=moment,
+            routine=routine,
+            on_busy=_skip_busy,
+            before_launch=_advance,
+        )
 
     async def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -559,7 +648,7 @@ class BotService:
     async def _settle_previous(self, bot: Bot, *, now: datetime | None = None) -> Bot:
         """把上一轮开工的终态计入健康统计（同一条任务只结算一次）。
 
-        无人值守的 Bot 没有可靠的完成回调，调度器每轮 tick 顺带结算即可：
+        Bot 没有可靠的完成回调，调度器每轮 tick 顺带结算即可：
         连续失败累积到阈值就把 Bot 自动暂停，避免无意义地反复重试。
         """
         task_id = bot.last_task_id
@@ -581,7 +670,7 @@ class BotService:
             values.update(consecutive_failures=0, last_error=None, paused_reason=None)
             if bot.status == BotStatus.PAUSED.value and bot.paused_reason:
                 # 自动暂停的 Bot 跑通一轮就自愈；用户手动暂停（无 paused_reason）保持原样
-                cron = self._cron(bot.schedule)
+                cron = self._cron_for(bot, bot.schedule)
                 values["status"] = BotStatus.ACTIVE.value
                 values["next_run_at"] = cron.next_after(now or _utcnow()) if cron else None
         elif task.status == TaskStatus.FAILED.value:
@@ -630,6 +719,59 @@ class BotService:
         dsh_home = Path(self._container.settings.dsh_home).expanduser()
         return dsh_home / "bots" / str(bot.id) / "workspace"
 
+    async def _launch_if_idle(
+        self,
+        bot: Bot,
+        *,
+        instruction: str | None,
+        now: datetime,
+        routine: BotRoutine | None = None,
+        conflict_on_busy: bool = False,
+        check_budget: bool = False,
+        on_busy: Callable[[], Awaitable[None]] | None = None,
+        before_launch: Callable[[], Awaitable[None]] | None = None,
+        catch_up: bool = False,
+    ) -> Task | None:
+        """在 Bot 级锁内重读忙闲，再决定是否开工（check-then-act 必须原子）。
+
+        锁覆盖到任务行已落库、Bot 的 last_task_id 已更新且 `is_busy` 可见为止，
+        随后立即释放：整轮运行期间不再占锁，其他入口只需看到「忙」就会跳过。
+        """
+        lock = self._launch_locks.get(bot.id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._launch_locks[bot.id] = lock
+        async with lock:
+            if await self._repo.is_busy(bot.id):
+                if conflict_on_busy:
+                    raise ConflictError(
+                        f"Bot {bot.name} 上一轮还没跑完，等它结束再触发",
+                        details={"bot_id": str(bot.id)},
+                    )
+                if on_busy is not None:
+                    await on_busy()
+                return None
+            if check_budget:
+                blocked = await self._budget_block(bot, now=now)
+                if blocked is not None:
+                    budget, used = blocked
+                    if conflict_on_busy:
+                        raise ConflictError(
+                            f"Bot {bot.name} 今日 token 已用 {used}，达到上限 {budget}；"
+                            "调高预算或等明天再跑",
+                            details={
+                                "bot_id": str(bot.id),
+                                "token_budget": budget,
+                                "tokens_used_today": used,
+                            },
+                        )
+                    return None
+            if before_launch is not None:
+                await before_launch()
+            return await self._launch(
+                bot, instruction=instruction, now=now, routine=routine, catch_up=catch_up
+            )
+
     async def _launch(
         self,
         bot: Bot,
@@ -637,6 +779,7 @@ class BotService:
         instruction: str | None,
         now: datetime,
         routine: BotRoutine | None = None,
+        catch_up: bool = False,
     ) -> Task:
         prompt = (instruction or "").strip() or (bot.description or "").strip()
         if not prompt:
@@ -644,8 +787,13 @@ class BotService:
                 f"Bot {bot.name} 还没有作业内容：先写 description，或手动触发时带上 instruction",
                 details={"bot_id": str(bot.id)},
             )
-        cron = self._cron(bot.schedule) if routine is None else None
-        next_run_at = cron.next_after(now) if cron else None
+        cron = self._cron_for(bot, bot.schedule) if routine is None else None
+        if cron is None:
+            next_run_at = None
+        elif catch_up:
+            next_run_at = self._catch_up_next(cron, _as_utc(bot.next_run_at), now)
+        else:
+            next_run_at = cron.next_after(now)
         workspace = str(self.workspace_path(bot))
         container = self._container
         task = await container.task_repo.create(
@@ -691,17 +839,84 @@ class BotService:
                 logger.warning("Bot 调度循环本轮失败", exc_info=True)
             await asyncio.sleep(self._interval_seconds)
 
-    def _cron(self, expression: str | None) -> CronSchedule | None:
+    def _cron(
+        self, expression: str | None, *, tz: ZoneInfo | str | None = None
+    ) -> CronSchedule | None:
         """解析 cron；空表示只手动触发。非法表达式在写入口就按 400 拒绝。"""
         text = (expression or "").strip()
         if not text:
             return None
         try:
-            return parse_cron(text)
+            return parse_cron(text, tz=tz or self._tz)
         except ValueError as exc:
             raise BadRequestError(
                 f"schedule 不是合法的 cron：{exc}", details={"schedule": text}
             ) from exc
+
+    def _cron_for(self, bot: Bot, expression: str | None) -> CronSchedule | None:
+        """按 Bot 自己的时区解析 cron；未设置时继承进程级 FLUX_TIMEZONE。"""
+        return self._cron(expression, tz=self._zone_for(bot))
+
+    def _zone(self, timezone: str | None) -> ZoneInfo:
+        if not timezone:
+            return self._tz
+        try:
+            return ZoneInfo(timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            return self._tz
+
+    def _zone_for(self, bot: Bot) -> ZoneInfo:
+        """Bot 时区；字段为空时用进程配置时区（在 __init__ 已校验过）。"""
+        if not bot.timezone:
+            return self._tz
+        try:
+            return ZoneInfo(bot.timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            # 历史数据里出现非法时区时不能让调度循环崩掉，退回进程配置。
+            logger.warning("Bot %s 的时区 %r 非法，回退到 FLUX_TIMEZONE", bot.id, bot.timezone)
+            return self._tz
+
+    def _clean_timezone(self, value: str | None) -> str | None:
+        """空值 = 继承（NULL）；非空必须是合法的 IANA 时区名。"""
+        text = (value or "").strip()
+        if not text:
+            return None
+        try:
+            ZoneInfo(text)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise BadRequestError(
+                f"timezone 不是合法的 IANA 时区：{text}", details={"timezone": text}
+            ) from exc
+        return text
+
+    def _missed_policy(self, value: str | None) -> str:
+        text = (value or "").strip() or _DEFAULT_MISSED_RUN_POLICY
+        if text not in _MISSED_RUN_POLICIES:
+            raise BadRequestError(
+                f"missed_run_policy 必须是 {sorted(_MISSED_RUN_POLICIES)} 之一",
+                details={"missed_run_policy": text},
+            )
+        return text
+
+    def _catch_up_next(
+        self, cron: CronSchedule, overdue: datetime | None, now: datetime
+    ) -> datetime:
+        """catch_up 的下一跳：从错过的触发点继续，但最多补几个槽位（见常量上限）。"""
+        candidate = cron.next_after(overdue or now)
+        if candidate > now:
+            return candidate
+        cursor = candidate
+        missed = 0
+        while cursor <= now and missed <= _MAX_CATCH_UP_SLOTS:
+            missed += 1
+            cursor = cron.next_after(cursor)
+        if missed > _MAX_CATCH_UP_SLOTS:
+            logger.warning(
+                "Bot 错过超过 %s 个触发点，catch_up 跳过错过的槽位，从当前时刻重新计时",
+                _MAX_CATCH_UP_SLOTS,
+            )
+            return cron.next_after(now)
+        return candidate
 
     def _clean_workspace(self, workspace: str | None) -> str | None:
         text = (workspace or "").strip()
@@ -710,7 +925,21 @@ class BotService:
         path = Path(text).expanduser()
         if not path.is_absolute():
             raise BadRequestError("workspace 必须是绝对路径", details={"workspace": text})
-        return str(path)
+        root_text = (self._container.settings.workspace_root or "").strip()
+        if not root_text:
+            raise BadRequestError(
+                "未配置 FLUX_WORKSPACE_ROOT，不能使用自定义工作目录；"
+                "请先为服务设置 FLUX_WORKSPACE_ROOT",
+                details={"workspace": text},
+            )
+        resolved = path.resolve()
+        root = Path(root_text).expanduser().resolve()
+        if not within_root(root, resolved):
+            raise BadRequestError(
+                "workspace 必须位于 FLUX_WORKSPACE_ROOT 之内",
+                details={"workspace": str(resolved), "workspace_root": str(root)},
+            )
+        return str(resolved)
 
     def _threshold(self, value: int | None) -> int:
         """连续失败阈值：0 表示永不自动暂停，范围 0~20。"""

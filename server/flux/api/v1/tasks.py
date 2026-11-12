@@ -24,13 +24,11 @@ from flux.container import Container
 from flux.core.agent_runtime.run_repository import as_utc, utcnow
 from flux.core.agent_runtime.runtimes.base import DEFAULT_RUNTIME
 from flux.core.agent_runtime.trace import summarize_trace
-from flux.core.attachment_store import UploadedFile, resolve_uploads, size_label
-from flux.core.context.budget import history_message_limit
+from flux.core.attachment_store import resolve_uploads
+from flux.core.bot.conversation import attachments_brief, record_attachments
 from flux.core.event.bus import Events
 from flux.core.github.service import ACCOUNT_HEADER, normalize_account_key
-from flux.core.github.tools import GITHUB_TOOLS, run_github_tool
 from flux.core.group.avatar import normalize_avatar
-from flux.core.model_gateway.base import ChatMessage
 from flux.core.task_engine.assistant import validate_confirmation_items
 from flux.core.task_engine.context_usage import (
     CONTEXT_MESSAGE_KINDS,
@@ -70,9 +68,6 @@ logger = get_logger(__name__)
 
 _FINAL_STATUSES = {TaskStatus.COMPLETED.value, TaskStatus.CANCELLED.value, TaskStatus.FAILED.value}
 
-#: 一次对话请求带上的历史条数上限：由 §6.1 的字符预算折算而来（不再是固定值）
-_HISTORY_LIMIT = history_message_limit()
-
 #: 生成交接摘要时最多回看的历史消息条数（更早的由摘要器按字符预算丢弃并标注）
 _HANDOFF_MESSAGE_LIMIT = 120
 
@@ -107,35 +102,6 @@ async def _require_open_task(container: Container, task_uuid: uuid.UUID, task_id
 def _task_dict(task: Task) -> dict[str, object]:
     """任务响应体：M0 冻结的 7 个键 + created_at（任务执行中心展示真实创建时间）。"""
     return task.to_dict()
-
-
-async def _record_attachments(
-    container: Container, task_uuid: uuid.UUID, files: list[UploadedFile]
-) -> None:
-    """把本轮附件记成一条 kind=attachments 的消息：刷新/换设备后仍能看到发过哪些文件。"""
-    if not files:
-        return
-    message = (
-        await container.task_repo.add_messages(
-            task_uuid,
-            [
-                MessageDraft(
-                    role=TaskMessageRole.USER.value,
-                    kind="attachments",
-                    content="、".join(item.name for item in files),
-                    payload={"files": [item.to_dict() for item in files]},
-                )
-            ],
-        )
-    )[0]
-    await container.task_stream.publish(task_uuid, "user_message", {"message": message.to_dict()})
-
-
-def _attachments_brief(files: list[UploadedFile]) -> str:
-    """只发附件没写正文时，给助手/Agent 的一句人话说明。"""
-    return "请看我随消息附上的文件：" + "、".join(
-        f"{item.name}（{size_label(item.size)}）" for item in files
-    )
 
 
 def _parse_uuid(value: str, *, field: str) -> uuid.UUID:
@@ -214,7 +180,7 @@ async def create_task(
             source_id or "未提供",
             len(summary),
         )
-    await _record_attachments(container, task.id, files)
+    await record_attachments(container, task.id, files)
     # 建 bot 时只落对话、不启动执行：否则会拿 bot 名字当需求直接跑 Agent。
     if payload.start:
         container.scheduler.submit(
@@ -456,108 +422,25 @@ async def create_task_message(
             details={"task_id": task_id, "status": task.status},
         )
 
-    user_message = (
-        await container.task_repo.add_messages(
-            task_uuid, [MessageDraft(role=TaskMessageRole.USER.value, content=content)]
-        )
-    )[0]
-    await container.task_stream.publish(
-        task_uuid, "user_message", {"message": user_message.to_dict()}
-    )
-    await _record_attachments(container, task_uuid, files)
-
-    history, _ = await container.task_repo.list_messages(task_uuid, limit=_HISTORY_LIMIT)
-    context = (
-        await container.brain.context(task.project_id) if task.project_id is not None else None
-    )
-    await container.task_stream.publish(task_uuid, "assistant_start", {})
-
-    async def _on_delta(text: str) -> None:
-        await container.task_stream.publish(task_uuid, "assistant_delta", {"text": text})
-
-    # 附件消息不进助手历史（kind=attachments），所以把附件清单拼进本轮提问，
-    # 否则用户「文字 + 附件」一起发时助手只看到文字、不知道有文件。
-    prompt_text = content or _attachments_brief(files)
-    if files and content:
-        prompt_text = content + "\n\n" + _attachments_brief(files)
-    # 外部连接器按本地账号隔离：请求头声明账号，只在这个账号真的连了 GitHub 时
-    # 才把工具交给模型；没连时明确要求它引导用户去账户页连接，禁止编造仓库数据。
     account_key = normalize_account_key(request.headers.get(ACCOUNT_HEADER))
-    github_connected = await container.github.is_connected(account_key)
-
-    async def _run_github(name: str, arguments: dict[str, Any]) -> Any:
-        return await run_github_tool(container.github, account_key, name, arguments)
-
-    github_kwargs: dict[str, Any] = (
-        {
-            "tools": list(GITHUB_TOOLS),
-            "tool_runner": _run_github,
-            "tools_note": (
-                "当前账号已连接 GitHub。用户问到仓库、代码、Issue、PR、提交或 Actions 时，"
-                "先调用 github_* 工具查真实数据再回答；不要凭猜测编造仓库名、数量或状态。"
-            ),
-        }
-        if github_connected
-        else {
-            "tools_note": (
-                "当前账号还没有连接 GitHub。用户如果问仓库、代码、Issue、PR 等 GitHub 数据，"
-                "明确告诉对方先到「账户 → 连接器 → GitHub」完成连接，然后才能查询；"
-                "不得编造任何仓库或提交数据。"
-            )
-        }
+    result = await container.bot_conversation.run_turn(
+        task,
+        content=content,
+        files=files,
+        account_key=account_key,
     )
-    try:
-        # 任务选了自己的模型时，这一轮对话也用它回答（与后续 Agent 执行同一通道）
-        channel = await container.key_vault.channel_for_task(task)
-        turn = await container.assistant.respond(
-            description=task.description,
-            message=prompt_text,
-            history=[
-                ChatMessage(role=m.role, content=m.content)
-                for m in history
-                if m.kind in CONTEXT_MESSAGE_KINDS and m.id != user_message.id
-            ],
-            context=context,
-            on_delta=_on_delta,
-            channel=channel,
-            model=(task.model or "").strip(),
-            **github_kwargs,
-        )
-    except Exception as exc:  # noqa: BLE001 - 先通知正在看的客户端，再按原样抛给调用方
-        await container.task_stream.publish(task_uuid, "assistant_error", {"error": str(exc)[:500]})
-        raise
-    reply = (
-        await container.task_repo.add_messages(
-            task_uuid,
-            [
-                MessageDraft(
-                    role=TaskMessageRole.ASSISTANT.value,
-                    # 需要用户填密钥时，气泡本身就是那张安全输入卡（正文仍是回复文案）
-                    kind="secure_input" if turn.secure_input else "text",
-                    content=turn.reply,
-                    payload=turn.payload(),
-                )
-            ],
-        )
-    )[0]
-    await container.task_stream.publish(
-        task_uuid, "assistant_message", {"message": reply.to_dict()}
-    )
-
-    if turn.confirmation:
-        # 助手每给出一次确认，就刷新任务上的确认卡（P0-06）。用户在"开始执行"前改过的那份
-        # 是执行依据；这里覆盖的是"又有了新信息"的情况——新一轮结论比旧结论更接近最终需求。
-        task = await container.task_repo.set_confirmation(
-            task_uuid,
-            {"items": turn.confirmation, "actor": "assistant", "updated_at": _now_iso()},
-        )
-
-    if task.status == TaskStatus.PENDING.value:
-        # 平台已真实开始处理这条任务：状态从 pending 进入 running（有实际动作才改状态）
-        task = await container.task_repo.set_status(task_uuid, TaskStatus.RUNNING)
     return ok(
-        {"task": _task_dict(task), "messages": [user_message.to_dict(), reply.to_dict()]},
-        metadata={"provider": turn.provider, "model": turn.model},
+        {
+            "task": _task_dict(result.task),
+            "messages": [
+                result.user_message.to_dict(),
+                result.reply_message.to_dict(),
+            ],
+        },
+        metadata={
+            "provider": result.assistant_turn.provider,
+            "model": result.assistant_turn.model,
+        },
     )
 
 
@@ -747,8 +630,8 @@ async def continue_task(
     await container.task_stream.publish(
         task_uuid, "user_message", {"message": user_message.to_dict()}
     )
-    await _record_attachments(container, task_uuid, files)
-    followup = content or _attachments_brief(files)
+    await record_attachments(container, task_uuid, files)
+    followup = content or attachments_brief(files)
     try:
         result = await container.task_run_service.start(task, followup=followup)
     except Exception:

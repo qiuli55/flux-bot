@@ -30,6 +30,9 @@ SPEC_TABLES = {
     "virtual_changes",
     "connectors",
     "connector_logs",
+    # 外部连接器：本地账号 ↔ GitHub 身份绑定（迁移 c8e4a1f72b93）。
+    # 令牌以密钥库信封加密落库，接口与日志只暴露身份与 scopes。
+    "github_connections",
     "usage_records",
     # §11.2 之外的新增表：官方套餐额度快照（计费 P0）。
     # 官方接口只给套餐总量、没有任务归因，快照负责把百分比钉在时间轴上用于对账与闸门判定。
@@ -127,6 +130,13 @@ SPEC_TABLES = {
     # 以及开工失败等主动通知（read_at 为空即未读）。
     "bot_routines",
     "bot_notifications",
+    # Bot 对话轮次（迁移 e4f1a2b3c4d5）：一轮用户消息 → 助手回复的持久化状态，
+    # 同时承担 client_turn_id 幂等与重启后的 interrupted 恢复。
+    "bot_turns",
+    # 手机设备配对（迁移 f9d2e4a7b1c8）：devices 存长期设备令牌哈希，
+    # pairing_codes 存一次性配对码哈希；两者都不落明文。
+    "devices",
+    "pairing_codes",
 }
 
 

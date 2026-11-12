@@ -188,7 +188,11 @@ def test_doctor_redacts_database_password(
     settings: Settings, db_schema: None, capsys: pytest.CaptureFixture[str]
 ) -> None:
     secret = settings.model_copy(
-        update={"database_url": "postgresql+asyncpg://flux:s3cret@db:5432/flux"}
+        update={
+            "database_url": "postgresql+asyncpg://flux:s3cret@db:5432/flux",
+            # 故意指向不可达主机；用小超时让用例快速验证"失败也要有界且不泄露密码"。
+            "doctor_db_timeout_seconds": 0.2,
+        }
     )
     _, payload = run_cli(secret, ["doctor"], capsys)
     assert "s3cret" not in json.dumps(payload)

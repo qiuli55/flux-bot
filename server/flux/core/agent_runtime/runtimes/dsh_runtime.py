@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 from flux.core.agent_runtime.runtimes.base import (
@@ -32,6 +33,7 @@ class DshRuntime:
     def __init__(self, client: Any, *, workspace: str = "") -> None:
         #: 由容器惰性解析（测试会替换 container.dsh，故不能在此固化）
         self._client = client
+        #: 默认工作区（settings.dsh_workspace）：没有 task.workspace 时使用。
         self._workspace = workspace
 
     async def prepare(
@@ -43,13 +45,20 @@ class DshRuntime:
         instruction: str,
         channel: ModelChannel | None = None,
     ) -> RuntimeLaunch:
+        # Bot 任务的执行目录来自 tasks.workspace 快照（每个 Bot 一个独立目录）；
+        # 普通对话没有该字段，回退到 DSH 默认工作区。目录必须在本轮启动前建好。
+        task_workspace = str(getattr(task, "workspace", "") or "").strip()
+        workspace = task_workspace or self._workspace
+        if task_workspace:
+            Path(task_workspace).expanduser().mkdir(parents=True, exist_ok=True)
         # 每个 Run 用独立 session：DSH 的 session id 全局唯一，沿用同一个 id 起第二轮
         # 会直接报 "session already exists"，同一对话续聊就永远起不来。
         return RuntimeLaunch(
             runtime_id=self.runtime_id,
             run_id=run_id,
             instruction=instruction,
-            cwd=self._workspace,
+            cwd=workspace,
+            workspace=task_workspace or None,
             session_id=f"flux-task-{getattr(task, 'id', run_id)}-{run_id}",
             task_id=str(getattr(task, "id", "")) or None,
             agent_id=getattr(agent, "id_str", None),
@@ -67,6 +76,9 @@ class DshRuntime:
             model=launch.model or None,
             channel=launch.channel,
             permission_mode=launch.permission_mode,
+            # 只把任务自带的目录传给客户端；没有 task.workspace 时保持原全局回退，
+            # 否则 cwd 里的默认值会覆盖 FLUX_WORKSPACE 的 workspace_root 语义。
+            workspace=launch.workspace,
         )
         return RuntimeProcess(
             runtime_id=self.runtime_id,

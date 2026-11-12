@@ -11,7 +11,15 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 _EVAL_PATH = Path(__file__).with_name("data") / "knowledge_eval.jsonl"
+
+if not _EVAL_PATH.is_file():
+    pytest.skip(
+        f"缺少知识库评测夹具 {_EVAL_PATH}（该文件随上游 Flux 仓库提供，不在本 Bot 仓库）",
+        allow_module_level=True,
+    )
 _SOURCES = {None, "conversation", "doc", "brain"}
 
 

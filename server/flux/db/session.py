@@ -17,10 +17,12 @@ from flux.logging import get_logger
 logger = get_logger(__name__)
 
 
-def create_engine(database_url: str) -> AsyncEngine:
+def create_engine(database_url: str, *, connect_timeout: float | None = None) -> AsyncEngine:
     """创建异步引擎。
 
     SQLite（本地开发）不支持连接池参数，故按方言分支。
+    `connect_timeout` 用于探针等需要快速失败的场景：PostgreSQL 下传给 asyncpg
+    作为单次连接超时，避免不可达主机长时间挂起。
     """
     if database_url.startswith("sqlite"):
         # timeout 是 sqlite3.connect 的 busy 超时（秒）：默认 5 秒，Windows 上磁盘与
@@ -39,7 +41,14 @@ def create_engine(database_url: str) -> AsyncEngine:
             cursor.close()
 
         return engine
-    return create_async_engine(database_url, future=True, pool_pre_ping=True, pool_size=5)
+    connect_args = {"timeout": connect_timeout} if connect_timeout is not None else {}
+    return create_async_engine(
+        database_url,
+        future=True,
+        pool_pre_ping=True,
+        pool_size=5,
+        connect_args=connect_args,
+    )
 
 
 def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
