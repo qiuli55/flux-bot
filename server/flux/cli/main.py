@@ -112,6 +112,13 @@ def build_parser() -> argparse.ArgumentParser:
     remove = agents_sub.add_parser("remove", help="移除一个 Agent 的接入记录")
     remove.add_argument("agent", help="Agent 名，如 opencode")
 
+    devices = sub.add_parser("devices", help="手机设备配对与长期令牌")
+    devices_sub = devices.add_subparsers(dest="devices_command", required=True)
+    devices_sub.add_parser("pair", help="生成一次性配对码（在手机 App 中输入）")
+    devices_sub.add_parser("list", help="列出已配对设备（仅令牌前缀）")
+    devices_revoke = devices_sub.add_parser("revoke", help="撤销一台设备")
+    devices_revoke.add_argument("id", help="设备 UUID")
+
     logs = sub.add_parser("logs", help="读取服务日志文件尾部")
     logs.add_argument("--lines", type=int, default=200, help="读取的行数，默认 200")
     logs.add_argument("--file", default=None, help="日志文件路径；缺省读 FLUX_LOG_FILE")
@@ -199,6 +206,12 @@ async def _run(args: argparse.Namespace, settings: Settings) -> tuple[dict[str, 
             if args.agents_command == "connect":
                 return await _cmd_agents_connect(container, args), 0
             return await _cmd_agents_remove(container, args), 0
+        if args.command == "devices":
+            if args.devices_command == "pair":
+                return await _cmd_devices_pair(container), 0
+            if args.devices_command == "list":
+                return await _cmd_devices_list(container), 0
+            return await _cmd_devices_revoke(container, args), 0
     finally:
         # doctor 是只读自检：数据库可能正是不可达的那个对象，退出时不再查/改会话表，
         # 否则失败报告已经产出后还会再卡在一条没有超时的数据库查询上。
@@ -608,6 +621,28 @@ async def _cmd_agents_remove(container: Container, args: argparse.Namespace) -> 
 
 
 # --- logs ---
+
+
+async def _cmd_devices_pair(container: Container) -> dict[str, Any]:
+    code, expires_at = await container.devices.issue_pairing_code()
+    return {
+        "code": code,
+        "expires_at": expires_at.isoformat(),
+        "hint": "在手机 App 的配对页输入该 8 位配对码；配对码单次有效",
+    }
+
+
+async def _cmd_devices_list(container: Container) -> dict[str, Any]:
+    devices = await container.devices.list()
+    return {
+        "count": len(devices),
+        "devices": [device.to_dict() for device in devices],
+    }
+
+
+async def _cmd_devices_revoke(container: Container, args: argparse.Namespace) -> dict[str, Any]:
+    device = await container.devices.revoke(args.id)
+    return {"device": device.to_dict(), "revoked": True}
 
 
 def _cmd_logs(args: argparse.Namespace) -> dict[str, Any]:

@@ -40,6 +40,13 @@ class AgentCreateRequest(BaseModel):
     runtime: Literal["dsh", "codex", "opencode"] = "dsh"
 
 
+class DevicePairRequest(BaseModel):
+    """手机用一次性配对码兑换设备令牌。"""
+
+    code: str = Field(min_length=1, max_length=32)
+    device_name: str = Field(default="", max_length=128)
+
+
 class AgentTokenIssueRequest(BaseModel):
     """为某个 Agent 签发一枚 MCP 接入令牌（目标架构 §3.2）。
 

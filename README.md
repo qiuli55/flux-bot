@@ -52,6 +52,59 @@ FLUX_BIND_ADDR=0.0.0.0    # 此时必须同时设置 FLUX_AUTH_TOKEN
 旧的无鉴权行为只能显式开启：`FLUX_ALLOW_NO_AUTH=true`。它仅适用于完全可信的内网，
 启动时会打印 WARNING；不要与公网暴露一起使用。
 
+### 设备配对
+
+手机不再共用 `FLUX_AUTH_TOKEN`，而是用一次性配对码换一枚只属于自己的长期设备令牌
+（`fbd_...`，数据库只存 sha256）。在服务器上生成配对码：
+
+```bash
+# Docker 部署
+docker compose exec flux-bot flux devices pair
+
+# 或调用管理 API（需要管理员令牌 / 本机回环）
+curl -s -X POST http://127.0.0.1:8600/api/v1/devices/pairing-codes \
+  -H "Authorization: Bearer $FLUX_AUTH_TOKEN"
+```
+
+把返回的 8 位配对码输入 App 的配对页即可。配对码单次有效，默认 10 分钟过期；
+设备令牌默认 90 天过期（`FLUX_DEVICE_TOKEN_TTL_DAYS=0` 表示永不过期）。
+失败的配对尝试按来源 IP 限流：每分钟最多 10 次。
+
+管理已配对设备：
+
+```bash
+docker compose exec flux-bot flux devices list
+docker compose exec flux-bot flux devices revoke <device-id>
+```
+
+手机也可以调用 `POST /api/v1/devices/me/revoke` 主动登出。撤销在本进程内立即生效；
+多进程部署时，其他进程最多延迟 30 秒（设备鉴权缓存的 TTL）。
+
+### 云桌面票据
+
+`POST /api/v1/bots/{bot_id}/desktop/session` 为某一台 Bot 签发独立的桌面会话。
+服务端按 Bot UUID 计算桌面 profile（`bot` + UUID 前 8 位 hex），手机不能自报 profile，
+因此不同 Bot 的桌面配置彼此隔离。
+
+配置 `FLUX_DESKTOP_HOST` 与 `FLUX_DESKTOP_GATEWAY_TOKEN` 后该接口才可用，否则返回
+503 `desktop_not_configured`。配置 `FLUX_DESKTOP_TICKET_SECRET` 后，响应里会带一个短期
+HMAC 票据（默认 300 秒）：
+
+```
+ticket = base64url(payload_json) + "." + base64url(HMAC-SHA256(base64url(payload_json), secret))
+```
+
+payload 包含 `bot_id`、`profile`、`principal`（设备会话另有 `device_id`）、`exp`（Unix 秒）
+与随机 `nonce`。桌面网关的验签步骤：
+
+1. 按 `.` 拆成 payload 段与签名段；
+2. 用共享的 `FLUX_DESKTOP_TICKET_SECRET` 对 payload 段重算 HMAC-SHA256，并常量时间比较；
+3. 对 payload 段做 base64url 解码（补回 `=` padding）并解析 JSON；
+4. 校验 `exp` 大于当前 Unix 秒，且 `profile` / `bot_id` 与请求的桌面实例一致。
+
+票据可用后，把 `FLUX_DESKTOP_SEND_GATEWAY_TOKEN` 设为 `false`：会话响应将不再下发
+长期的 `gateway_token` / `bridge_key`，手机只持有短期票据。
+
 ### 数据持久化
 
 数据全部落在挂载卷 `./data`，容器重建不会丢失：

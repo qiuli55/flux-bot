@@ -17,6 +17,7 @@ from flux.models.bot_routine import BotRoutine
 from flux.models.bot_turn import BotTurn
 from flux.models.connector import ConnectorConfig, ConnectorLog
 from flux.models.context import ContextBlob, ContextStep, ContextStepToken
+from flux.models.device import Device, PairingCode
 from flux.models.github import GithubConnection
 from flux.models.group import (
     ChatGroup,
@@ -82,6 +83,7 @@ __all__ = [
     "ContextBlob",
     "ContextStep",
     "ContextStepToken",
+    "Device",
     "GithubConnection",
     "ImportedCapability",
     "KnowledgeChunk",
@@ -91,6 +93,7 @@ __all__ = [
     "OrganizationMember",
     "Project",
     "ProjectMemory",
+    "PairingCode",
     "ProviderAccount",
     "RunTraceItem",
     "SupervisorAssignment",

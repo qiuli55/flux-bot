@@ -77,6 +77,27 @@ class Settings(BaseSettings):
     allow_no_auth: bool | None = None
     # Electron 桌面端用于“打开文件夹”的一次运行期能力令牌；普通 Web 客户端不能使用。
     desktop_control_token: str | None = None
+
+    # --- 设备配对（手机长期令牌）---
+    # 配对成功的设备令牌有效期（天）。0 = 永不过期。
+    device_token_ttl_days: int = 90
+    # 一次性配对码有效期（秒）。
+    pairing_code_ttl_seconds: int = 600
+
+    # --- 云桌面（按 Bot 隔离的桌面会话）---
+    # 桌面网关地址与长期网关令牌；二者缺一即视为未配置（接口返回 503）。
+    desktop_host: str | None = None
+    desktop_gateway_token: str | None = None
+    # 桌面网桥地址与密钥（可选，随会话下发给客户端）。
+    desktop_bridge: str | None = None
+    desktop_bridge_key: str | None = None
+    # 桌面票据签名密钥；留空时仍返回会话信息，但 ticket 为 null。
+    desktop_ticket_secret: str | None = None
+    # 桌面票据有效期（秒）。
+    desktop_ticket_ttl_seconds: int = 300
+    # 是否把长期 gateway_token / bridge_key 一并下发。网关启用票据校验后可关掉，
+    # 让手机端不再持有长期密钥。
+    desktop_send_gateway_token: bool = True
     # 脱敏映射表（context_redactions）的加密密钥（FLUX_CONTEXT_MECHANISM §10.1）。
     # 留空 = 映射不落库（fail-closed）：正文照常打码，只是不可回填。
     redaction_key: str | None = None

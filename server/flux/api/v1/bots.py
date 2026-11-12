@@ -12,15 +12,17 @@ from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
 from flux.api.deps import get_container
 from flux.api.response import ok
 from flux.container import Container
 from flux.core.attachment_store import resolve_uploads
+from flux.core.desktop.tickets import build_desktop_session
 from flux.enums import BotMemoryRelevance, BotStatus, TaskStatus
-from flux.errors import BadRequestError, NotFoundError
+from flux.errors import AIOSError, BadRequestError, NotFoundError
+from flux.logging import get_logger
 from flux.models.bot import Bot
 from flux.schemas.api import (
     BotCreateRequest,
@@ -34,6 +36,7 @@ from flux.schemas.api import (
 )
 
 router = APIRouter(prefix="/bots", tags=["bots"])
+logger = get_logger(__name__)
 
 
 def _bot_id(value: str) -> uuid.UUID:
@@ -652,6 +655,38 @@ async def clear_bot_memories(
     else:
         removed = await container.bot_memories.clear(bot.id)
     return ok({"deleted": removed})
+
+
+@router.post("/{bot_id}/desktop/session")
+async def create_desktop_session(
+    bot_id: str,
+    request: Request,
+    container: Container = Depends(get_container),
+) -> dict[str, object]:
+    """签发某一台 Bot 的云桌面会话（票据按 Bot 隔离）。
+
+    未配置桌面网关时返回 503 `desktop_not_configured`。profile 完全由服务端按
+    Bot UUID 计算，客户端不能自报；票据密钥未配置时 ticket 为 null。
+    """
+    settings = container.settings
+    host = (settings.desktop_host or "").strip()
+    gateway_token = (settings.desktop_gateway_token or "").strip()
+    if not host or not gateway_token:
+        raise AIOSError(
+            "云桌面未配置",
+            code="desktop_not_configured",
+            http_status=503,
+        )
+    bot = await container.bots.get(_bot_id(bot_id))
+    principal = getattr(request.state, "principal", None) or {"kind": "local"}
+    data = build_desktop_session(settings, bot_id=bot.id, principal=principal)
+    logger.info(
+        "desktop.session.issue principal=%s bot=%s profile=%s",
+        principal.get("kind"),
+        bot.id,
+        data["profile"],
+    )
+    return ok(data)
 
 
 __all__ = ["router"]

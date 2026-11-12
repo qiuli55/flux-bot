@@ -39,6 +39,7 @@ from flux.core.context.redact import RedactionStore
 from flux.core.context.repository import ContextStepRepository
 from flux.core.context.store import ContentStore
 from flux.core.context.trust import VerificationLedger
+from flux.core.devices.service import DeviceService
 from flux.core.event.bus import EventBus, Events
 from flux.core.git_integration.client import GitClient
 from flux.core.git_integration.service import GitService
@@ -118,6 +119,8 @@ class Container:
     bus: EventBus = field(default_factory=EventBus)
     policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     engine: AsyncEngine = field(init=False)
+    #: 手机设备配对码与长期设备令牌（鉴权依赖直接从这里取缓存）。
+    devices: DeviceService = field(init=False)
     agents: AgentManager = field(init=False)
     router: ModelRouter = field(init=False)
     scheduler: TaskScheduler = field(init=False)
@@ -216,6 +219,7 @@ class Container:
     def __post_init__(self) -> None:
         self.engine = create_engine(self.settings.database_url)
         self.session_factory = create_session_factory(self.engine)  # type: ignore[attr-defined]
+        self.devices = DeviceService(self.session_factory, self.settings)  # type: ignore[attr-defined]
         #: 内建 CLI Agent Adapter 集合：installation 状态机与 P2-1 的 CLI runtime 共用同一批实例
         cli_adapters = build_default_adapters()
         self.task_repo = TaskRepository(self.session_factory)  # type: ignore[attr-defined]
