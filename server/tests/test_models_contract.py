@@ -140,6 +140,8 @@ SPEC_TABLES = {
     # 与 bot_memories（每 Bot 记忆）和 memories（三层记忆）分开存储。
     "user_profile_entries",
     "user_journal_entries",
+    # 统一出站草稿（迁移 e2c9b7a4d1f3）：各频道待审批出站正文的持久化真相源。
+    "outbound_drafts",
     # 手机设备配对（迁移 f9d2e4a7b1c8）：devices 存长期设备令牌哈希，
     # pairing_codes 存一次性配对码哈希；两者都不落明文。
     "devices",
