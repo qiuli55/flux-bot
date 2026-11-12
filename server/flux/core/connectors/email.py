@@ -241,13 +241,24 @@ class EmailConnectorService:
         *,
         mailbox: str = "INBOX",
         limit: int = DEFAULT_LIST_LIMIT,
+        since_uid: int | None = None,
     ) -> list[dict[str, Any]]:
+        """列出邮件头。
+
+        默认（`since_uid=None`）保持原有语义：最新的 `limit` 封，新的在前。
+        传 `since_uid` 时改为「UID 严格大于水位线、从最老的开始取 `limit` 封」，
+        让入站轮询的水位线连续前进：窗口满时剩下的更晚邮件留到下一轮，
+        不会因为只取最新 N 封而跳过中间的新邮件。
+        """
         credentials = await self._credentials_for(account_key, "imap")
         clean_mailbox = _clean_mailbox(mailbox)
         clean_limit = max(1, min(int(limit), MAX_LIST_LIMIT))
+        clean_since: int | None = None
+        if since_uid is not None:
+            clean_since = max(0, int(since_uid))
         try:
             messages = await asyncio.to_thread(
-                self._list_sync, credentials, clean_mailbox, clean_limit
+                self._list_sync, credentials, clean_mailbox, clean_limit, clean_since
             )
         except Exception as exc:
             self._log_protocol_failure("list", account_key, exc)
@@ -256,10 +267,11 @@ class EmailConnectorService:
                 details={"connector": CONNECTOR_ID, "protocol": "imap"},
             ) from exc
         logger.info(
-            "email.list account=%s mailbox=%s limit=%d count=%d",
+            "email.list account=%s mailbox=%s limit=%d since_uid=%s count=%d",
             account_key,
             clean_mailbox,
             clean_limit,
+            clean_since,
             len(messages),
         )
         return messages
@@ -430,6 +442,7 @@ class EmailConnectorService:
         credentials: dict[str, Any],
         mailbox: str,
         limit: int,
+        since_uid: int | None = None,
     ) -> list[dict[str, Any]]:
         connection = self._imap_open(credentials)
         try:
@@ -441,7 +454,12 @@ class EmailConnectorService:
                 raise _ProtocolFailure("IMAP SEARCH failed")
             raw_uids = (data[0] if data else b"") or b""
             uids = [item for item in raw_uids.split() if item.isdigit()]
-            selected = list(reversed(uids[-limit:]))
+            if since_uid is None:
+                selected = list(reversed(uids[-limit:]))
+            else:
+                # 水位线之后按 UID 升序取最老的 limit 封，保证下一轮从连续的位置继续。
+                newer = sorted((uid for uid in uids if int(uid) > since_uid), key=int)
+                selected = newer[:limit]
             summaries: list[dict[str, Any]] = []
             for uid in selected:
                 raw, seen = self._fetch(connection, uid, b"(FLAGS BODY.PEEK[HEADER])")
