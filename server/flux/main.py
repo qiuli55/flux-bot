@@ -13,7 +13,7 @@ from fastapi import Depends, FastAPI
 from flux.api.auth import require_rest_auth
 from flux.api.errors import register_exception_handlers
 from flux.api.internal_tap import router as llm_tap_router
-from flux.api.v1 import api_v1_router, hooks, ide, supervisor_webhook, terminal
+from flux.api.v1 import api_v1_router, channels_feishu, hooks, ide, supervisor_webhook, terminal
 from flux.api.v1 import cloud as cloud_api
 from flux.cloud.uploader import upload_previous_run
 from flux.config import Settings, get_settings
@@ -133,6 +133,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 外部例程触发（CI / GitHub / 自建 Webhook）同样免 REST 鉴权：
     # 安全性由 HMAC 签名把关，密钥未配置时 fail-closed。
     app.include_router(hooks.router, prefix=app_settings.api_v1_prefix)
+    # 正式 Bot 飞书频道：平台回调同样免本机 REST 令牌，靠 verification token /
+    # Encrypt Key 签名 / 解密把关；出站仍由审批卡控制。
+    app.include_router(channels_feishu.router, prefix=app_settings.api_v1_prefix)
     # WebSocket 不能复用 Request + HTTPBearer 的 REST 依赖；Human PTY 自己执行
     # same-origin + token/cookie 鉴权，并单独挂到应用，避免依赖注入在 WS 上失效。
     app.include_router(
