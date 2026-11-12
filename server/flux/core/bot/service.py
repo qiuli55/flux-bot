@@ -62,8 +62,10 @@ _MAX_LIST_ITEMS = 64
 #: 漏跑补偿策略；skip 与旧行为一致（只开一轮，然后从当前时刻重新计时）。
 _MISSED_RUN_POLICIES = frozenset({"skip", "skip_silent", "catch_up"})
 _DEFAULT_MISSED_RUN_POLICY = "skip"
-#: catch_up 最多连续补跑的错过的触发点；超过则直接跳到当前时刻之后，避免停机数周后雪崩。
-_MAX_CATCH_UP_SLOTS = 24
+#: catch_up 最多连续补跑的错过触发点；超过则直接跳到当前时刻之后，避免停机或
+#: 改系统时间后一次性触发大量带副作用的 Run。补跑是逐轮进行的，3 个槽位已够覆盖
+#: 一次短时重启，再往上收益很小、风险却放大。
+_MAX_CATCH_UP_SLOTS = 3
 #: 可配置的事件名（Events 里的字符串常量）
 _KNOWN_EVENTS = frozenset(
     value for value in vars(Events).values() if isinstance(value, str) and value != WILDCARD
@@ -899,7 +901,7 @@ class BotService:
     def _catch_up_next(
         self, cron: CronSchedule, overdue: datetime | None, now: datetime
     ) -> datetime:
-        """catch_up 的下一跳：从错过的触发点继续，但最多补 24 个槽位。"""
+        """catch_up 的下一跳：从错过的触发点继续，但最多补几个槽位（见常量上限）。"""
         candidate = cron.next_after(overdue or now)
         if candidate > now:
             return candidate
