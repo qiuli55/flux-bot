@@ -728,3 +728,71 @@ class GroupMessageCreateRequest(BaseModel):
     """在群里发一条消息；会打断正在进行的 epoch 并开启新一轮。"""
 
     content: str = Field(min_length=1, max_length=8000)
+
+
+# --- 用户保险库（站点登录 / 支付卡 / 联系人）---
+
+
+class VaultLoginCreateRequest(BaseModel):
+    """新增一条站点登录；`password` 只进请求体，落库即加密。"""
+
+    site: str = Field(min_length=1, max_length=512)
+    username: str = Field(min_length=1, max_length=256)
+    password: str = Field(min_length=1, max_length=4096)
+    notes: str = Field(default="", max_length=4000)
+
+
+class VaultLoginUpdateRequest(BaseModel):
+    """局部更新登录条目；字段未出现或为 null 表示不改，`password` 留空也不改。"""
+
+    site: str | None = Field(default=None, min_length=1, max_length=512)
+    username: str | None = Field(default=None, min_length=1, max_length=256)
+    password: str | None = Field(default=None, max_length=4096)
+    notes: str | None = Field(default=None, max_length=4000)
+
+
+class VaultCardCreateRequest(BaseModel):
+    """新增一张支付卡。
+
+    `pan` / `cvv` 只用于生成密文与 last4，明文立即丢弃；也可以只给 `last4`。
+    """
+
+    label: str = Field(default="", max_length=128)
+    brand: str = Field(default="", max_length=32)
+    pan: str | None = Field(default=None, max_length=32)
+    cvv: str | None = Field(default=None, max_length=4)
+    last4: str | None = Field(default=None, max_length=4)
+    exp_month: int | None = Field(default=None, ge=1, le=12)
+    exp_year: int | None = Field(default=None, ge=2000, le=2100)
+    notes: str = Field(default="", max_length=4000)
+
+
+class VaultCardUpdateRequest(BaseModel):
+    """局部更新支付卡；未出现或为 null 的字段保持不变。没有任何 reveal 接口。"""
+
+    label: str | None = Field(default=None, max_length=128)
+    brand: str | None = Field(default=None, max_length=32)
+    pan: str | None = Field(default=None, max_length=32)
+    cvv: str | None = Field(default=None, max_length=4)
+    last4: str | None = Field(default=None, max_length=4)
+    exp_month: int | None = Field(default=None, ge=1, le=12)
+    exp_year: int | None = Field(default=None, ge=2000, le=2100)
+    notes: str | None = Field(default=None, max_length=4000)
+
+
+class VaultContactCreateRequest(BaseModel):
+    """新增一个联系人；电话 / 邮箱是字符串数组，服务层再做条数与长度校验。"""
+
+    name: str = Field(min_length=1, max_length=128)
+    phones: list[str] = Field(default_factory=list, max_length=20)
+    emails: list[str] = Field(default_factory=list, max_length=20)
+    notes: str = Field(default="", max_length=4000)
+
+
+class VaultContactUpdateRequest(BaseModel):
+    """局部更新联系人；未出现或为 null 的字段保持不变。"""
+
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    phones: list[str] | None = Field(default=None, max_length=20)
+    emails: list[str] | None = Field(default=None, max_length=20)
+    notes: str | None = Field(default=None, max_length=4000)

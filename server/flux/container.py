@@ -111,6 +111,7 @@ from flux.core.task_engine.stream import TaskStreamHub, TaskStreamRelay
 from flux.core.terminal.pty_service import HumanPtyService
 from flux.core.terminal.repository import TerminalRepository
 from flux.core.terminal.service import TerminalService
+from flux.core.vault.service import VaultService
 from flux.core.virtual_workspace.apply_engine import ApplyEngine
 from flux.core.virtual_workspace.batch_repository import ApplyBatchRepository
 from flux.core.virtual_workspace.repository import ProposalRepository
@@ -149,6 +150,8 @@ class Container:
     memory: MemoryService = field(init=False)
     task_repo: TaskRepository = field(init=False)
     key_vault: KeyVaultService = field(init=False)
+    #: 用户保险库（站点登录 / 支付卡 / 联系人），密文复用密钥库同一把主密钥
+    vault: VaultService = field(init=False)
     #: 外部连接器（GitHub）：按本地账号隔离的 OAuth 连接 + 只读 REST 工具
     github: GitHubConnectorService = field(init=False)
     #: 用户账号连接器框架（catalog / install / uninstall）；与 Agent 执行侧注册表分离
@@ -242,6 +245,9 @@ class Container:
         self.task_repo = TaskRepository(self.session_factory)  # type: ignore[attr-defined]
         # 密钥库：Agent 模型通道的 API Key（加密落库），与任务级 model / api_key_id 配合解析
         self.key_vault = KeyVaultService(self.session_factory, self.settings)  # type: ignore[attr-defined]
+        # 用户保险库：登录密码 / 卡号 / CVV 与模型密钥共用同一把主密钥；
+        # 写入入口只有用户侧 REST API（不注册 MCP / Agent 写工具）。
+        self.vault = VaultService(self.session_factory, self.key_vault)  # type: ignore[attr-defined]
         # 外部连接器：令牌复用同一把密钥库主密钥加密，按本地账号隔离
         self.github = GitHubConnectorService(
             self.session_factory,  # type: ignore[attr-defined]

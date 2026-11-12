@@ -140,6 +140,11 @@ SPEC_TABLES = {
     # 与 bot_memories（每 Bot 记忆）和 memories（三层记忆）分开存储。
     "user_profile_entries",
     "user_journal_entries",
+    # 用户保险库（迁移 d7a1f4c9b2e6）：站点登录 / 支付卡 / 联系人。
+    # 密码、完整卡号、CVV 均以 SecretBox 信封密文落库；接口只回掩码。
+    "vault_logins",
+    "vault_cards",
+    "vault_contacts",
     # 手机设备配对（迁移 f9d2e4a7b1c8）：devices 存长期设备令牌哈希，
     # pairing_codes 存一次性配对码哈希；两者都不落明文。
     "devices",
