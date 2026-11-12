@@ -158,7 +158,7 @@ class McpServer:
         if spec is None:
             return _error(request_id, INVALID_PARAMS, f"未知工具：{name}")
 
-        # 第一道：模式白名单（Plan 只读）。DSH 的长期令牌是能力位超集，
+        # 第一道：模式白名单（Plan 只读）。长期令牌是能力位超集，
         # 只靠 scopes 区分不了模式，所以白名单必须排在能力位检查之前。
         if not tool_allowed(identity.permission_mode, name):
             message = denied_message(identity.permission_mode, name)

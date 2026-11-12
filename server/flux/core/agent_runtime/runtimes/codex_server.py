@@ -24,7 +24,7 @@ from flux.logging import get_logger
 
 logger = get_logger(__name__)
 
-#: 攒批粒度：与 DSH 旁路一致，8 字符推一帧，模型停顿时最多等 50ms
+#: 攒批粒度：8 字符推一帧，模型停顿时最多等 50ms
 FLUSH_CHARS = 8
 FLUSH_INTERVAL_SECONDS = 0.05
 

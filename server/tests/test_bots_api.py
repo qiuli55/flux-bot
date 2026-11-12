@@ -82,7 +82,7 @@ def _create(client: TestClient, **overrides: object) -> dict:
 
 
 def test_create_bot_defaults(client: TestClient) -> None:
-    """默认：active、无人值守、无定时、工作目录按 <dsh_home>/bots/<id>/workspace 派生。"""
+    """默认：active、无人值守、无定时、工作目录按 <runtime_home>/bots/<id>/workspace 派生。"""
     bot = _create(client)
     assert set(bot) == _BOT_KEYS
     assert bot["status"] == "active"

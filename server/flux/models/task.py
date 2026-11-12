@@ -48,7 +48,7 @@ class Task(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     confirmation: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # 决策点历史（文档 §5）：一个列表，每个元素是一个决策点记录；status=pending 的那条是"正等人选"。
     decisions: Mapped[list | None] = mapped_column(JSON, nullable=True)
-    # 该任务触发的 DSH Run（P0-05）。Run 结束时靠它把终态回写到任务上。
+    # 该任务触发的 Agent Run（P0-05）。Run 结束时靠它把终态回写到任务上。
     run_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     # 任务级模型覆盖（移动端对话页切换 Agent 的模型）；None = 用该 Agent runtime 的默认模型。
     model: Mapped[str | None] = mapped_column(String(128), nullable=True)

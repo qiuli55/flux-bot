@@ -176,7 +176,7 @@ def resolve_default_model(settings: Settings, runtime_id: str) -> str:
         return opencode_default_model(settings)
     if runtime_id == "codex":
         return (settings.codex_model or "").strip()
-    return (settings.dsh_model or "").strip()
+    return (settings.anthropic_model or "").strip()
 
 
 # --- OpenCode Go ---

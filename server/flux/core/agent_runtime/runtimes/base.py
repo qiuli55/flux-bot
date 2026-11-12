@@ -1,12 +1,12 @@
 """Agent Runtime 统一契约（P2-1，设计 §6）。
 
-`Task → AgentRuntime → {DSH, Codex, OpenCode}`：平台只认这一份契约，启动、身份注入、
-MCP 接入、事件流、取消各运行时各管各的实现细节，编排层（`TaskRunService`）不出现
-任何 runtime 专属分支。
+`Task → AgentRuntime → {Claude Code, Codex, OpenCode}`：平台只认这一份契约，启动、
+身份注入、MCP 接入、事件流、取消各运行时各管各的实现细节，编排层（`TaskRunService`）
+不出现任何 runtime 专属分支。
 
-统一事件词表与 DSH 侧对齐（`dsh_events.py`）：`status / message / tool_call /
-tool_result / final / error`。终态由既有 `RunSupervisor` 裁决（CLI 退出码 0 → completed、
-非 0 → failed、cancel/timeout 由看护器升级链路判定），本契约不新增第二套生命周期。
+统一事件词表：`status / message / tool_call / tool_result / thinking / final / error`。
+终态由既有 `RunSupervisor` 裁决（CLI 退出码 0 → completed、非 0 → failed、
+cancel/timeout 由看护器升级链路判定），本契约不新增第二套生命周期。
 """
 
 from __future__ import annotations
@@ -17,22 +17,22 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 #: 支持的 runtime 标识（也是 Agent 档案里 `config["runtime"]` 的合法取值）
-RUNTIME_DSH = "dsh"
+RUNTIME_CLAUDE = "claude-code"
 RUNTIME_CODEX = "codex"
 RUNTIME_OPENCODE = "opencode"
-DEFAULT_RUNTIME = RUNTIME_DSH
-KNOWN_RUNTIMES: tuple[str, ...] = (RUNTIME_DSH, RUNTIME_CODEX, RUNTIME_OPENCODE)
+DEFAULT_RUNTIME = RUNTIME_CLAUDE
+KNOWN_RUNTIMES: tuple[str, ...] = (RUNTIME_CLAUDE, RUNTIME_CODEX, RUNTIME_OPENCODE)
 #: 需要 Flux 主动拉起本机 CLI 的 runtime（安装状态必须是 READY）
-CLI_RUNTIMES: tuple[str, ...] = (RUNTIME_CODEX, RUNTIME_OPENCODE)
+CLI_RUNTIMES: tuple[str, ...] = (RUNTIME_CLAUDE, RUNTIME_CODEX, RUNTIME_OPENCODE)
 
 #: 每个 runtime 是否原生逐 token 流式。
-#: True = 增量由 runtime 自己产出（DSH 走 LLM SSE 旁路 / codex 走 app-server delta /
-#: opencode 走 serve 的 message.part.delta），平台不做「整段生成再切块回放」。
+#: True = 增量由 runtime 自己产出（claude-code 走 stream_event delta / codex 走
+#: app-server delta / opencode 走 serve 的 message.part.delta），平台不做「整段生成再切块回放」。
 #: False = 该 runtime 只能整段返回：Agent 仍可正常创建与执行，档案带
 #: `native_streaming=False` 供客户端标注，正文由平台按分段回放兜底。
 #: 新增 runtime 必须在上面显式登记取值，契约测试会拦住漏登记的 runtime。
 RUNTIME_NATIVE_STREAMING: dict[str, bool] = {
-    RUNTIME_DSH: True,
+    RUNTIME_CLAUDE: True,
     RUNTIME_CODEX: True,
     RUNTIME_OPENCODE: True,
 }
@@ -71,7 +71,8 @@ DEFAULT_RUNTIME_LIMITS = RuntimeLimits()
 
 #: 各 runtime 的时限默认值；被 Settings 的 `agent_*` 覆盖项进一步收敛
 RUNTIME_LIMITS: dict[str, RuntimeLimits] = {
-    RUNTIME_DSH: RuntimeLimits(submit_timeout_seconds=120.0, async_turn=True),
+    #: `claude -p` 是一次性进程（靠 `--resume <session_id>` 续聊），不进进程池
+    RUNTIME_CLAUDE: RuntimeLimits(submit_timeout_seconds=60.0, async_turn=True),
     RUNTIME_CODEX: RuntimeLimits(submit_timeout_seconds=60.0, reusable_process=True),
     RUNTIME_OPENCODE: RuntimeLimits(
         submit_timeout_seconds=30.0,
@@ -163,9 +164,9 @@ class RuntimeProcess:
     run_id: str
     pid: int | None = None
     pgid: int | None = None
-    #: 运行时自己的句柄（DSH 是 DshRun，CLI 是 CliProcess）；编排层不解释它
+    #: 运行时自己的句柄（CLI 是 CliProcess）；编排层不解释它
     handle: Any = None
-    #: 对外 Run 快照（字段与 DshRun.to_dict 对齐，供 API 响应）
+    #: 对外 Run 快照（字段与 Run 快照 dict 对齐，供 API 响应）
     snapshot: dict[str, Any] = field(default_factory=dict)
 
 
@@ -222,8 +223,8 @@ __all__ = [
     "EVENT_TOOL_RESULT",
     "KNOWN_RUNTIMES",
     "ModelChannel",
+    "RUNTIME_CLAUDE",
     "RUNTIME_CODEX",
-    "RUNTIME_DSH",
     "RUNTIME_EVENT_TYPES",
     "RUNTIME_LIMITS",
     "RUNTIME_NATIVE_STREAMING",

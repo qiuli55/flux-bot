@@ -15,7 +15,6 @@ from fastapi import Depends, FastAPI
 
 from flux.api.auth import require_rest_auth
 from flux.api.errors import register_exception_handlers
-from flux.api.internal_tap import router as llm_tap_router
 from flux.api.v1 import (
     agents,
     bots,
@@ -24,7 +23,6 @@ from flux.api.v1 import (
     connectors,
     deliveries,
     desktop,
-    dsh,
     groups,
     health,
     keys,
@@ -35,7 +33,6 @@ from flux.api.v1 import (
 )
 from flux.config import Settings, get_settings
 from flux.container import Container
-from flux.core.agent_runtime.llm_stream_tap import llm_stream_tap
 from flux.core.mcp.server import router as mcp_router
 from flux.logging import configure_logging
 from flux.version import VERSION
@@ -53,7 +50,6 @@ _BOT_ROUTERS = (
     memory,
     models,
     keys,
-    dsh,
     capabilities,
     uploads,
     codex_account,
@@ -72,11 +68,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await container.agent_tokens.migrate_legacy_tokens()
         # 上一轮进程被杀时中断的工作区 Apply 需要按磁盘事实恢复，否则 Bot 的改动会卡在 applying。
         await container.workspace.recover_interrupted_applies()
-        if app_settings.dsh_enabled:
-            # 收摊孤儿 Run，再拉起心跳/对账循环：Bot 的定时任务全靠它推进。
-            await container.dsh.supervisor.startup_recovery()
-            await container.task_runs.reconcile_orphan_tasks()
-            container.dsh.supervisor.ensure_background()
+        # 收摊孤儿 Run，再拉起心跳/对账循环：Bot 的定时任务全靠它推进。
+        await container.run_supervisor.startup_recovery()
+        await container.task_runs.reconcile_orphan_tasks()
+        container.run_supervisor.ensure_background()
         # Bot 调度：轮询 bots.next_run_at，到期且空闲就开新任务。关掉后仍可手动触发。
         if app_settings.bot_scheduler_enabled:
             await container.bots.start()
@@ -84,7 +79,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # 调度循环先停：定时开工要写 tasks / bots，必须在 dispose 之前收尾。
         await container.bots.stop()
         await container.dispose()
-        await llm_stream_tap.aclose()
 
     app = FastAPI(
         title="Flux Bot",
@@ -104,8 +98,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
     # MCP 能力面：给 agent 用的协议端点，与 REST 同进程同生命周期。
     app.include_router(mcp_router)
-    # 内置 Agent 的 token 流式旁路：只给本机 DSH 子进程用。
-    app.include_router(llm_tap_router)
     return app
 
 

@@ -3,43 +3,36 @@
 三条链路各自对应的"必须测试"项：
 
 - P0-06：AI 先追问不动代码；六维度确认卡用户可改；改完的版本就是执行依据（TC-103）；
-- P0-05：确认后「开始执行」真正起一次 DSH Run，任务状态随 Run 终态收敛；
+- P0-05：确认后「开始执行」真正起一次 Claude Code Run，任务状态随 Run 终态收敛；
 - §5：任务级策略 auto / manual 分流，manual 挂 `waiting_for_user_decision` 等人选，
   选完续跑；Run 结束时不得把"等人决策"改写成完成（TC-203）。
 
-DSH 一律注入 fake harness：不启动真实 runtime、不调用真实模型（`default_provider="local"`）。
+一律注入 fake Claude CLI：不启动真实 runtime、不调用真实模型（`default_provider="local"`）。
 决策类用例需要"Agent 还在执行中"这个前提，因此默认替身行为是**一直不结束**，
 由夹具在用例收尾时统一放行——否则 Run 会在毫秒级跑完，任务已终态，决策点无从谈起。
 """
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from deepseek_harness import Notification, RunResult
 from fastapi.testclient import TestClient
 
 from flux.config import Settings
 from flux.container import Container
-from flux.core.agent_runtime.dsh_client import FluxDshClient
-from flux.core.agent_runtime.protocol import RUNTIME_BOOTSTRAP
 from flux.core.event.bus import Events
 from flux.core.task_engine.assistant import CONFIRMATION_DIMENSIONS
 from flux.enums import DecisionMode, DshRunStatus, TaskStatus
 from flux.main import create_app
-from tests.fakes import (
-    DshBehavior,
-    FakeDshHarness,
-    FakeDshHarnessFactory,
-    default_dsh_behavior,
-)
+from tests.conftest import create_agent
+from tests.fakes import mark_runtime_ready, read_cli_argv, write_fake_claude
 
 PREFIX = "/api/v1"
 
@@ -71,59 +64,53 @@ _OPTIONS: list[dict[str, Any]] = [
 ]
 
 
-def _hold_behavior(
-    harness: FakeDshHarness,
-    instruction: str,
-    session_id: str | None,
-    on_notification: Callable[[Notification], None] | None,
-) -> RunResult:
-    """替身行为：Run 一直不结束，模拟"执行中的 Agent"（夹具收尾时放行）。"""
-    harness.cancel_event.wait(timeout=10)
-    return RunResult(
-        session_id=session_id or "session",
-        final_response="",
-        finish_reason="cancelled",
-        events=[],
-        notifications=[],
-    )
-
-
 @contextmanager
 def _solo(
-    settings: Settings, tmp_path: Path, *, behavior: DshBehavior = _hold_behavior
-) -> Iterator[tuple[TestClient, FakeDshHarnessFactory]]:
-    """带 fake DSH 的 app：任务「开始执行」时起的是替身 Run，不碰真实 runtime。"""
+    settings: Settings, tmp_path: Path, *, hold: bool = True, ready: bool = True
+) -> Iterator[tuple[TestClient, Path]]:
+    """带 fake Claude CLI 的 app：任务「开始执行」时起的是替身进程，不碰真实 runtime。
+
+    `hold=True` 让替身一直不结束（默认，供决策类用例）；夹具收尾时 touch sentinel 放行。
+    `ready=False` 不把 installation 置为 READY，用于验证「runtime 未接入」的显式失败。
+    """
     root = tmp_path / "project"
     root.mkdir(exist_ok=True)
+    log_path = tmp_path / "cli-argv.log"
+    sentinel = tmp_path / "release"
+    binary = write_fake_claude(tmp_path / "claude", log_path=log_path, sentinel=sentinel, hold=hold)
     enabled = settings.model_copy(
         update={
-            "dsh_enabled": True,
-            "dsh_home": str(tmp_path / "dsh-home"),
-            "dsh_workspace": str(tmp_path / "dsh-ws"),
+            "runtime_home": str(tmp_path / "runtime-home"),
+            "runtime_workspace": str(tmp_path / "runtime-ws"),
             "workspace_root": str(root),
+            "mcp_enabled": True,
+            "mcp_url": "http://127.0.0.1:8000/mcp",
         }
     )
     app = create_app(enabled)
-    factory = FakeDshHarnessFactory(behavior)
-    with TestClient(app) as client:
-        container = app.state.container
-        container.dsh = FluxDshClient(
-            enabled,
-            bus=container.bus,
-            harness_factory=factory,
-            token_service=container.agent_tokens,
-        )
-        try:
-            yield client, factory
-        finally:
-            # 放行所有还在"执行中"的替身 Run，避免退出时留下阻塞线程
-            for harness in factory.created:
-                harness.cancel_event.set()
+    previous = os.environ.get("FLUX_CLAUDE_CLI_BINARY")
+    os.environ["FLUX_CLAUDE_CLI_BINARY"] = binary
+    try:
+        with TestClient(app) as client:
+            if ready:
+                mark_runtime_ready(app.state.container, "claude-code")
+            try:
+                yield client, log_path
+            finally:
+                sentinel.touch()
+    finally:
+        if previous is None:
+            os.environ.pop("FLUX_CLAUDE_CLI_BINARY", None)
+        else:
+            os.environ["FLUX_CLAUDE_CLI_BINARY"] = previous
 
 
 def _create(client: TestClient, *, mode: str = "auto", description: str = "改造待办服务") -> dict:
+    # 执行需要 Agent 档案（runtime 的配置、模型与权限都挂在 Agent 上）
+    agent_id = create_agent(client, name="solo-dev")
     response = client.post(
-        f"{PREFIX}/tasks", json={"description": description, "decision_mode": mode}
+        f"{PREFIX}/tasks",
+        json={"description": description, "decision_mode": mode, "agent_id": agent_id},
     )
     assert response.status_code == 200, response.text
     return response.json()["data"]
@@ -151,12 +138,12 @@ def _wait_status(client: TestClient, task_id: str, wanted: str, *, timeout: floa
     raise AssertionError(f"任务未在 {timeout}s 内进入 {wanted}，当前 {task.get('status')}")
 
 
-def _wait_harnesses(factory: Any, count: int, *, timeout: float = 5.0) -> None:
-    """Run 的 harness 在后台任务里创建：HTTP 返回时可能还没到位，等它出现再断言。"""
+def _wait_runs(log_path: Path, count: int, *, timeout: float = 5.0) -> None:
+    """Run 在后台线程里启动：HTTP 返回时进程可能还没起来，等 argv 落盘再断言。"""
     deadline = time.monotonic() + timeout
-    while len(factory.created) < count and time.monotonic() < deadline:
+    while len(read_cli_argv(log_path)) < count and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert len(factory.created) == count
+    assert len(read_cli_argv(log_path)) == count
 
 
 def _messages(client: TestClient, task_id: str) -> list[dict]:
@@ -205,7 +192,7 @@ def test_task_defaults_to_auto_with_no_confirmation(settings: Settings, tmp_path
 
 def test_assistant_replies_without_touching_the_code(settings: Settings, tmp_path: Path) -> None:
     """AI 先对话不动代码：消息落库、任务进入 running，但不会自己起 Run。"""
-    with _solo(settings, tmp_path) as (client, factory):
+    with _solo(settings, tmp_path) as (client, log_path):
         task = _create(client, description="给待办服务加一个按完成状态过滤的接口")
         replied = client.post(
             f"{PREFIX}/tasks/{task['id']}/messages", json={"content": "只做后端，别动前端"}
@@ -218,7 +205,7 @@ def test_assistant_replies_without_touching_the_code(settings: Settings, tmp_pat
         assert body["messages"][1]["content"]
 
         # 追问阶段绝不执行：没有任何 Run 被起起来
-        assert factory.created == []
+        assert read_cli_argv(log_path) == []
         assert _task(client, task["id"])["run_id"] is None
 
 
@@ -298,8 +285,8 @@ def test_confirmation_is_rejected_on_a_finished_task(settings: Settings, tmp_pat
 
 
 def test_start_runs_the_agent_and_settles_the_task(settings: Settings, tmp_path: Path) -> None:
-    """确认后「开始执行」：起一次 DSH Run，Run 结束把任务收敛到 completed。"""
-    with _solo(settings, tmp_path, behavior=default_dsh_behavior) as (client, factory):
+    """确认后「开始执行」：起一次 Claude Code Run，Run 结束把任务收敛到 completed。"""
+    with _solo(settings, tmp_path, hold=False) as (client, log_path):
         task = _create(client, description="给待办服务加过滤接口")
         client.put(f"{PREFIX}/tasks/{task['id']}/confirmation", json={"items": SIX_DIMENSIONS})
 
@@ -318,18 +305,20 @@ def test_start_runs_the_agent_and_settles_the_task(settings: Settings, tmp_path:
 
         settled = _wait_status(client, task["id"], "completed")
         assert settled["run_id"] == run_id
-        assert len(factory.created) == 1
-        # 批次①：任务路径（tasks.py → start_run）交给 harness 的 prompt 以 Bootstrap 起始，
-        # 而 run / 消息里存的仍是用户原文（上面的 instruction 取样即存库原文）
-        assert factory.created[0].prompts == [f"{RUNTIME_BOOTSTRAP}\n\n{instruction}"]
-        assert _wait_last_message(client, task["id"], "run_finished")["content"].startswith("echo:")
+        runs = read_cli_argv(log_path)
+        assert len(runs) == 1
+        # prompt 恒为 argv 最后一项：Flux Bootstrap 打头，紧跟存库的这份指令
+        prompt = runs[0][-1]
+        assert prompt.startswith("You are running inside Flux.")
+        assert prompt.endswith(instruction)
+        assert _wait_last_message(client, task["id"], "run_finished")["content"] == "done"
 
 
 def test_start_can_take_the_confirmation_with_the_request(
     settings: Settings, tmp_path: Path
 ) -> None:
     """前端"改完直接执行"：确认卡随 start 一起提交，落库的就是这份。"""
-    with _solo(settings, tmp_path, behavior=default_dsh_behavior) as (client, _):
+    with _solo(settings, tmp_path, hold=False) as (client, _log_path):
         task = _create(client)
         tuned = [dict(item) for item in SIX_DIMENSIONS]
         tuned[3] = {"label": "修改范围", "value": "只改 todo_service/store.py"}
@@ -342,34 +331,53 @@ def test_start_can_take_the_confirmation_with_the_request(
 
 def test_start_twice_is_rejected(settings: Settings, tmp_path: Path) -> None:
     """重复开始执行是明确冲突，不会起第二个 Run。"""
-    with _solo(settings, tmp_path) as (client, factory):
+    with _solo(settings, tmp_path) as (client, log_path):
         task = _create(client)
         _start(client, task["id"])
         again = client.post(f"{PREFIX}/tasks/{task['id']}/start", json={})
         assert again.status_code == 409
         assert "已开始执行" in again.json()["message"]
-        _wait_harnesses(factory, 1)
+        _wait_runs(log_path, 1)
 
 
-def test_start_fails_loudly_when_dsh_is_disabled(settings: Settings, tmp_path: Path) -> None:
-    """未启用 DSH 时是 503，不是"假装开始执行"的 200。"""
-    disabled = settings.model_copy(update={"dsh_enabled": False, "workspace_root": str(tmp_path)})
-    with TestClient(create_app(disabled)) as client:
+def test_start_fails_loudly_when_runtime_is_not_ready(settings: Settings, tmp_path: Path) -> None:
+    """runtime 未接入时是 409，不是"假装开始执行"的 200。"""
+    with _solo(settings, tmp_path, ready=False) as (client, _log_path):
         task = _create(client)
         response = client.post(f"{PREFIX}/tasks/{task['id']}/start", json={})
-        assert response.status_code == 503
-        assert response.json()["code"] == "configuration_error"
+        assert response.status_code == 409
+        assert response.json()["code"] == "conflict"
         # 失败之后任务上不留 run_id，可以修好配置再点一次
         assert _task(client, task["id"])["run_id"] is None
+
+
+def _run_status(client: TestClient, task_id: str, run_id: str) -> str | None:
+    runs = client.get(f"{PREFIX}/tasks/{task_id}/runs").json()["data"]
+    for run in runs:
+        if run["run_id"] == run_id:
+            return run["status"]
+    return None
+
+
+def _wait_run_status(
+    client: TestClient, task_id: str, run_id: str, wanted: str, *, timeout: float = 5.0
+) -> None:
+    deadline = time.monotonic() + timeout
+    status = None
+    while time.monotonic() < deadline:
+        status = _run_status(client, task_id, run_id)
+        if status == wanted:
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"Run 未在 {timeout}s 内进入 {wanted}，当前 {status}")
 
 
 def test_cancel_stops_the_task_and_its_run(settings: Settings, tmp_path: Path) -> None:
     """取消任务要连它正在跑的 Run 一起停（留个还在干活的 Agent 与"已取消"是矛盾的）。
 
-    替身 harness 收到 session/cancel 的确定性验证在 test_dsh_api 里；这里验证任务链路：
-    取消后任务与它的 Run 都进入 cancelled，且中断请求已下发。
+    这里验证任务链路：取消后任务与它的 Run 都进入 cancelled（替身进程随进程组被杀）。
     """
-    with _solo(settings, tmp_path) as (client, factory):
+    with _solo(settings, tmp_path) as (client, _log_path):
         task = _create(client)
         run_id = _start(client, task["id"])["task"]["run_id"]
 
@@ -377,16 +385,7 @@ def test_cancel_stops_the_task_and_its_run(settings: Settings, tmp_path: Path) -
         assert cancelled.status_code == 200
         assert cancelled.json()["data"]["status"] == "cancelled"
 
-        run = client.get(f"{PREFIX}/dsh/runs/{run_id}").json()["data"]
-        assert run["cancel_requested"] is True
-        for _ in range(500):
-            run = client.get(f"{PREFIX}/dsh/runs/{run_id}").json()["data"]
-            if run["status"] == "cancelled":
-                break
-            # 替身 Run 卡在"执行中"，需要真收到 cancel 才会返回
-            factory.created[0].cancel_event.set()
-            time.sleep(0.01)
-        assert run["status"] == "cancelled"
+        _wait_run_status(client, task["id"], run_id, "cancelled")
         assert _task(client, task["id"])["status"] == "cancelled"
 
 
@@ -399,47 +398,25 @@ def test_cancel_after_run_completed_keeps_task_completed(
     而 Run 的终态已是 completed；旧实现把"非 cancelled"一律记 failed，把一次成功的
     执行改判成失败。修复后按 Run 的真实结局收尾：任务与响应都停留在 completed。
     """
-    root = tmp_path / "project"
-    root.mkdir(exist_ok=True)
-    enabled = settings.model_copy(
-        update={
-            "dsh_enabled": True,
-            "dsh_home": str(tmp_path / "dsh-home"),
-            "dsh_workspace": str(tmp_path / "dsh-ws"),
-            "workspace_root": str(root),
-        }
-    )
-    app = create_app(enabled)
-    factory = FakeDshHarnessFactory(_hold_behavior)
-    with TestClient(app) as client:
-        container = app.state.container
-        container.dsh = FluxDshClient(
-            enabled,
-            bus=container.bus,
-            harness_factory=factory,
-            token_service=container.agent_tokens,
-        )
-        try:
-            task = _create(client)
-            _start(client, task["id"])
+    with _solo(settings, tmp_path) as (client, _log_path):
+        container = client.app.state.container
+        task = _create(client)
+        _start(client, task["id"])
 
-            async def cancel_reports_completed(run_id: str) -> Any:
-                """替身：取消发出的瞬间 Run 已经成功结束（终态先行、桥接收尾在后）。"""
-                return SimpleNamespace(status=DshRunStatus.COMPLETED)
+        async def cancel_reports_completed(run_id: str) -> Any:
+            """替身：取消发出的瞬间 Run 已经成功结束（终态先行、桥接收尾在后）。"""
+            return DshRunStatus.COMPLETED
 
-            container.dsh.cancel = cancel_reports_completed  # type: ignore[method-assign]
-            response = client.post(f"{PREFIX}/tasks/{task['id']}/cancel")
-            assert response.status_code == 200
-            assert response.json()["data"]["status"] == "completed"
-            assert _task(client, task["id"])["status"] == "completed"
-        finally:
-            for harness in factory.created:
-                harness.cancel_event.set()
+        container.run_supervisor.cancel = cancel_reports_completed  # type: ignore[method-assign]
+        response = client.post(f"{PREFIX}/tasks/{task['id']}/cancel")
+        assert response.status_code == 200
+        assert response.json()["data"]["status"] == "completed"
+        assert _task(client, task["id"])["status"] == "completed"
 
 
 def test_continue_reopens_a_finished_conversation(settings: Settings, tmp_path: Path) -> None:
     """终态对话收到新消息：重开同一任务并起第二轮 Run，历史与用户消息都保留。"""
-    with _solo(settings, tmp_path, behavior=default_dsh_behavior) as (client, factory):
+    with _solo(settings, tmp_path, hold=False) as (client, log_path):
         task = _create(client, description="给待办服务加过滤接口")
         started = _start(client, task["id"])
         first_run_id = started["task"]["run_id"]
@@ -460,18 +437,15 @@ def test_continue_reopens_a_finished_conversation(settings: Settings, tmp_path: 
         assert len(data["messages"]) == 1
 
         # 起了第二轮 Run，且这一轮的指令就是新消息（不再叠加上一轮的确认卡）
-        _wait_harnesses(factory, 2)
-        # Run 在后台线程里执行，prompt 可能在 HTTP 返回后才记下来，这里等一小会儿
+        _wait_runs(log_path, 2)
+        # Run 在后台线程里执行，argv 可能在 HTTP 返回后才记下来，这里等一小会儿
         deadline = time.monotonic() + 5
-        while not factory.created[1].prompts and time.monotonic() < deadline:
+        while len(read_cli_argv(log_path)) < 2 and time.monotonic() < deadline:
             time.sleep(0.01)
-        followup_instruction = factory.created[1].prompts[0]
+        followup_instruction = read_cli_argv(log_path)[1][-1]
         assert "再补一个按关键字搜索的参数" in followup_instruction
         assert "## 本轮任务" in followup_instruction
         assert "需求确认" not in followup_instruction
-        # 两轮必须用不同 session：DSH 复用同一个 id 起第二轮会报 already exists
-        assert factory.created[0].session_ids and factory.created[1].session_ids
-        assert factory.created[0].session_ids[0] != factory.created[1].session_ids[0]
 
         # 历史没被清掉：旧消息还在，新消息追加在后面
         messages = _messages(client, task["id"])
@@ -484,7 +458,7 @@ def test_continue_reopens_a_finished_conversation(settings: Settings, tmp_path: 
 
 def test_continue_rejects_a_conversation_still_running(settings: Settings, tmp_path: Path) -> None:
     """还在执行的对话不需要续跑：直接追加消息即可，续跑接口明确 409。"""
-    with _solo(settings, tmp_path) as (client, factory):
+    with _solo(settings, tmp_path) as (client, log_path):
         task = _create(client)
         _start(client, task["id"])
         response = client.post(
@@ -492,14 +466,14 @@ def test_continue_rejects_a_conversation_still_running(settings: Settings, tmp_p
         )
         assert response.status_code == 409
         assert "仍在进行中" in response.json()["message"]
-        _wait_harnesses(factory, 1)
+        _wait_runs(log_path, 1)
 
 
 def test_continue_works_after_the_conversation_was_cancelled(
     settings: Settings, tmp_path: Path
 ) -> None:
     """取消也是终态：用户后悔了可以接着聊，不用重建一个新对话。"""
-    with _solo(settings, tmp_path) as (client, factory):
+    with _solo(settings, tmp_path) as (client, log_path):
         task = _create(client)
         _start(client, task["id"])
         cancelled = client.post(f"{PREFIX}/tasks/{task['id']}/cancel", json={})
@@ -511,7 +485,7 @@ def test_continue_works_after_the_conversation_was_cancelled(
         )
         assert continued.status_code == 200, continued.text
         assert continued.json()["data"]["task"]["status"] == "running"
-        _wait_harnesses(factory, 2)
+        _wait_runs(log_path, 2)
 
 
 # --- §5 决策模式 ---

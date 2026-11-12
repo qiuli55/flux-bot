@@ -925,9 +925,9 @@ async def start_task(
     """开始执行（P0-05）：把确认过的需求交给该 Agent 的 runtime 起一次 Run，任务进入 running。
 
     确认卡可以随请求一起传（前端"改完直接执行"），也可以留空用任务上已保存的那份。
-    编排收敛在 `TaskRunService`（P2-1 §6.2）：按 `agent.config["runtime"]` 分发 DSH / CLI，
-    对外响应与消息落库行为保持不变。runtime 不可用（DSH 未启用 / CLI 未接入）时不返回
-    "假装开始执行"的 200。
+    编排收敛在 `TaskRunService`（P2-1 §6.2）：按 `agent.config["runtime"]` 分发
+    Claude Code / Codex / OpenCode，对外响应与消息落库行为保持不变。runtime 不可用
+    （CLI 未接入）时不返回"假装开始执行"的 200。
     """
     task_uuid = _task_id(task_id)
     task = await _require_open_task(container, task_uuid, task_id)
@@ -1091,7 +1091,7 @@ async def cancel_task(
     with contextlib.suppress(NotFoundError):
         container.scheduler.cancel(str(task.id))
     if task.run_id:
-        # 取消任务要连它正在跑的 DSH Run 一起停——留一个还在改文件的 Agent 与"已取消"是矛盾的。
+        # 取消任务要连它正在跑的 Agent Run 一起停——留一个还在改文件的 Agent 与"已取消"是矛盾的。
         # P2-15：以 Run 的终态为准映射任务状态——进程树确认清理干净才是 cancelled，
         # 清理失败（FAILED）或超时（TIMEOUT）都按 failed 记录，不粉饰成"取消成功"。
         run_status = await _cancel_run(container, task.run_id)
@@ -1143,8 +1143,8 @@ async def delete_task(
 
 
 async def _cancel_run(container: Container, run_id: str) -> DshRunStatus | None:
-    """取消任务所属的 DSH Run；Run 不存在时返回 None（历史任务没有 Run，不算失败）。"""
+    """取消任务所属的 Run；Run 不存在时返回 None（历史任务没有 Run，不算失败）。"""
     try:
-        return (await container.dsh.cancel(run_id)).status
+        return await container.run_supervisor.cancel(run_id)
     except NotFoundError:
         return None

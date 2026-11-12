@@ -49,7 +49,7 @@ class Bot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     decision_mode: Mapped[str] = mapped_column(
         String(16), nullable=False, default="auto", server_default="auto"
     )
-    #: 独立工作目录（绝对路径）。留空 = `<dsh_home>/bots/<id>/workspace`。
+    #: 独立工作目录（绝对路径）。留空 = `<runtime_home>/bots/<id>/workspace`。
     #: 每次开工都会把解析后的路径快照进 tasks.workspace，历史记录不随配置漂移。
     workspace: Mapped[str | None] = mapped_column(String(512), nullable=True)
     #: 取值见 flux.enums.BotStatus；paused 的 Bot 不会被定时触发

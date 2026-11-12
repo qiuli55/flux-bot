@@ -337,7 +337,7 @@ class MessageType(StrEnum):
 
 
 class DshRunStatus(StrEnum):
-    """DSH Agent Run 状态机（修复方案 §2.2）。
+    """Agent Run 状态机（修复方案 §2.2）。
 
     PENDING → STARTING → RUNNING → COMPLETED / FAILED / TIMEOUT，
     取消走 RUNNING → CANCELLING → CANCELLED（进程树确认清理完成才算 CANCELLED），

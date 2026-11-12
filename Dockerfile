@@ -6,8 +6,13 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# Node 20 + Claude Code CLI：Bot 的 Agent 底座（npm 全局装 claude）
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
+    && apt-get install -y --no-install-recommends curl ca-certificates gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g @anthropic-ai/claude-code \
+    && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/*
 
 # 依赖单列一层：改代码不重装依赖，NAS 上重建更快
@@ -18,9 +23,9 @@ COPY server/ ./
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# 数据与 DSH 家目录都落在挂载卷里，容器重建不丢 Bot 与例程
+# 数据与运行期目录都落在挂载卷里，容器重建不丢 Bot 与例程
 ENV FLUX_DATABASE_URL=sqlite+aiosqlite:////data/flux.db \
-    FLUX_DSH_HOME=/data/dsh-home \
+    FLUX_RUNTIME_HOME=/data/runtime-home \
     FLUX_BOT_PORT=8600
 
 VOLUME ["/data"]

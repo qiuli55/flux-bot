@@ -3,8 +3,8 @@
 第一版不新造与 MCP 平行的协议：`MCP initialize` + `flux_context` 即 Flux Agent
 Handshake v1。这里只放协议名与版本，供 `flux_context` 与 CLI Adapter 共用同一份标识。
 
-同时提供 Runtime Bootstrap / Runtime Identity 的**唯一真源**：CLI Agent Adapter 与
-DSH 客户端都从这里取，避免两套 `FLUX_*` 注入各写各的（收口方案 §8.2）。
+同时提供 Runtime Bootstrap / Runtime Identity 的**唯一真源**：所有 CLI Agent Adapter
+都从这里取，避免多套 `FLUX_*` 注入各写各的（收口方案 §8.2）。
 """
 
 from __future__ import annotations

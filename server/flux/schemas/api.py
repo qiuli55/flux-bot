@@ -35,9 +35,9 @@ class AgentCreateRequest(BaseModel):
     skills: list[str] = Field(default_factory=list)
     tools: list[str] = Field(default_factory=list)
     permissions: list[Capability] = Field(default_factory=list)
-    #: 执行该 Agent 的 runtime（P2-1 §6.2）：内置 DSH 默认，或本机 CLI（codex / opencode）。
+    #: 执行该 Agent 的 runtime（P2-1 §6.2）：默认 Claude Code，或本机 CLI（codex / opencode）。
     #: 取值在边界即校验（非法 → 422），并由 AgentManager 再校验一次（内部调用方同样受约束）。
-    runtime: Literal["dsh", "codex", "opencode"] = "dsh"
+    runtime: Literal["claude-code", "codex", "opencode"] = "claude-code"
 
 
 class AgentTokenIssueRequest(BaseModel):
@@ -100,7 +100,7 @@ class BotCreateRequest(BaseModel):
     #: 无人值守是 Bot 的常态；需要人工把关时显式改成 normal / plan / full
     permission_mode: PermissionMode = PermissionMode.UNATTENDED
     decision_mode: DecisionMode = DecisionMode.AUTO
-    #: 独立工作目录（绝对路径）；留空 = <dsh_home>/bots/<id>/workspace
+    #: 独立工作目录（绝对路径）；留空 = <runtime_home>/bots/<id>/workspace
     workspace: str | None = Field(default=None, max_length=512)
     schedule: str | None = Field(default=None, max_length=64)
     #: 连续失败多少次自动暂停；0 = 永不自动暂停
