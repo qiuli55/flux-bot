@@ -35,6 +35,7 @@ from flux.core.capability_import.scanners import AgentScanner
 from flux.core.capability_import.service import CapabilityImportService
 from flux.core.channels.feishu_bot import FeishuBotChannel
 from flux.core.code_intelligence.service import CodeIntelligenceService
+from flux.core.connectors.email import EmailConnectorService
 from flux.core.connectors.framework import ConnectorFrameworkService, build_default_catalog
 from flux.core.context.lifecycle import ContextLifecycle
 from flux.core.context.metrics import BackfillObserver
@@ -153,6 +154,8 @@ class Container:
     github: GitHubConnectorService = field(init=False)
     #: 用户账号连接器框架（catalog / install / uninstall）；与 Agent 执行侧注册表分离
     connector_framework: ConnectorFrameworkService = field(init=False)
+    #: Email 连接器（IMAP 读信 / SMTP 发信），凭据复用同一把密钥库主密钥
+    email: EmailConnectorService = field(init=False)
     #: Bot 桌面入口参数：公开隧道地址 + 环境变量里的凭据
     desktop: DesktopService = field(init=False)
     task_runs: TaskRunBridge = field(init=False)
@@ -248,13 +251,21 @@ class Container:
             self.settings,
             self.key_vault,
         )
-        # 账号侧连接器目录：当前只上架 GitHub；安装状态按 account_key 隔离。
-        # Agent 执行侧的 connector 注册表（self.connectors）保持独立，互不替换。
+        # Email 连接器：IMAP/SMTP 都是阻塞标准库调用，动作层用 asyncio.to_thread 包装；
+        # 凭据（连接参数 + 邮箱密码）整体加密后落在 connector_installations。
+        self.email = EmailConnectorService(
+            self.session_factory,  # type: ignore[attr-defined]
+            self.key_vault,
+        )
+        # 账号侧连接器目录：GitHub（OAuth）+ Email（api_key 即邮箱密码）；
+        # 安装状态按 account_key 隔离。Agent 执行侧的 connector 注册表
+        # （self.connectors）保持独立，互不替换。
         self.connector_framework = ConnectorFrameworkService(
             self.session_factory,  # type: ignore[attr-defined]
             self.key_vault,
             build_default_catalog(self.settings),
             github=self.github,
+            email=self.email,
         )
         # Bot 桌面：只做公开隧道地址代读 + 凭据拼装，无状态
         self.desktop = DesktopService(self.settings)

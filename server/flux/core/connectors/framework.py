@@ -8,10 +8,14 @@
 GitHub 继续复用 `GitHubConnectorService` 与 `github_connections` 表（设备码 OAuth、
 令牌加密、账号隔离都不变）。本框架只登记它的 catalog 定义，并在列表 / 卸载时委托；
 通用连接器（api_key 等）的安装元数据与凭据落在 `connector_installations` 表。
+
+Email 也走同一张表：api_key 承载邮箱密码，连接参数（IMAP/SMTP 主机、端口、SSL）
+放在安装请求的 `settings` 里，两者合并成一份 JSON 凭据整体加密，不新增表。
 """
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -20,6 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from flux.config import Settings
+from flux.core.connectors.email import EmailConnectorService, prepare_credentials
 from flux.core.github.service import GitHubConnectorService
 from flux.core.key_vault.service import KeyVaultService
 from flux.errors import BadRequestError, ConflictError, NotFoundError
@@ -97,9 +102,10 @@ class ConnectorCatalog:
 
 
 def build_default_catalog(settings: Settings) -> ConnectorCatalog:
-    """生产目录：当前只上架 GitHub（OAuth 设备码）。
+    """生产目录：GitHub（OAuth 设备码）+ Email（IMAP/SMTP，api_key 即邮箱密码）。
 
-    scope 取自 `settings.github_scopes`，与 GitHub 登录流程实际请求的范围一致。
+    GitHub 的 scope 取自 `settings.github_scopes`，与登录流程实际请求的范围一致；
+    Email 不需要新增鉴权方式，沿用 api_key 承载应用密码，连接参数走安装时的 settings。
     """
     catalog = ConnectorCatalog()
     catalog.register(
@@ -109,6 +115,15 @@ def build_default_catalog(settings: Settings) -> ConnectorCatalog:
             description=GitHubConnectorService.description,
             auth_types=(AUTH_OAUTH,),
             scopes=tuple(part for part in settings.github_scopes.split() if part),
+        )
+    )
+    catalog.register(
+        ConnectorDefinition(
+            id=EmailConnectorService.connector_id,
+            name=EmailConnectorService.connector_name,
+            description=EmailConnectorService.description,
+            auth_types=(AUTH_API_KEY,),
+            scopes=EmailConnectorService.scopes,
         )
     )
     return catalog
@@ -124,11 +139,13 @@ class ConnectorFrameworkService:
         catalog: ConnectorCatalog,
         *,
         github: GitHubConnectorService | None = None,
+        email: EmailConnectorService | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._key_vault = key_vault
         self._catalog = catalog
         self._github = github
+        self._email = email
 
     # --- 目录 ---
 
@@ -163,7 +180,14 @@ class ConnectorFrameworkService:
 
         row = await self.installation(account_key, connector_id)
         if row is not None:
-            return row.to_public(name=definition.name, description=definition.description)
+            public = row.to_public(name=definition.name, description=definition.description)
+            # email 的账号名来自加密凭据里的 username；解密失败时留空，不拖垮整个列表
+            if self._is_email(connector_id) and row.credential_ciphertext is not None:
+                assert self._email is not None
+                label = await self._email.label_for_ciphertext(row.credential_ciphertext)
+                public["account"] = label
+                public["display_name"] = label or definition.name
+            return public
         return {
             "id": definition.id,
             "name": definition.name,
@@ -190,6 +214,7 @@ class ConnectorFrameworkService:
         auth_type: str | None = None,
         api_key: str | None = None,
         scopes: list[str] | None = None,
+        settings: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         definition = self._catalog.get(connector_id)
         requested = (auth_type or "").strip()
@@ -218,17 +243,27 @@ class ConnectorFrameworkService:
                 },
             )
 
-        secret = (api_key or "").strip()
-        if not secret:
-            raise BadRequestError(
-                "安装 API Key 类连接器需要提供 api_key",
-                details={"connector": connector_id, "auth_type": AUTH_API_KEY},
-            )
         if await self.installation(account_key, connector_id) is not None:
             raise ConflictError(
                 "该连接器已安装；如需更换凭据请先卸载",
                 details={"connector": connector_id},
             )
+
+        if self._is_email(connector_id):
+            # email 的凭据是一份含连接参数的 JSON 文档：密码可放在 api_key 或
+            # settings.password，主机 / 端口 / SSL 开关放在 settings。整体加密落库。
+            document = prepare_credentials(api_key, settings)
+            credential_ciphertext = self._key_vault.seal_text(
+                json.dumps(document, ensure_ascii=False)
+            )
+        else:
+            secret = (api_key or "").strip()
+            if not secret:
+                raise BadRequestError(
+                    "安装 API Key 类连接器需要提供 api_key",
+                    details={"connector": connector_id, "auth_type": AUTH_API_KEY},
+                )
+            credential_ciphertext = self._key_vault.seal_text(secret)
 
         scope_value = self._normalize_scopes(definition, scopes)
         async with self._session_factory() as session:
@@ -238,7 +273,7 @@ class ConnectorFrameworkService:
                     connector_id=connector_id,
                     auth_type=AUTH_API_KEY,
                     scopes=scope_value,
-                    credential_ciphertext=self._key_vault.seal_text(secret),
+                    credential_ciphertext=credential_ciphertext,
                 )
             )
             await session.commit()
@@ -292,6 +327,9 @@ class ConnectorFrameworkService:
 
     def _is_github(self, connector_id: str) -> bool:
         return self._github is not None and connector_id == self._github.connector_id
+
+    def _is_email(self, connector_id: str) -> bool:
+        return self._email is not None and connector_id == self._email.connector_id
 
     @staticmethod
     def _normalize_scopes(definition: ConnectorDefinition, scopes: list[str] | None) -> str:
