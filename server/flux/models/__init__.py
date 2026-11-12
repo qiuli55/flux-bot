@@ -9,6 +9,7 @@ from flux.models.agent_run import AgentRun
 from flux.models.agent_token import AgentToken
 from flux.models.api_key import ApiKey
 from flux.models.apply_batch import ApplyBatch
+from flux.models.artifact_page import ArtifactPage, ArtifactPageRevision
 from flux.models.base import Base
 from flux.models.bot import Bot
 from flux.models.bot_memory import BotMemory, BotMemoryChunk
@@ -67,6 +68,8 @@ __all__ = [
     "AgentToken",
     "ApiKey",
     "ApplyBatch",
+    "ArtifactPage",
+    "ArtifactPageRevision",
     "Base",
     "Bot",
     "BotMemory",

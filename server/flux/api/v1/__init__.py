@@ -22,6 +22,7 @@ from flux.api.v1 import (
     keys,
     memory,
     models,
+    pages,
     projects,
     supervisor,
     tasks,
@@ -49,6 +50,7 @@ api_v1_router.include_router(git.router)
 api_v1_router.include_router(projects.router)
 api_v1_router.include_router(memory.router)
 api_v1_router.include_router(models.router)
+api_v1_router.include_router(pages.router)
 api_v1_router.include_router(connectors.router)
 api_v1_router.include_router(dsh.router)
 api_v1_router.include_router(capabilities.router)

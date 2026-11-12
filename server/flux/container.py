@@ -75,6 +75,8 @@ from flux.core.memory.shared_user import SharedUserMemoryService
 from flux.core.memory.shared_user_repository import SharedUserMemoryRepository
 from flux.core.model_gateway.providers.registry import build_providers
 from flux.core.model_gateway.router import ModelRouter
+from flux.core.pages.repository import ArtifactPageRepository
+from flux.core.pages.service import ArtifactPageService
 from flux.core.permission_engine.policy import PermissionPolicy
 from flux.core.project_brain.refresh import BrainRefresher
 from flux.core.project_brain.repository import ProjectBrainRepository
@@ -172,6 +174,8 @@ class Container:
     #: 跨 Bot 共享的用户记忆：画像（只由用户侧 API 写）+ 去重日志（只追加）
     shared_user_memory_repo: SharedUserMemoryRepository = field(init=False)
     shared_user_memory: SharedUserMemoryService = field(init=False)
+    #: 制品页面：Bot 产出的可分享静态内容，版本只追加，公开面按 share_token 读取
+    pages: ArtifactPageService = field(init=False)
     proposal_repo: ProposalRepository = field(init=False)
     batch_repo: ApplyBatchRepository = field(init=False)
     dsh: FluxDshClient = field(init=False)
@@ -305,6 +309,8 @@ class Container:
             self.session_factory  # type: ignore[attr-defined]
         )
         self.shared_user_memory = SharedUserMemoryService(self.shared_user_memory_repo)
+        # 制品页面：管理面走 REST，公开面只按不可猜测的 share_token 读取 published
+        self.pages = ArtifactPageService(ArtifactPageRepository(self.session_factory))  # type: ignore[attr-defined]
         self.groups = GroupOrchestrator(
             self.group_repo,
             self.task_repo,
