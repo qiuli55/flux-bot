@@ -619,7 +619,9 @@ class BotConversationService:
             # 共享用户记忆叠加在 Bot 自己的记忆之上：两者并存，互不替代。
             # 共享层失败只降级为「只有 Bot 记忆」，不能挡住这一轮对话。
             shared_memory = await self._shared_memory_block()
-            context_parts = [part for part in (memory, shared_memory) if part]
+            # 技能库注入：与记忆并列，失败只降级为「没有技能块」。
+            skills = await self._skills_block(bot)
+            context_parts = [part for part in (memory, shared_memory, skills) if part]
             description = (bot.description or "").strip() or bot.name
             user_message = await self.begin_user_turn(
                 task,
@@ -660,6 +662,17 @@ class BotConversationService:
             return await service.render_block()
         except Exception:  # noqa: BLE001 - 共享记忆只是增强，失败不能打断 turn
             logger.warning("共享用户记忆渲染失败，本轮仅使用 Bot 记忆", exc_info=True)
+            return ""
+
+    async def _skills_block(self, bot: Bot) -> str:
+        """读取分配给该 Bot 的启用技能；任何失败都降级为空串，不影响本轮对话。"""
+        service = getattr(self._container, "skills", None)
+        if service is None:
+            return ""
+        try:
+            return await service.render_block(bot.id)
+        except Exception:  # noqa: BLE001 - 技能只是上下文增强，失败不能打断 turn
+            logger.warning("Bot %s 技能渲染失败，本轮不注入技能", bot.id, exc_info=True)
             return ""
 
     async def _fail(self, turn_id: uuid.UUID, error: str, error_code: str) -> None:

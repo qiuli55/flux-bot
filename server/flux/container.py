@@ -81,6 +81,8 @@ from flux.core.project_brain.repository import ProjectBrainRepository
 from flux.core.project_brain.service import ProjectBrain
 from flux.core.project_files.explorer import WorkspaceFileExplorer
 from flux.core.project_scanner.scanner import ProjectScanner
+from flux.core.skills.repository import SkillLibraryRepository
+from flux.core.skills.service import SkillLibraryService
 from flux.core.supervisor import (
     FeishuChannel,
     FeishuWebhook,
@@ -172,6 +174,9 @@ class Container:
     #: 跨 Bot 共享的用户记忆：画像（只由用户侧 API 写）+ 去重日志（只追加）
     shared_user_memory_repo: SharedUserMemoryRepository = field(init=False)
     shared_user_memory: SharedUserMemoryService = field(init=False)
+    #: 技能库：库内技能包 CRUD + 每 Bot 分配；对话时把正文注入 context
+    skill_library_repo: SkillLibraryRepository = field(init=False)
+    skills: SkillLibraryService = field(init=False)
     proposal_repo: ProposalRepository = field(init=False)
     batch_repo: ApplyBatchRepository = field(init=False)
     dsh: FluxDshClient = field(init=False)
@@ -305,6 +310,9 @@ class Container:
             self.session_factory  # type: ignore[attr-defined]
         )
         self.shared_user_memory = SharedUserMemoryService(self.shared_user_memory_repo)
+        # 技能库：正文存库、按 Bot 分配，对话轮次只做 context 注入（不经过 agent_runtime）
+        self.skill_library_repo = SkillLibraryRepository(self.session_factory)  # type: ignore[attr-defined]
+        self.skills = SkillLibraryService(self.skill_library_repo)
         self.groups = GroupOrchestrator(
             self.group_repo,
             self.task_repo,
