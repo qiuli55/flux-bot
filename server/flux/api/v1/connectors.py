@@ -137,6 +137,20 @@ async def test_email_connection(
     return ok(await container.email.test_connection(account_key))
 
 
+@router.post("/email/poll")
+async def poll_email_messages(
+    request: Request,
+    container: Container = Depends(get_container),
+) -> dict[str, object]:
+    """立即跑一轮邮箱轮询（供测试与未来的「立即检查」按钮）。
+
+    只发布新邮件对应的 email.received 事件，不发送任何邮件；响应里不含正文与密码。
+    后台轮询由 main.py lifespan 按 FLUX_EMAIL_TRIGGER_* 配置自动起停。
+    """
+    account_key = _account_key(request)
+    return ok(await container.email_trigger.poll_account(account_key))
+
+
 @router.post("/{connector_id}/install")
 async def install_connector(
     connector_id: str,

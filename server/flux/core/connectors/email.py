@@ -791,7 +791,9 @@ def _credential_port(document: dict[str, Any], field: str, default: int) -> int:
     value = document.get(field)
     if value is None:
         return default
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
+    # 0 是 prepare_credentials 对「该方向未配置」写入的哨兵值（只配 SMTP 或只配 IMAP
+    # 时另一侧的端口就是 0）；真正的可用性由 _credentials_for 按 host 判定。
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 65535:
         raise ConfigurationError(
             "email 连接器凭据格式已损坏，请重新安装",
             details={"connector": CONNECTOR_ID},

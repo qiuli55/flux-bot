@@ -19,6 +19,7 @@ from flux.models.connector import ConnectorConfig, ConnectorLog
 from flux.models.connector_installation import ConnectorInstallation
 from flux.models.context import ContextBlob, ContextStep, ContextStepToken
 from flux.models.device import Device, PairingCode
+from flux.models.email_trigger_cursor import EmailTriggerCursor
 from flux.models.github import GithubConnection
 from flux.models.group import (
     ChatGroup,
@@ -87,6 +88,7 @@ __all__ = [
     "ContextStep",
     "ContextStepToken",
     "Device",
+    "EmailTriggerCursor",
     "GithubConnection",
     "ImportedCapability",
     "KnowledgeChunk",

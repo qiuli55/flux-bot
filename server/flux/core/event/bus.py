@@ -80,6 +80,9 @@ class Events:
     GITHUB_ISSUE_COMMENT = "github.issue_comment"
     GITHUB_RELEASE = "github.release"
     GITHUB_WORKFLOW_RUN = "github.workflow_run"
+    #: IMAP 轮询发现的新邮件；载荷只含账号、目录、UID 与邮件头字段，
+    #: 不含正文与凭据。Bot / 例程的 event_triggers 直接订阅这个事件名。
+    EMAIL_RECEIVED = "email.received"
 
 
 class EventBus:

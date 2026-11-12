@@ -144,6 +144,10 @@ SPEC_TABLES = {
     # pairing_codes 存一次性配对码哈希；两者都不落明文。
     "devices",
     "pairing_codes",
+    # §11.2 之外的新增表：Email 入站轮询游标（迁移 b7c2e4f9a1d3）。
+    # 每个 (account_key, mailbox) 一行，记录已处理的最大 IMAP UID 与最近轮询状态；
+    # 进程内去重集合重启即丢，持久化游标才能避免重复发布 email.received。
+    "email_trigger_cursors",
 }
 
 

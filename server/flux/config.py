@@ -349,6 +349,18 @@ class Settings(BaseSettings):
     routine_webhook_secret: str | None = None
     github_webhook_secret: str | None = None
 
+    # --- Email 入站触发（IMAP 轮询）---
+    # 定期轮询已安装的 email 连接器，发现新邮件后发布 email.received 事件，
+    # 与 Webhook / GitHub 共用 Bot / 例程的事件触发链路。只读邮件头，不自动回复。
+    email_trigger_enabled: bool = True
+    # 轮询间隔（秒）。小于 15 会被抬到 15，避免测试 / 本地把 IMAP 打爆；
+    # 设为 0 或负数等价于关闭轮询（即使 email_trigger_enabled=true）。
+    email_trigger_interval_seconds: float = 60.0
+    # 轮询的邮箱目录；需要非 INBOX 目录时改这里。
+    email_trigger_mailbox: str = "INBOX"
+    # 每个账号每轮最多读取的邮件头数量（连接器自身上限 50）。
+    email_trigger_limit: int = 20
+
     # --- 助理知识库（RAG / wiki）---
     # 给助理建一份覆盖「全部对话 + docs + 项目记忆」的检索层（见 flux.core.knowledge）。
     # 关闭后不做任何索引，assistant.search 直接返回空——测试里关掉，避免后台索引抢时序。
