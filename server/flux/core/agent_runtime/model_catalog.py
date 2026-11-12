@@ -36,11 +36,19 @@ PROVIDER_DEEPSEEK = "deepseek"
 PROVIDER_OPENAI = "openai"
 PROVIDER_OPENAI_COMPATIBLE = "openai_compatible"
 PROVIDER_ANTHROPIC = "anthropic"
+PROVIDER_QWEN = "qwen"
+PROVIDER_ZHIPU = "zhipu"
+PROVIDER_KIMI = "kimi"
+PROVIDER_DOUBAO = "doubao"
 KEY_PROVIDERS: tuple[str, ...] = (
     PROVIDER_DEEPSEEK,
     PROVIDER_OPENAI,
     PROVIDER_OPENAI_COMPATIBLE,
     PROVIDER_ANTHROPIC,
+    PROVIDER_QWEN,
+    PROVIDER_ZHIPU,
+    PROVIDER_KIMI,
+    PROVIDER_DOUBAO,
 )
 
 PROVIDER_TITLES: dict[str, str] = {
@@ -48,6 +56,10 @@ PROVIDER_TITLES: dict[str, str] = {
     PROVIDER_OPENAI: "OpenAI",
     PROVIDER_OPENAI_COMPATIBLE: "OpenAI 兼容",
     PROVIDER_ANTHROPIC: "Anthropic",
+    PROVIDER_QWEN: "Qwen（通义千问）",
+    PROVIDER_ZHIPU: "智谱 GLM",
+    PROVIDER_KIMI: "Kimi（月之暗面）",
+    PROVIDER_DOUBAO: "豆包（火山方舟）",
 }
 
 #: 各 runtime 能吃哪些供应商协议的 key。协议层不兼容的一律不展示、不接收。
@@ -56,7 +68,9 @@ _RUNTIME_PROVIDERS: dict[str, frozenset[str]] = {
     RUNTIME_DSH: frozenset({PROVIDER_DEEPSEEK}),
     # codex 的第三方供应商块只讲 OpenAI wire api（responses / chat）
     RUNTIME_CODEX: frozenset({PROVIDER_DEEPSEEK, PROVIDER_OPENAI, PROVIDER_OPENAI_COMPATIBLE}),
-    # opencode 原生支持多家供应商
+    # opencode 原生支持多家供应商。四家中国区供应商都提供 OpenAI 兼容的
+    # chat/completions，opencode 用 openai-compatible 适配器即可直连；
+    # codex 侧只走 Responses API，故不把它们放进去。
     RUNTIME_OPENCODE: frozenset(KEY_PROVIDERS),
 }
 
@@ -218,6 +232,14 @@ def default_base_url(settings: Settings, provider: str) -> str:
         return (settings.openai_base_url or "").strip()
     if provider == PROVIDER_ANTHROPIC:
         return (settings.anthropic_base_url or "").strip()
+    if provider == PROVIDER_QWEN:
+        return (settings.qwen_base_url or "").strip()
+    if provider == PROVIDER_ZHIPU:
+        return (settings.zhipu_base_url or "").strip()
+    if provider == PROVIDER_KIMI:
+        return (settings.kimi_base_url or "").strip()
+    if provider == PROVIDER_DOUBAO:
+        return (settings.doubao_base_url or "").strip()
     return ""
 
 
@@ -250,9 +272,13 @@ __all__ = [
     "KEY_PROVIDERS",
     "PROVIDER_ANTHROPIC",
     "PROVIDER_DEEPSEEK",
+    "PROVIDER_DOUBAO",
+    "PROVIDER_KIMI",
     "PROVIDER_OPENAI",
     "PROVIDER_OPENAI_COMPATIBLE",
+    "PROVIDER_QWEN",
     "PROVIDER_TITLES",
+    "PROVIDER_ZHIPU",
     "KeyEntry",
     "KeyModelOption",
     "default_base_url",

@@ -44,7 +44,7 @@ def python_script(path: str | Path) -> str:
 def settings(tmp_path) -> Settings:
     """测试用配置：SQLite 落临时目录，日志降到 WARNING，供应商用离线回显。
 
-    三个真实供应商的密钥显式传 None：pydantic-settings 的默认值仍是"读环境"，
+    所有真实供应商的密钥显式传 None：pydantic-settings 的默认值仍是"读环境"，
     开发机仓库根的 .env 一旦填了 FLUX_OPENAI_API_KEY 之类，就会让"未配置供应商"
     的断言变成"已配置"，测试结果随开发机环境漂移。显式钉死让用例与外部环境无关。
     """
@@ -75,6 +75,10 @@ def settings(tmp_path) -> Settings:
         openai_api_key=None,
         anthropic_api_key=None,
         deepseek_api_key=None,
+        qwen_api_key=None,
+        zhipu_api_key=None,
+        kimi_api_key=None,
+        doubao_api_key=None,
         default_provider="local",
         # 密钥库用固定主密钥：用例不读 ~/.flux，也不在开发机留下密钥文件
         key_vault_secret="flux-test-key-vault-secret",
