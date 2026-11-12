@@ -27,6 +27,7 @@ from flux.api.v1 import (
     tasks,
     terminal,
     uploads,
+    user_memory,
     workspace,
 )
 
@@ -54,6 +55,7 @@ api_v1_router.include_router(capabilities.router)
 api_v1_router.include_router(designs.router)
 api_v1_router.include_router(deliveries.router)
 api_v1_router.include_router(uploads.router)
+api_v1_router.include_router(user_memory.router)
 api_v1_router.include_router(codex_account.router)
 api_v1_router.include_router(supervisor.router)
 

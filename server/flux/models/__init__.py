@@ -33,6 +33,7 @@ from flux.models.memory import MemoryEntry
 from flux.models.project import Project, ProjectMemory
 from flux.models.run_trace import RunTraceItem
 from flux.models.runtime_session import TaskRuntimeSession
+from flux.models.shared_user_memory import UserJournalEntry, UserProfileEntry
 from flux.models.supervisor import (
     SupervisorAssignment,
     SupervisorDigest,
@@ -118,6 +119,8 @@ __all__ = [
     "UsageRecord",
     "UsageSnapshot",
     "User",
+    "UserJournalEntry",
+    "UserProfileEntry",
     "VirtualChange",
     "WechatSession",
 ]
