@@ -66,6 +66,9 @@ def settings(tmp_path) -> Settings:
         knowledge_worker_enabled=False,
         # Bot 调度循环同理：后台按 next_run_at 自动开工会让任务状态随用例时序漂移
         bot_scheduler_enabled=False,
+        # Webhook 密钥显式置空：避免开发机 .env 里的真实密钥让 fail-closed 断言失真
+        routine_webhook_secret=None,
+        github_webhook_secret=None,
         knowledge_embedding_api_key=None,
         memory_prefs_file=str(tmp_path / "memory-prefs.json"),
         # 补全偏好同样落临时目录：不能读写开发机 ~/.flux/completion-prefs.json

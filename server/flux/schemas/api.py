@@ -173,6 +173,8 @@ class BotRoutineCreateRequest(BaseModel):
     #: 5 段 cron；留空 = 只手动触发
     schedule: str | None = Field(default=None, max_length=64)
     enabled: bool = True
+    #: 可触发本例程的事件名；留空 = 只按 cron 跑
+    event_triggers: list[str] | None = Field(default=None, max_length=32)
 
 
 class BotRoutineUpdateRequest(BaseModel):
@@ -182,6 +184,8 @@ class BotRoutineUpdateRequest(BaseModel):
     instruction: str | None = Field(default=None, max_length=8000)
     schedule: str | None = Field(default=None, max_length=64)
     enabled: bool | None = None
+    #: 显式传 null / [] 表示清空事件触发
+    event_triggers: list[str] | None = Field(default=None, max_length=32)
 
 
 class BotRunRequest(BaseModel):
