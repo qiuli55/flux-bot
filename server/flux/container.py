@@ -35,6 +35,7 @@ from flux.core.capability_import.scanners import AgentScanner
 from flux.core.capability_import.service import CapabilityImportService
 from flux.core.channels.feishu_bot import FeishuBotChannel
 from flux.core.channels.outbound_drafts import OutboundDraftService
+from flux.core.channels.wecom_bot import WeComBotChannel
 from flux.core.code_intelligence.service import CodeIntelligenceService
 from flux.core.connectors.framework import ConnectorFrameworkService, build_default_catalog
 from flux.core.context.lifecycle import ContextLifecycle
@@ -197,6 +198,8 @@ class Container:
     outbound_drafts: OutboundDraftService = field(init=False)
     #: 正式飞书频道：加密回调入站建 turn，出站回复必须经审批卡放行
     feishu_bot: FeishuBotChannel = field(init=False)
+    #: 正式企业微信频道：加密回调入站建 turn，出站回复必须经审批卡放行
+    wecom_bot: WeComBotChannel = field(init=False)
     # IDE 行内补全（AI_COMPLETION_SPEC）：偏好/当前 Agent 落盘 + 模型解析 + 流式生成
     completion_prefs: CompletionPrefsStore = field(init=False)
     completion_resolver: CompletionModelResolver = field(init=False)
@@ -508,6 +511,18 @@ class Container:
             bot_id=self.settings.feishu_bot_id,
         )
         self.bus.subscribe(Events.APPROVAL_RESOLVED, self.feishu_bot.on_approval_resolved)
+        # 正式企业微信频道：与飞书并列订阅审批结果，只处理 kind=wecom_outbound。
+        self.wecom_bot = WeComBotChannel(
+            self,
+            corp_id=self.settings.wecom_corp_id,
+            agent_id=self.settings.wecom_agent_id,
+            secret=self.settings.wecom_secret,
+            token=self.settings.wecom_token,
+            encoding_aes_key=self.settings.wecom_encoding_aes_key,
+            api_base=self.settings.wecom_api_base,
+            bot_id=self.settings.wecom_bot_id,
+        )
+        self.bus.subscribe(Events.APPROVAL_RESOLVED, self.wecom_bot.on_approval_resolved)
         # 上游瞬时故障（429 / ReadTimeout）自动续跑一轮：事件桥只做判定与冷却，
         # 真正重新起 Run 交给 TaskRunService（沿用任务自己的 Agent / 模型 / 权限模式）。
         self.task_runs.set_retry_handler(self._auto_retry_task)
@@ -694,6 +709,8 @@ class Container:
         # 正式飞书频道先收摊：取消仍在等 turn 的后台任务并关发送端连接池，
         # 避免 Bot 对话 worker 停掉时它们又去挂新的出站审批。
         await self.feishu_bot.aclose()
+        # 企业微信频道同理：先取消等待中的 turn 跟踪并关发送端连接池。
+        await self.wecom_bot.aclose()
         # Bot 对话 worker 先停：它要写 bot_turns / task_messages，不能跑在 dispose 之后。
         await self.bot_conversation.shutdown()
         # 退出时先停看护循环并清理仍在跑的 Agent 进程树，再释放连接（P2-15 §2.5）

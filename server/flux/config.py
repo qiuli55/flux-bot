@@ -407,6 +407,20 @@ class Settings(BaseSettings):
     # 这条飞书频道归属的 Flux Bot UUID；消息事件必须能定位到 Bot 才处理。
     feishu_bot_id: str | None = None
 
+    # --- Bot 频道 · 企业微信（WeCom，正式入站 + 受审批出站）---
+    # 自建应用凭据：corp_id / agent_id / secret 用于取 access_token 并发送应用消息。
+    wecom_corp_id: str | None = None
+    wecom_agent_id: str | None = None
+    wecom_secret: str | None = None
+    # 接收消息与事件的回调 token；留空 = 拒绝一切回调（fail-closed）。
+    wecom_token: str | None = None
+    # 回调加密的 EncodingAESKey（43 字符）；留空 = 拒绝一切回调。
+    wecom_encoding_aes_key: str | None = None
+    # 企业微信 API 基址（私有化部署可改）。
+    wecom_api_base: str = "https://qyapi.weixin.qq.com"
+    # 这条企业微信频道归属的 Flux Bot UUID；消息事件必须能定位到 Bot 才处理。
+    wecom_bot_id: str | None = None
+
     # --- Supervisor · 微信接入（OpenClaw + 微信 ClawBot 仅作传输层）---
     # 微信消息由本机 OpenClaw 网关转给 Flux，Flux 当大脑。入站令牌：插件每次转发
     # 都带 `Authorization: Bearer <token>`；留空 = 拒绝一切微信回调（fail-closed）。
