@@ -30,6 +30,9 @@ SPEC_TABLES = {
     "virtual_changes",
     "connectors",
     "connector_logs",
+    # 账号侧连接器框架（迁移 a1c4e7f92b30）：通用安装元数据 + api_key 凭据密文。
+    # GitHub 的 OAuth 令牌仍复用 github_connections，本表不重复存令牌。
+    "connector_installations",
     # 外部连接器：本地账号 ↔ GitHub 身份绑定（迁移 c8e4a1f72b93）。
     # 令牌以密钥库信封加密落库，接口与日志只暴露身份与 scopes。
     "github_connections",
