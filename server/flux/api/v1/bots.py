@@ -121,7 +121,8 @@ def _bot_dict(container: Container, bot: Bot, *, tokens_used: int = 0) -> dict[s
     # 每日预算的实时用量：账本是唯一权威，按需聚合，不额外落库
     data["tokens_used_today"] = tokens_used
     # cron 与预算窗口按这个时区解释，前端展示 next_run_at 时不用再猜。
-    data["timezone"] = container.settings.timezone
+    # Bot 自己设置了时区就展示它，否则展示继承的进程级 FLUX_TIMEZONE。
+    data["timezone"] = bot.timezone or container.settings.timezone
     return data
 
 
@@ -176,6 +177,8 @@ async def create_bot(
         decision_mode=payload.decision_mode,
         workspace=payload.workspace,
         schedule=payload.schedule,
+        timezone=payload.timezone,
+        missed_run_policy=payload.missed_run_policy,
         failure_threshold=payload.failure_threshold,
         token_budget=payload.token_budget,
         notify_on_failure=payload.notify_on_failure,

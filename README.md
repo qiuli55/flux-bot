@@ -30,6 +30,12 @@ curl http://127.0.0.1:8600/api/v1/health
 
 Bot 的 cron（`0 9 * * *`）和例程、每日 token 预算重置都按 `FLUX_TIMEZONE` 解释，默认 UTC。
 例如设置 `FLUX_TIMEZONE=Asia/Shanghai` 后，`0 9 * * *` 在本地 09:00 触发，预算也在本地零点重置。
+单个 Bot 可以通过 API 字段 `timezone`（IANA 名称，如 `America/New_York`）覆盖全局时区；
+留空则继承 `FLUX_TIMEZONE`。修改 `timezone` 或 `schedule` 后会立即按新时区重算 `next_run_at`。
+
+停机期间错过的触发点由 `missed_run_policy` 决定：`skip`（默认，恢复后只补跑一次）每次都从
+当前时刻重新计时；`skip_silent` 不补跑，只把下一次触发推到未来；`catch_up` 会按错过的槽位
+逐个补跑（每轮 tick 最多一次），但错过多于 24 个槽位时直接跳到当前时刻之后，避免任务雪崩。
 
 ### 鉴权与网络暴露
 

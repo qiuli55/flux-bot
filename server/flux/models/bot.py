@@ -58,6 +58,12 @@ class Bot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     #: 5 段 cron（分 时 日 月 周）。留空 = 只手动触发。
     schedule: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: 定时与预算窗口使用的 IANA 时区；NULL = 继承 FLUX_TIMEZONE。
+    timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: 停机错过触发点时的处理策略：skip / skip_silent / catch_up。
+    missed_run_policy: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="skip", server_default="skip"
+    )
     #: 下一次自动开工时间；调度器按它取到期任务，落库保证重启不丢。
     next_run_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
@@ -121,6 +127,8 @@ class Bot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "workspace": self.workspace,
             "status": self.status or "active",
             "schedule": self.schedule,
+            "timezone": self.timezone,
+            "missed_run_policy": self.missed_run_policy or "skip",
             "next_run_at": _iso(self.next_run_at),
             "last_run_at": _iso(self.last_run_at),
             "last_task_id": str(self.last_task_id) if self.last_task_id is not None else None,

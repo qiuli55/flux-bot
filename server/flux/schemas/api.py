@@ -110,6 +110,10 @@ class BotCreateRequest(BaseModel):
     #: 独立工作目录（绝对路径）；留空 = <dsh_home>/bots/<id>/workspace
     workspace: str | None = Field(default=None, max_length=512)
     schedule: str | None = Field(default=None, max_length=64)
+    #: 该 Bot 的 IANA 时区；留空 = 继承 FLUX_TIMEZONE
+    timezone: str | None = Field(default=None, max_length=64)
+    #: 错过触发点的处理策略：skip / skip_silent / catch_up
+    missed_run_policy: str | None = Field(default=None, max_length=16)
     #: 连续失败多少次自动暂停；0 = 永不自动暂停
     failure_threshold: int = Field(default=3, ge=0, le=20)
     #: 每日 token 预算（按 FLUX_TIMEZONE 的自然日）；留空或 0 = 无上限
@@ -144,6 +148,10 @@ class BotUpdateRequest(BaseModel):
     decision_mode: DecisionMode | None = None
     workspace: str | None = Field(default=None, max_length=512)
     schedule: str | None = Field(default=None, max_length=64)
+    #: 该 Bot 的 IANA 时区；显式传 null 表示继承 FLUX_TIMEZONE
+    timezone: str | None = Field(default=None, max_length=64)
+    #: 错过触发点的处理策略：skip / skip_silent / catch_up
+    missed_run_policy: str | None = Field(default=None, max_length=16)
     status: BotStatus | None = None
     failure_threshold: int | None = Field(default=None, ge=0, le=20)
     #: 每日 token 预算；显式传 null 表示改为无上限
