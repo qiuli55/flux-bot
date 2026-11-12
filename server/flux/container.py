@@ -32,6 +32,7 @@ from flux.core.bot.service import BotService
 from flux.core.capability_import.repository import ImportedCapabilityRepository
 from flux.core.capability_import.scanners import AgentScanner
 from flux.core.capability_import.service import CapabilityImportService
+from flux.core.channels.feishu_bot import FeishuBotChannel
 from flux.core.code_intelligence.service import CodeIntelligenceService
 from flux.core.context.lifecycle import ContextLifecycle
 from flux.core.context.metrics import BackfillObserver
@@ -180,6 +181,8 @@ class Container:
     bots: BotService = field(init=False)
     #: Bot 对话轮次：持久化 turn + 每 Bot 串行后台队列（legacy 对话也复用其助理逻辑）
     bot_conversation: BotConversationService = field(init=False)
+    #: 正式飞书频道：加密回调入站建 turn，出站回复必须经审批卡放行
+    feishu_bot: FeishuBotChannel = field(init=False)
     # IDE 行内补全（AI_COMPLETION_SPEC）：偏好/当前 Agent 落盘 + 模型解析 + 流式生成
     completion_prefs: CompletionPrefsStore = field(init=False)
     completion_resolver: CompletionModelResolver = field(init=False)
@@ -462,6 +465,18 @@ class Container:
         )
         # Bot 对话：一轮落一条 bot_turns，后台按 Bot 串行调用同一个助手逻辑。
         self.bot_conversation = BotConversationService(self)
+        # 正式飞书频道：入站回调建 turn；出站草稿走审批卡，用户点「允许」后才发送。
+        # 监听器只处理 kind=feishu_outbound 的审批结果，与既有审批闸门共存。
+        self.feishu_bot = FeishuBotChannel(
+            self,
+            app_id=self.settings.feishu_app_id,
+            app_secret=self.settings.feishu_app_secret,
+            verification_token=self.settings.feishu_verification_token,
+            encrypt_key=self.settings.feishu_encrypt_key,
+            api_base=self.settings.feishu_api_base,
+            bot_id=self.settings.feishu_bot_id,
+        )
+        self.bus.subscribe(Events.APPROVAL_RESOLVED, self.feishu_bot.on_approval_resolved)
         # 上游瞬时故障（429 / ReadTimeout）自动续跑一轮：事件桥只做判定与冷却，
         # 真正重新起 Run 交给 TaskRunService（沿用任务自己的 Agent / 模型 / 权限模式）。
         self.task_runs.set_retry_handler(self._auto_retry_task)
@@ -645,6 +660,9 @@ class Container:
             return ModelProvider.LOCAL
 
     async def dispose(self, *, close_terminal_sessions: bool = True) -> None:
+        # 正式飞书频道先收摊：取消仍在等 turn 的后台任务并关发送端连接池，
+        # 避免 Bot 对话 worker 停掉时它们又去挂新的出站审批。
+        await self.feishu_bot.aclose()
         # Bot 对话 worker 先停：它要写 bot_turns / task_messages，不能跑在 dispose 之后。
         await self.bot_conversation.shutdown()
         # 退出时先停看护循环并清理仍在跑的 Agent 进程树，再释放连接（P2-15 §2.5）

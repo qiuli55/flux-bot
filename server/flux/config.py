@@ -362,6 +362,21 @@ class Settings(BaseSettings):
     # 回调事件在 Supervisor 里的来源标识，同时也是订阅/通道的键。
     supervisor_feishu_source_key: str = "feishu"
 
+    # --- Bot 频道 · 飞书（正式入站 + 受审批出站）---
+    # 与 Supervisor 的飞书接入相互独立：这里把飞书文本消息变成 Bot 对话轮次，
+    # 回复必须经审批卡「允许」后才发送。未配置 verification token / bot id 时
+    # 消息事件 fail-closed。
+    feishu_app_id: str | None = None
+    feishu_app_secret: str | None = None
+    # 事件订阅的 verification token；留空 = 拒绝一切回调。
+    feishu_verification_token: str | None = None
+    # 加密回调的 Encrypt Key；配置后回调必须带合法签名，密文用 AES-256-CBC 解密。
+    feishu_encrypt_key: str | None = None
+    # 飞书开放平台 API 基址（私有化部署可改）。
+    feishu_api_base: str = "https://open.feishu.cn"
+    # 这条飞书频道归属的 Flux Bot UUID；消息事件必须能定位到 Bot 才处理。
+    feishu_bot_id: str | None = None
+
     # --- Supervisor · 微信接入（OpenClaw + 微信 ClawBot 仅作传输层）---
     # 微信消息由本机 OpenClaw 网关转给 Flux，Flux 当大脑。入站令牌：插件每次转发
     # 都带 `Authorization: Bearer <token>`；留空 = 拒绝一切微信回调（fail-closed）。
