@@ -85,8 +85,13 @@ async def raise_approval(
     title: str,
     detail: str,
     meta: dict[str, Any],
+    decision_id: str | None = None,
 ) -> dict[str, Any]:
-    """把一条审批请求写成强制 pending 的决策记录 + 对话消息，返回记录本身。"""
+    """把一条审批请求写成强制 pending 的决策记录 + 对话消息，返回记录本身。
+
+    `decision_id` 可选：调用方需要提前把审批 id 写进关联记录（如出站草稿）时，
+    先自行生成并传入，保证两边在审批卡可见前就指向同一个 id。
+    """
     record = build_decision(
         question=title,
         options=[
@@ -110,6 +115,7 @@ async def raise_approval(
     )
     record = {
         **record,
+        "id": decision_id or record["id"],
         "kind": kind,
         "meta": {**meta, "task_id": str(task_id), "run_id": run_id},
     }
