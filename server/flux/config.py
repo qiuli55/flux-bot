@@ -407,6 +407,20 @@ class Settings(BaseSettings):
     # 这条飞书频道归属的 Flux Bot UUID；消息事件必须能定位到 Bot 才处理。
     feishu_bot_id: str | None = None
 
+    # --- Bot 频道 · 钉钉（HTTP 事件订阅入站 + 受审批出站）---
+    # AppKey 同时是应用级事件订阅的 ownerKey 与默认 robotCode；AppSecret 只用于
+    # 换取 accessToken 发消息。token / EncodingAESKey 未配置时回调 fail-closed。
+    dingtalk_app_key: str | None = None
+    dingtalk_app_secret: str | None = None
+    # 事件订阅后台配置的签名 token（3~32 位英文或数字）；留空 = 拒绝一切回调。
+    dingtalk_token: str | None = None
+    # 43 位 EncodingAESKey；回调密文用 AES-256-CBC 解密，应答也要用它加密。
+    dingtalk_aes_key: str | None = None
+    # 钉钉 OpenAPI 基址（私有化部署可改）。
+    dingtalk_api_base: str = "https://api.dingtalk.com"
+    # 这条钉钉频道归属的 Flux Bot UUID；消息事件必须能定位到 Bot 才处理。
+    dingtalk_bot_id: str | None = None
+
     # --- Supervisor · 微信接入（OpenClaw + 微信 ClawBot 仅作传输层）---
     # 微信消息由本机 OpenClaw 网关转给 Flux，Flux 当大脑。入站令牌：插件每次转发
     # 都带 `Authorization: Bearer <token>`；留空 = 拒绝一切微信回调（fail-closed）。

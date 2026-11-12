@@ -33,6 +33,7 @@ from flux.core.bot.webhook_triggers import WebhookTriggerService
 from flux.core.capability_import.repository import ImportedCapabilityRepository
 from flux.core.capability_import.scanners import AgentScanner
 from flux.core.capability_import.service import CapabilityImportService
+from flux.core.channels.dingtalk_bot import DingTalkBotChannel
 from flux.core.channels.feishu_bot import FeishuBotChannel
 from flux.core.channels.outbound_drafts import OutboundDraftService
 from flux.core.code_intelligence.service import CodeIntelligenceService
@@ -197,6 +198,8 @@ class Container:
     outbound_drafts: OutboundDraftService = field(init=False)
     #: 正式飞书频道：加密回调入站建 turn，出站回复必须经审批卡放行
     feishu_bot: FeishuBotChannel = field(init=False)
+    #: 正式钉钉频道：HTTP 事件订阅入站建 turn，出站回复同样必须经审批卡放行
+    dingtalk_bot: DingTalkBotChannel = field(init=False)
     # IDE 行内补全（AI_COMPLETION_SPEC）：偏好/当前 Agent 落盘 + 模型解析 + 流式生成
     completion_prefs: CompletionPrefsStore = field(init=False)
     completion_resolver: CompletionModelResolver = field(init=False)
@@ -508,6 +511,18 @@ class Container:
             bot_id=self.settings.feishu_bot_id,
         )
         self.bus.subscribe(Events.APPROVAL_RESOLVED, self.feishu_bot.on_approval_resolved)
+        # 正式钉钉频道：HTTP 事件订阅验签/解密后建 turn；出站同样只挂审批卡。
+        # kind=dingtalk_outbound 与飞书监听器互不干扰，两个订阅并存。
+        self.dingtalk_bot = DingTalkBotChannel(
+            self,
+            app_key=self.settings.dingtalk_app_key,
+            app_secret=self.settings.dingtalk_app_secret,
+            token=self.settings.dingtalk_token,
+            aes_key=self.settings.dingtalk_aes_key,
+            api_base=self.settings.dingtalk_api_base,
+            bot_id=self.settings.dingtalk_bot_id,
+        )
+        self.bus.subscribe(Events.APPROVAL_RESOLVED, self.dingtalk_bot.on_approval_resolved)
         # 上游瞬时故障（429 / ReadTimeout）自动续跑一轮：事件桥只做判定与冷却，
         # 真正重新起 Run 交给 TaskRunService（沿用任务自己的 Agent / 模型 / 权限模式）。
         self.task_runs.set_retry_handler(self._auto_retry_task)
@@ -694,6 +709,8 @@ class Container:
         # 正式飞书频道先收摊：取消仍在等 turn 的后台任务并关发送端连接池，
         # 避免 Bot 对话 worker 停掉时它们又去挂新的出站审批。
         await self.feishu_bot.aclose()
+        # 钉钉频道同理：先停跟踪任务与发送端，再停对话 worker。
+        await self.dingtalk_bot.aclose()
         # Bot 对话 worker 先停：它要写 bot_turns / task_messages，不能跑在 dispose 之后。
         await self.bot_conversation.shutdown()
         # 退出时先停看护循环并清理仍在跑的 Agent 进程树，再释放连接（P2-15 §2.5）

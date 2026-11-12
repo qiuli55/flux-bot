@@ -21,6 +21,7 @@ from flux.api.v1 import (
     agents,
     bots,
     capabilities,
+    channels_dingtalk,
     channels_feishu,
     codex_account,
     connectors,
@@ -184,6 +185,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 正式飞书频道回调：平台服务器没有本机令牌，免 REST 鉴权；安全性由
     # verification token / Encrypt Key 签名把关（未配置时 fail-closed）。
     app.include_router(channels_feishu.router, prefix=app_settings.api_v1_prefix)
+    # 正式钉钉频道回调：同样免 REST 鉴权，安全性由签名 token / EncodingAESKey 把关
+    # （未配置时 fail-closed）；出站回复仍必须经审批卡放行。
+    app.include_router(channels_dingtalk.router, prefix=app_settings.api_v1_prefix)
     # MCP 能力面：给 agent 用的协议端点，与 REST 同进程同生命周期。
     app.include_router(mcp_router)
     # 内置 Agent 的 token 流式旁路：只给本机 DSH 子进程用。
