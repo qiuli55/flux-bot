@@ -418,13 +418,22 @@ class Role(StrEnum):
 class ModelProvider(StrEnum):
     """模型供应商（主规格 §5.3 裁决 A4）。
 
-    只服务于 Flux 侧基础设施的模型调用（T2 压缩、扫描摘要等）——
-    Agent 用什么模型是 Agent 自己的事，不经本枚举（目标架构 §1）。
+    服务于 Flux 侧基础设施的模型调用（T2 压缩、扫描摘要等）——
+    Agent 用什么模型是 Agent 自己的事，不经本枚举（目标架构 §1）；
+    Agent 要用的第三方模型仍可经密钥库通道下发。
+
+    除 OpenAI / Anthropic / DeepSeek 外，Flux Bot 还把四家中国区供应商作为
+    一等公民接入（Qwen / 智谱 GLM / Kimi / 豆包），它们与 DeepSeek 同属
+    OpenAI 兼容协议。`openai_compatible` 仍是通用逃生口，没有枚举值。
     """
 
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
     DEEPSEEK = "deepseek"
+    QWEN = "qwen"
+    ZHIPU = "zhipu"
+    KIMI = "kimi"
+    DOUBAO = "doubao"
     LOCAL = "local"
 
 

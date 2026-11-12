@@ -11,6 +11,17 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from flux.core.model_gateway.providers.official_models import (
+    DOUBAO_BASE_URL,
+    DOUBAO_DEFAULT_MODEL,
+    KIMI_BASE_URL,
+    KIMI_DEFAULT_MODEL,
+    QWEN_BASE_URL,
+    QWEN_DEFAULT_MODEL,
+    ZHIPU_BASE_URL,
+    ZHIPU_DEFAULT_MODEL,
+)
+
 # backend/flux/config.py -> backend/flux -> backend -> 仓库根
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -130,6 +141,21 @@ class Settings(BaseSettings):
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-flash"
+    # 中国区供应商（2026-11-12 核验）：默认端点与模型 id 的唯一来源是
+    # flux.core.model_gateway.providers.official_models，这里只做同名配置项。
+    # 密钥同样只由对应 Provider 读取，绝不下发给 Agent（§14.3）。
+    qwen_api_key: str | None = None
+    qwen_base_url: str = QWEN_BASE_URL
+    qwen_model: str = QWEN_DEFAULT_MODEL
+    zhipu_api_key: str | None = None
+    zhipu_base_url: str = ZHIPU_BASE_URL
+    zhipu_model: str = ZHIPU_DEFAULT_MODEL
+    kimi_api_key: str | None = None
+    kimi_base_url: str = KIMI_BASE_URL
+    kimi_model: str = KIMI_DEFAULT_MODEL
+    doubao_api_key: str | None = None
+    doubao_base_url: str = DOUBAO_BASE_URL
+    doubao_model: str = DOUBAO_DEFAULT_MODEL
     local_model_base_url: str | None = None
     local_model_name: str = "local-echo"
     # Anthropic 的 max_tokens 是必填字段（做不到 OpenAI / DeepSeek 那样"不传=不限"），
@@ -318,6 +344,10 @@ class Settings(BaseSettings):
     bot_scheduler_enabled: bool = True
     # 轮询间隔（秒）：cron 的最小粒度是分钟，30 秒足够且不会压垮 SQLite。
     bot_scheduler_interval_seconds: float = 30.0
+    # 外部例程触发（Webhook）的 HMAC 密钥。留空 = fail-closed，拒绝所有入站请求。
+    # 通用入口校验 X-Flux-Signature；GitHub 入口校验 X-Hub-Signature-256。
+    routine_webhook_secret: str | None = None
+    github_webhook_secret: str | None = None
 
     # --- 助理知识库（RAG / wiki）---
     # 给助理建一份覆盖「全部对话 + docs + 项目记忆」的检索层（见 flux.core.knowledge）。
@@ -361,6 +391,21 @@ class Settings(BaseSettings):
     supervisor_feishu_api_base: str = "https://open.feishu.cn"
     # 回调事件在 Supervisor 里的来源标识，同时也是订阅/通道的键。
     supervisor_feishu_source_key: str = "feishu"
+
+    # --- Bot 频道 · 飞书（正式入站 + 受审批出站）---
+    # 与 Supervisor 的飞书接入相互独立：这里把飞书文本消息变成 Bot 对话轮次，
+    # 回复必须经审批卡「允许」后才发送。未配置 verification token / bot id 时
+    # 消息事件 fail-closed。
+    feishu_app_id: str | None = None
+    feishu_app_secret: str | None = None
+    # 事件订阅的 verification token；留空 = 拒绝一切回调。
+    feishu_verification_token: str | None = None
+    # 加密回调的 Encrypt Key；配置后回调必须带合法签名，密文用 AES-256-CBC 解密。
+    feishu_encrypt_key: str | None = None
+    # 飞书开放平台 API 基址（私有化部署可改）。
+    feishu_api_base: str = "https://open.feishu.cn"
+    # 这条飞书频道归属的 Flux Bot UUID；消息事件必须能定位到 Bot 才处理。
+    feishu_bot_id: str | None = None
 
     # --- Supervisor · 微信接入（OpenClaw + 微信 ClawBot 仅作传输层）---
     # 微信消息由本机 OpenClaw 网关转给 Flux，Flux 当大脑。入站令牌：插件每次转发

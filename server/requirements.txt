@@ -25,6 +25,8 @@ tzdata>=2024.1
 # 上下文原文库的存储层压缩（FLUX_CONTEXT_MECHANISM §3.5），完全无损。
 # 缺失时 flux.core.context.store 自动退到标准库 lzma（同样无损），故不是硬依赖。
 zstandard>=0.23
+# 飞书加密回调的 AES-256-CBC 解密；标准库没有 AES，故引入维护良好的 cryptography。
+cryptography==50.0.2
 
 # --- 测试与开发 ---
 pytest==9.1.1

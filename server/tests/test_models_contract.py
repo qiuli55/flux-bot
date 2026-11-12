@@ -136,6 +136,10 @@ SPEC_TABLES = {
     # Bot 对话轮次（迁移 e4f1a2b3c4d5）：一轮用户消息 → 助手回复的持久化状态，
     # 同时承担 client_turn_id 幂等与重启后的 interrupted 恢复。
     "bot_turns",
+    # 跨 Bot 共享的用户记忆（迁移 c7e2a9b4d6f1）：画像键值 + 去重共享日志。
+    # 与 bot_memories（每 Bot 记忆）和 memories（三层记忆）分开存储。
+    "user_profile_entries",
+    "user_journal_entries",
     # 手机设备配对（迁移 f9d2e4a7b1c8）：devices 存长期设备令牌哈希，
     # pairing_codes 存一次性配对码哈希；两者都不落明文。
     "devices",

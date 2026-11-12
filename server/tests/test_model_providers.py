@@ -520,22 +520,30 @@ async def test_unconfigured_anthropic_reports_not_configured() -> None:
 # --- registry ---
 
 
-def test_registry_registers_all_four_providers() -> None:
+def test_registry_registers_all_providers() -> None:
     providers = build_providers(Settings())
     assert set(providers) == {
         ModelProvider.LOCAL,
         ModelProvider.OPENAI,
         ModelProvider.ANTHROPIC,
         ModelProvider.DEEPSEEK,
+        ModelProvider.QWEN,
+        ModelProvider.ZHIPU,
+        ModelProvider.KIMI,
+        ModelProvider.DOUBAO,
     }
 
 
 def test_registry_without_keys_does_not_expose_http_providers() -> None:
-    """没有密钥时四家供应商都不可用，只剩离线回显的 LOCAL。"""
+    """没有密钥时所有 HTTP 供应商都不可用，只剩离线回显的 LOCAL。"""
     settings = Settings(
         openai_api_key=None,
         anthropic_api_key=None,
         deepseek_api_key=None,
+        qwen_api_key=None,
+        zhipu_api_key=None,
+        kimi_api_key=None,
+        doubao_api_key=None,
     )
     router = ModelRouter(build_providers(settings))
     assert router.available() == [ModelProvider.LOCAL]
