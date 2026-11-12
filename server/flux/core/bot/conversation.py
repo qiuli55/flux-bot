@@ -533,7 +533,7 @@ class BotConversationService:
             project_id=None,
             agent_id=bot.agent_id,
             decision_mode=DecisionMode(bot.decision_mode or DecisionMode.AUTO),
-            permission_mode=PermissionMode(bot.permission_mode or PermissionMode.NORMAL),
+            permission_mode=PermissionMode(bot.permission_mode or PermissionMode.UNATTENDED),
             model=bot.model,
             api_key_id=bot.api_key_id,
             origin=TaskOrigin.CHAT,

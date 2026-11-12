@@ -84,11 +84,11 @@ def _create(client: TestClient, **overrides: object) -> dict:
 
 
 def test_create_bot_defaults(client: TestClient) -> None:
-    """默认：active、需人工审核、无定时、工作目录按 <dsh_home>/bots/<id>/workspace 派生。"""
+    """默认：active、免审核、无定时、工作目录按 <dsh_home>/bots/<id>/workspace 派生。"""
     bot = _create(client)
     assert set(bot) == _BOT_KEYS
     assert bot["status"] == "active"
-    assert bot["permission_mode"] == "normal"
+    assert bot["permission_mode"] == "unattended"
     assert bot["decision_mode"] == "auto"
     assert bot["schedule"] is None
     assert bot["next_run_at"] is None

@@ -154,7 +154,7 @@ def test_group_crud_keeps_member_order(client: TestClient) -> None:
     assert group["member_count"] == 2
     assert set(group["members"][0]) == _MEMBER_KEYS
     assert group["members"][0]["role"] == "member"
-    assert group["members"][0]["permission_mode"] == "normal"
+    assert group["members"][0]["permission_mode"] == "unattended"
     assert [m["bot_id"] for m in group["members"]] == [first["id"], second["id"]]
     assert group["members"][0]["name"] == "统计"
     assert group["members"][0]["avatar_shape"] == "hexagon"

@@ -104,8 +104,8 @@ class BotCreateRequest(BaseModel):
     agent_id: str | None = None
     model: str | None = Field(default=None, max_length=128)
     key_id: str | None = Field(default=None, max_length=64)
-    #: 默认需要人工审核高风险操作；无人值守时显式改成 unattended / full
-    permission_mode: PermissionMode = PermissionMode.NORMAL
+    #: 无人值守是 Bot 的常态；需要人工把关时显式改成 normal / plan / full
+    permission_mode: PermissionMode = PermissionMode.UNATTENDED
     decision_mode: DecisionMode = DecisionMode.AUTO
     #: 独立工作目录（绝对路径）；留空 = <dsh_home>/bots/<id>/workspace
     workspace: str | None = Field(default=None, max_length=512)
