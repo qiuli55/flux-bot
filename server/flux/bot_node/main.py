@@ -34,6 +34,7 @@ from flux.api.v1 import (
     models,
     tasks,
     uploads,
+    user_memory,
 )
 from flux.config import Settings, get_settings
 from flux.container import Container
@@ -61,6 +62,7 @@ _BOT_ROUTERS = (
     dsh,
     capabilities,
     uploads,
+    user_memory,
     codex_account,
 )
 

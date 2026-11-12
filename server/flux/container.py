@@ -68,6 +68,8 @@ from flux.core.memory.bot_memory_service import BotMemoryService
 from flux.core.memory.prefs import MemoryPrefsStore
 from flux.core.memory.repository import MemoryRepository
 from flux.core.memory.service import MemoryService
+from flux.core.memory.shared_user import SharedUserMemoryService
+from flux.core.memory.shared_user_repository import SharedUserMemoryRepository
 from flux.core.model_gateway.providers.registry import build_providers
 from flux.core.model_gateway.router import ModelRouter
 from flux.core.permission_engine.policy import PermissionPolicy
@@ -162,6 +164,9 @@ class Container:
     #: Bot 自己的长期记忆（第一人称）：摘要层合并覆盖 + 全文 chunk 层只追加
     bot_memory_repo: BotMemoryRepository = field(init=False)
     bot_memories: BotMemoryService = field(init=False)
+    #: 跨 Bot 共享的用户记忆：画像（只由用户侧 API 写）+ 去重日志（只追加）
+    shared_user_memory_repo: SharedUserMemoryRepository = field(init=False)
+    shared_user_memory: SharedUserMemoryService = field(init=False)
     proposal_repo: ProposalRepository = field(init=False)
     batch_repo: ApplyBatchRepository = field(init=False)
     dsh: FluxDshClient = field(init=False)
@@ -278,6 +283,11 @@ class Container:
             self.bot_memory_repo,
             summarizer=self.conversation_summarizer,
         )
+        # 共享用户记忆：与 Bot 记忆并存，只作为所有 Bot 都能看到的账号级背景
+        self.shared_user_memory_repo = SharedUserMemoryRepository(
+            self.session_factory  # type: ignore[attr-defined]
+        )
+        self.shared_user_memory = SharedUserMemoryService(self.shared_user_memory_repo)
         self.groups = GroupOrchestrator(
             self.group_repo,
             self.task_repo,
