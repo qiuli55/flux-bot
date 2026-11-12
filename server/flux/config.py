@@ -434,6 +434,10 @@ class Settings(BaseSettings):
     github_oauth_base: str = "https://github.com"
     github_timeout_seconds: float = 20.0
 
+    # --- 外部连接器（日历）---
+    # CalDAV / ICS 单次请求的默认超时；安装时可用 settings.timeout 覆盖（1–60 秒）。
+    calendar_timeout_seconds: float = 15.0
+
     # --- Bot 桌面（Hermes 云电脑 noVNC）---
     # App 进入「Bot 桌面」时向服务端要入口参数。隧道地址会随隧道重启变化，所以放在
     # 公开的 desktop.json 里由服务端代读；token / bridge_key 属于凭据，只从环境变量下发，

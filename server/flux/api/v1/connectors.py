@@ -88,6 +88,7 @@ async def install_connector(
         auth_type=payload.auth_type,
         api_key=payload.api_key,
         scopes=payload.scopes,
+        settings=payload.settings,
     )
     return ok(state)
 

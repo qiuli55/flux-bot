@@ -20,6 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from flux.config import Settings
+from flux.core.connectors.calendar import CalendarConnectorService
 from flux.core.github.service import GitHubConnectorService
 from flux.core.key_vault.service import KeyVaultService
 from flux.errors import BadRequestError, ConflictError, NotFoundError
@@ -97,9 +98,10 @@ class ConnectorCatalog:
 
 
 def build_default_catalog(settings: Settings) -> ConnectorCatalog:
-    """生产目录：当前只上架 GitHub（OAuth 设备码）。
+    """生产目录：GitHub（OAuth 设备码）+ Calendar（CalDAV / ICS，api_key）。
 
-    scope 取自 `settings.github_scopes`，与 GitHub 登录流程实际请求的范围一致。
+    GitHub 的 scope 取自 `settings.github_scopes`，与设备码登录流程实际请求的范围一致。
+    Calendar 的 api_key 指 CalDAV 密码或 ICS 订阅密码；公开 ICS 订阅可以留空。
     """
     catalog = ConnectorCatalog()
     catalog.register(
@@ -109,6 +111,15 @@ def build_default_catalog(settings: Settings) -> ConnectorCatalog:
             description=GitHubConnectorService.description,
             auth_types=(AUTH_OAUTH,),
             scopes=tuple(part for part in settings.github_scopes.split() if part),
+        )
+    )
+    catalog.register(
+        ConnectorDefinition(
+            id=CalendarConnectorService.connector_id,
+            name=CalendarConnectorService.connector_name,
+            description=CalendarConnectorService.description,
+            auth_types=(AUTH_API_KEY,),
+            scopes=("calendar.read", "calendar.write"),
         )
     )
     return catalog
@@ -124,11 +135,13 @@ class ConnectorFrameworkService:
         catalog: ConnectorCatalog,
         *,
         github: GitHubConnectorService | None = None,
+        calendar: CalendarConnectorService | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._key_vault = key_vault
         self._catalog = catalog
         self._github = github
+        self._calendar = calendar
 
     # --- 目录 ---
 
@@ -160,6 +173,9 @@ class ConnectorFrameworkService:
         if self._is_github(connector_id):
             assert self._github is not None
             return await self._github.public_state(account_key)
+        if self._is_calendar(connector_id):
+            assert self._calendar is not None
+            return await self._calendar.public_state(account_key)
 
         row = await self.installation(account_key, connector_id)
         if row is not None:
@@ -190,6 +206,7 @@ class ConnectorFrameworkService:
         auth_type: str | None = None,
         api_key: str | None = None,
         scopes: list[str] | None = None,
+        settings: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         definition = self._catalog.get(connector_id)
         requested = (auth_type or "").strip()
@@ -216,6 +233,18 @@ class ConnectorFrameworkService:
                     "auth_type": AUTH_OAUTH,
                     "login_path": f"/api/v1/connectors/{connector_id}/login/start",
                 },
+            )
+
+        # 日历连接器把 mode / url / username / password 打包进同一份加密凭据；
+        # ICS 订阅允许空密码，因此不能走下面 api_key 必填的通用分支。
+        if self._is_calendar(connector_id):
+            assert self._calendar is not None
+            scope_value = self._normalize_scopes(definition, scopes)
+            return await self._calendar.install(
+                account_key,
+                api_key=api_key,
+                settings=settings,
+                scopes=scope_value,
             )
 
         secret = (api_key or "").strip()
@@ -292,6 +321,9 @@ class ConnectorFrameworkService:
 
     def _is_github(self, connector_id: str) -> bool:
         return self._github is not None and connector_id == self._github.connector_id
+
+    def _is_calendar(self, connector_id: str) -> bool:
+        return self._calendar is not None and connector_id == self._calendar.connector_id
 
     @staticmethod
     def _normalize_scopes(definition: ConnectorDefinition, scopes: list[str] | None) -> str:
