@@ -490,7 +490,9 @@ def test_routine_event_trigger_launches_through_event_bus(
             assert routine.event_triggers == ["webhook.deploy"]
         finally:
             await container.bots.stop()
-            await container.engine.dispose()
+            # 与应用 lifespan 一致：先停调度，再关闭对话/频道/连接池，避免残留协程
+            # 在 asyncio.run 收尾时卡在 aiosqlite 终止路径上。
+            await container.dispose()
 
     asyncio.run(_scenario())
 
@@ -519,7 +521,9 @@ def test_bot_level_event_trigger_still_works_alongside_routines(
             assert "Bot 级作业" in task.description
         finally:
             await container.bots.stop()
-            await container.engine.dispose()
+            # 与应用 lifespan 一致：先停调度，再关闭对话/频道/连接池，避免残留协程
+            # 在 asyncio.run 收尾时卡在 aiosqlite 终止路径上。
+            await container.dispose()
 
     asyncio.run(_scenario())
 
@@ -552,7 +556,9 @@ def test_disabled_routine_and_paused_bot_are_skipped(settings: Settings, db_sche
             assert (await container.bots.get(paused_bot.id)).last_task_id is None
         finally:
             await container.bots.stop()
-            await container.engine.dispose()
+            # 与应用 lifespan 一致：先停调度，再关闭对话/频道/连接池，避免残留协程
+            # 在 asyncio.run 收尾时卡在 aiosqlite 终止路径上。
+            await container.dispose()
 
     asyncio.run(_scenario())
 
@@ -587,7 +593,9 @@ def test_event_cooldown_and_busy_lock_skip(settings: Settings, db_schema: None) 
             assert (await container.bots.get(bot.id)).last_task_id == manual.id
         finally:
             await container.bots.stop()
-            await container.engine.dispose()
+            # 与应用 lifespan 一致：先停调度，再关闭对话/频道/连接池，避免残留协程
+            # 在 asyncio.run 收尾时卡在 aiosqlite 终止路径上。
+            await container.dispose()
 
     asyncio.run(_scenario())
 
@@ -629,7 +637,9 @@ def test_targeted_routine_launches_without_subscription(
             assert "定向执行" in task.description
         finally:
             await container.bots.stop()
-            await container.engine.dispose()
+            # 与应用 lifespan 一致：先停调度，再关闭对话/频道/连接池，避免残留协程
+            # 在 asyncio.run 收尾时卡在 aiosqlite 终止路径上。
+            await container.dispose()
 
     asyncio.run(_scenario())
 
@@ -668,7 +678,9 @@ def test_generic_webhook_service_publishes_to_subscribers(
             assert "from service" in task.description
         finally:
             await container.bots.stop()
-            await container.engine.dispose()
+            # 与应用 lifespan 一致：先停调度，再关闭对话/频道/连接池，避免残留协程
+            # 在 asyncio.run 收尾时卡在 aiosqlite 终止路径上。
+            await container.dispose()
 
     asyncio.run(_scenario())
 
@@ -707,6 +719,34 @@ def test_github_webhook_service_publishes_and_summarizes(
             assert "refs/heads/main" in task.description
         finally:
             await container.bots.stop()
-            await container.engine.dispose()
+            # 与应用 lifespan 一致：先停调度，再关闭对话/频道/连接池，避免残留协程
+            # 在 asyncio.run 收尾时卡在 aiosqlite 终止路径上。
+            await container.dispose()
+
+    asyncio.run(_scenario())
+
+
+def test_bot_stop_awaits_in_flight_event_jobs(settings: Settings, db_schema: None) -> None:
+    """stop() 必须等已取消的事件派发协程退出，否则 dispose / asyncio.run 会挂死。"""
+
+    async def _scenario() -> None:
+        container = Container(settings)
+        await container.bots.create(name="inflight bot", event_triggers=["webhook.received"])
+        started = asyncio.Event()
+
+        async def _blocked(_event: str, _payload: dict) -> None:
+            started.set()
+            await asyncio.sleep(3600)
+
+        container.bots._dispatch_event = _blocked  # type: ignore[method-assign]
+        await container.bots.start()
+        try:
+            await container.bus.publish("webhook.received", {"summary": "block"})
+            await asyncio.wait_for(started.wait(), timeout=2)
+            await asyncio.wait_for(container.bots.stop(), timeout=2)
+            assert all(job.done() for job in list(container.bots._event_jobs))
+        finally:
+            await container.bots.stop()
+            await container.dispose()
 
     asyncio.run(_scenario())

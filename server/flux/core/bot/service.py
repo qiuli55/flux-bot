@@ -781,9 +781,16 @@ class BotService:
 
     async def stop(self) -> None:
         self._container.bus.unsubscribe(WILDCARD, self.handle_event)
-        for job in list(self._event_jobs):
-            job.cancel()
+        # 必须等事件派发协程退出：它们可能正在写库。只 cancel 不等待的话，
+        # 随后的 engine.dispose() 会在 aiosqlite 回调里卡住，
+        # asyncio.run 收尾阶段的 gather 会无限等待（CI 上曾因此 120s 超时）。
+        jobs = list(self._event_jobs)
         self._event_jobs.clear()
+        for job in jobs:
+            job.cancel()
+        if jobs:
+            # return_exceptions：单个派发失败不能挡住其余协程收尾，也不能让 stop() 本身失败
+            await asyncio.gather(*jobs, return_exceptions=True)
         task, self._task = self._task, None
         if task is None:
             return
