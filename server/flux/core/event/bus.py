@@ -69,6 +69,17 @@ class Events:
     #: 重复导入判定为 unchanged / keep 时不发事件（没有发生变化就不该有"已变更"信号）。
     CAPABILITY_IMPORTED = "capability.imported"
     CAPABILITY_REPLACED = "capability.replaced"
+    #: 通用外部 Webhook 的统一事件名；`webhook.<slug>` 由受控前缀族动态放行，
+    #: 与 Bot / 例程的 event_triggers 直接对上。
+    WEBHOOK_RECEIVED = "webhook.received"
+    #: GitHub Webhook 映射到的事件族；其余官方 X-GitHub-Event 按 `github.<event>`
+    #: 动态放行（仅限小写字母、数字与下划线）。
+    GITHUB_PUSH = "github.push"
+    GITHUB_PULL_REQUEST = "github.pull_request"
+    GITHUB_ISSUES = "github.issues"
+    GITHUB_ISSUE_COMMENT = "github.issue_comment"
+    GITHUB_RELEASE = "github.release"
+    GITHUB_WORKFLOW_RUN = "github.workflow_run"
 
 
 class EventBus:

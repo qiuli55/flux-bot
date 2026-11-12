@@ -29,6 +29,7 @@ from flux.core.bot.conversation import attachments_brief, record_attachments
 from flux.core.event.bus import Events
 from flux.core.github.service import ACCOUNT_HEADER, normalize_account_key
 from flux.core.group.avatar import normalize_avatar
+from flux.core.task_engine.approvals import APPROVAL_ALLOW
 from flux.core.task_engine.assistant import validate_confirmation_items
 from flux.core.task_engine.context_usage import (
     CONTEXT_MESSAGE_KINDS,
@@ -955,6 +956,19 @@ async def choose_decision(
             ],
         )
     )[0]
+    # 审批结果事件：出站类审批（如飞书草稿）只在 chosen == 允许 时动作。
+    # 这里不直接依赖任何具体频道的实现，由订阅方按 kind 自行过滤。
+    await container.bus.publish(
+        Events.APPROVAL_RESOLVED,
+        {
+            "task_id": str(task_uuid),
+            "decision_id": payload.decision_id,
+            "result": "allowed" if record.get("chosen") == APPROVAL_ALLOW else "denied",
+            "chosen": record.get("chosen"),
+            "kind": pending.get("kind"),
+            "meta": pending.get("meta") or {},
+        },
+    )
     return ok({"task": _task_dict(task), "decision": record, "message": message.to_dict()})
 
 

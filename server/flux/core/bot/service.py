@@ -23,7 +23,12 @@ from flux.core.bot.cron import CronSchedule, parse_cron
 from flux.core.bot.notification_repository import BotNotificationRepository
 from flux.core.bot.repository import BotRepository
 from flux.core.bot.routine_repository import BotRoutineRepository
-from flux.core.event.bus import WILDCARD, Events
+from flux.core.bot.webhook_triggers import (
+    TARGET_BOT_KEY,
+    TARGET_ROUTINE_KEY,
+    is_known_event,
+)
+from flux.core.event.bus import WILDCARD
 from flux.core.group.avatar import normalize_color, normalize_shape
 from flux.core.mcp.tools import ALL_TOOLS, FORBIDDEN_TOOL_NAMES, TOOLS
 from flux.core.virtual_workspace.path_guard import within_root
@@ -66,10 +71,9 @@ _DEFAULT_MISSED_RUN_POLICY = "skip"
 #: 改系统时间后一次性触发大量带副作用的 Run。补跑是逐轮进行的，3 个槽位已够覆盖
 #: 一次短时重启，再往上收益很小、风险却放大。
 _MAX_CATCH_UP_SLOTS = 3
-#: 可配置的事件名（Events 里的字符串常量）
-_KNOWN_EVENTS = frozenset(
-    value for value in vars(Events).values() if isinstance(value, str) and value != WILDCARD
-)
+#: 可配置的事件名：Events 常量与受控前缀族（webhook.* / github.*），
+#: 校验入口统一收敛到 flux.core.bot.webhook_triggers.is_known_event。
+#: 未声明的事件名（如 "bogus"）仍按 400 拒绝。
 
 
 def _utcnow() -> datetime:
@@ -344,20 +348,24 @@ class BotService:
         instruction: str = "",
         schedule: str | None = None,
         enabled: bool = True,
+        event_triggers: list[str] | None = None,
     ) -> BotRoutine:
         bot = await self._repo.get(bot_id)
         cleaned = (name or "").strip()
         if not cleaned:
             raise BadRequestError("例程名称不能为空")
         cron = self._cron(schedule, tz=self._zone_for(bot))
-        return await self._routines.create(
+        routine = await self._routines.create(
             bot_id=bot_id,
             name=cleaned[:64],
             instruction=(instruction or "").strip()[:8000],
             schedule=cron.expression if cron else None,
             next_run_at=cron.next_after(_utcnow()) if cron and enabled else None,
             enabled=enabled,
+            event_triggers=self._event_list(event_triggers),
         )
+        await self._refresh_triggers()
+        return routine
 
     async def update_routine(
         self, bot_id: uuid.UUID, routine_id: uuid.UUID, changes: dict[str, Any]
@@ -383,6 +391,8 @@ class BotService:
             )
         if "enabled" in changes:
             values["enabled"] = bool(changes["enabled"])
+        if "event_triggers" in changes:
+            values["event_triggers"] = self._event_list(changes["event_triggers"])
 
         if "schedule" in values or "enabled" in values:
             enabled = bool(values.get("enabled", routine.enabled))
@@ -391,7 +401,10 @@ class BotService:
             values["next_run_at"] = cron.next_after(_utcnow()) if cron and enabled else None
         if not values:
             return routine
-        return await self._routines.update(routine_id, values)
+        updated = await self._routines.update(routine_id, values)
+        if "event_triggers" in values or "enabled" in values:
+            await self._refresh_triggers()
+        return updated
 
     async def _reschedule_routines(self, bot: Bot) -> None:
         """Bot 时区变更后，启用中的例程从当前时刻按新时区重新计时。"""
@@ -412,6 +425,11 @@ class BotService:
                 f"例程 {routine_id} 不属于 Bot {bot_id}", details={"routine_id": str(routine_id)}
             )
         await self._routines.delete(routine_id)
+        await self._refresh_triggers()
+
+    async def get_routine(self, routine_id: uuid.UUID) -> BotRoutine:
+        """按 id 取例程（Webhook 定向触发需要先确认例程归属）。"""
+        return await self._routines.get(routine_id)
 
     # --- 通知 ---
 
@@ -442,28 +460,44 @@ class BotService:
     # --- 事件触发 ---
 
     async def handle_event(self, event: str, payload: dict[str, Any]) -> None:
-        """事件总线订阅入口：只做轻量筛选，真正的开工放到后台协程。"""
-        if event not in self._trigger_events:
+        """事件总线订阅入口：只做轻量筛选，真正的开工放到后台协程。
+
+        定向触发（Webhook 显式给了 bot_id / routine_id）不受订阅集合限制：
+        即使目标没有把事件写进 event_triggers，也必须交给后台按定向语义处理。
+        """
+        targeted = TARGET_BOT_KEY in payload or TARGET_ROUTINE_KEY in payload
+        if event not in self._trigger_events and not targeted:
             return
         job = asyncio.create_task(self._dispatch_event(event, payload), name="flux-bot-event")
         self._event_jobs.add(job)
         job.add_done_callback(self._event_jobs.discard)
 
     async def _dispatch_event(self, event: str, payload: dict[str, Any]) -> None:
+        """一次事件的完整派发：Bot 级订阅 + 启用例程订阅（以及显式定向）。"""
         moment = _utcnow()
         source_bot = str(payload.get("bot_id") or "")
         summary = self._event_summary(event, payload)
-        for bot in await self._repo.list(status=BotStatus.ACTIVE.value, limit=200):
-            if event not in (bot.event_triggers or []):
-                continue
-            # 自己触发的任务事件不再触发自己：否则一轮完成会立刻引发下一轮
-            if source_bot and source_bot == str(bot.id):
-                continue
-            last = self._event_last.get(bot.id)
-            if last is not None and (moment - last).total_seconds() < _EVENT_COOLDOWN_SECONDS:
-                continue
-            if await self._budget_block(bot, now=moment) is not None:
-                logger.info("Bot %s 今日 token 已用完，跳过事件 %s", bot.id, event)
+        target_bot = self._payload_uuid(payload.get(TARGET_BOT_KEY))
+        target_routine = self._payload_uuid(payload.get(TARGET_ROUTINE_KEY))
+
+        if target_routine is not None:
+            await self._dispatch_targeted_routine(
+                event, target_routine, target_bot, summary, moment
+            )
+            return
+
+        active_bots = await self._repo.list(status=BotStatus.ACTIVE.value, limit=200)
+        for bot in active_bots:
+            if target_bot is not None:
+                if bot.id != target_bot:
+                    continue
+            else:
+                if event not in (bot.event_triggers or []):
+                    continue
+                # 自己触发的任务事件不再触发自己：否则一轮完成会立刻引发下一轮
+                if source_bot and source_bot == str(bot.id):
+                    continue
+            if not await self._event_launch_allowed(bot, event, moment):
                 continue
             description = (bot.description or "").strip()
             instruction = f"[事件触发] {event}：{summary}"
@@ -478,15 +512,129 @@ class BotService:
             except Exception as exc:  # noqa: BLE001 - 单个 Bot 失败不影响其他 Bot
                 logger.warning("Bot %s 事件触发开工失败：%s", bot.id, exc)
 
+        # 显式定向到某个 Bot 时只跑 Bot 级触发，不再扩散到它的例程。
+        if target_bot is not None:
+            return
+        await self._dispatch_routines(event, payload, source_bot, summary, moment, active_bots)
+
+    async def _dispatch_routines(
+        self,
+        event: str,
+        payload: dict[str, Any],
+        source_bot: str,
+        summary: str,
+        moment: datetime,
+        active_bots: list[Bot],
+    ) -> None:
+        """把事件派发给订阅它的启用例程；同一 Bot 一次事件最多起一轮。"""
+        candidates: dict[uuid.UUID, list[BotRoutine]] = {}
+        for routine in await self._routines.list_enabled(limit=500):
+            if event in (routine.event_triggers or []):
+                candidates.setdefault(routine.bot_id, []).append(routine)
+        if not candidates:
+            return
+        active_by_id = {bot.id: bot for bot in active_bots}
+        for bot_id, routines in candidates.items():
+            bot = active_by_id.get(bot_id)
+            if bot is None:
+                continue
+            if source_bot and source_bot == str(bot.id):
+                continue
+            if not await self._event_launch_allowed(bot, event, moment):
+                continue
+            routine = routines[0]
+            instruction = self._routine_event_instruction(routine, event, summary)
+            try:
+                task = await self._launch_if_idle(
+                    bot, instruction=instruction, now=moment, routine=routine
+                )
+                if task is None:
+                    continue
+                self._event_last[bot.id] = moment
+                await self._routines.update(routine.id, {"last_run_at": moment})
+                logger.info("例程 %s 被事件 %s 触发开工", routine.id, event)
+            except Exception as exc:  # noqa: BLE001 - 单个例程失败不影响其他例程
+                logger.warning("例程 %s 事件触发开工失败：%s", routine.id, exc)
+
+    async def _dispatch_targeted_routine(
+        self,
+        event: str,
+        routine_id: uuid.UUID,
+        bot_id: uuid.UUID | None,
+        summary: str,
+        moment: datetime,
+    ) -> None:
+        """显式定向一个例程：只要求例程启用、Bot 未暂停，不要求它订阅该事件。"""
+        try:
+            routine = await self._routines.get(routine_id)
+        except NotFoundError:
+            logger.warning("事件 %s 指向的例程 %s 不存在", event, routine_id)
+            return
+        if bot_id is not None and routine.bot_id != bot_id:
+            logger.warning("事件 %s 的例程 %s 不属于 Bot %s", event, routine_id, bot_id)
+            return
+        if not routine.enabled:
+            logger.info("例程 %s 已停用，跳过定向事件 %s", routine_id, event)
+            return
+        try:
+            bot = await self._repo.get(routine.bot_id)
+        except NotFoundError:
+            logger.warning("例程 %s 的 Bot %s 不存在", routine_id, routine.bot_id)
+            return
+        if bot.status != BotStatus.ACTIVE.value:
+            logger.info("Bot %s 已暂停，跳过定向例程 %s", bot.id, routine_id)
+            return
+        if not await self._event_launch_allowed(bot, event, moment):
+            return
+        instruction = self._routine_event_instruction(routine, event, summary)
+        try:
+            task = await self._launch_if_idle(
+                bot, instruction=instruction, now=moment, routine=routine
+            )
+            if task is None:
+                return
+            self._event_last[bot.id] = moment
+            await self._routines.update(routine.id, {"last_run_at": moment})
+            logger.info("例程 %s 被定向事件 %s 触发开工", routine.id, event)
+        except Exception as exc:  # noqa: BLE001 - 定向失败只记日志
+            logger.warning("例程 %s 定向事件触发开工失败：%s", routine.id, exc)
+
+    async def _event_launch_allowed(self, bot: Bot, event: str, moment: datetime) -> bool:
+        """事件触发的共同闸门：冷却 + 每日 token 预算。"""
+        last = self._event_last.get(bot.id)
+        if last is not None and (moment - last).total_seconds() < _EVENT_COOLDOWN_SECONDS:
+            return False
+        if await self._budget_block(bot, now=moment) is not None:
+            logger.info("Bot %s 今日 token 已用完，跳过事件 %s", bot.id, event)
+            return False
+        return True
+
+    def _routine_event_instruction(self, routine: BotRoutine, event: str, summary: str) -> str:
+        instruction = f"[事件触发] {event}：{summary}"
+        body = (routine.instruction or "").strip()
+        if body:
+            instruction = f"{instruction}\n\n{body}"
+        return instruction
+
+    def _payload_uuid(self, value: Any) -> uuid.UUID | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            return uuid.UUID(value.strip())
+        except ValueError:
+            return None
+
     async def _refresh_triggers(self) -> None:
         events: set[str] = set()
         for bot in await self._repo.list(limit=500):
             events.update(bot.event_triggers or [])
-        self._trigger_events = events & _KNOWN_EVENTS
+        for routine in await self._routines.list_enabled(limit=500):
+            events.update(routine.event_triggers or [])
+        self._trigger_events = {event for event in events if is_known_event(event)}
 
     def _remember_triggers(self, bot: Bot) -> None:
         self._trigger_events.update(
-            event for event in (bot.event_triggers or []) if event in _KNOWN_EVENTS
+            event for event in (bot.event_triggers or []) if is_known_event(event)
         )
 
     def _event_summary(self, event: str, payload: dict[str, Any]) -> str:
@@ -633,9 +781,16 @@ class BotService:
 
     async def stop(self) -> None:
         self._container.bus.unsubscribe(WILDCARD, self.handle_event)
-        for job in list(self._event_jobs):
-            job.cancel()
+        # 必须等事件派发协程退出：它们可能正在写库。只 cancel 不等待的话，
+        # 随后的 engine.dispose() 会在 aiosqlite 回调里卡住，
+        # asyncio.run 收尾阶段的 gather 会无限等待（CI 上曾因此 120s 超时）。
+        jobs = list(self._event_jobs)
         self._event_jobs.clear()
+        for job in jobs:
+            job.cancel()
+        if jobs:
+            # return_exceptions：单个派发失败不能挡住其余协程收尾，也不能让 stop() 本身失败
+            await asyncio.gather(*jobs, return_exceptions=True)
         task, self._task = self._task, None
         if task is None:
             return
@@ -1006,7 +1161,16 @@ class BotService:
         return result or None
 
     def _event_list(self, value: Any) -> list[str] | None:
-        return self._string_list(value, "event_triggers", allowed=set(_KNOWN_EVENTS))
+        items = self._string_list(value, "event_triggers")
+        if not items:
+            return None
+        invalid = next((item for item in items if not is_known_event(item)), None)
+        if invalid is not None:
+            raise BadRequestError(
+                f"event_triggers 含不支持的事件名：{invalid}",
+                details={"event_triggers": invalid[:64]},
+            )
+        return items
 
     def _tool_list(self, value: Any) -> list[str] | None:
         allowed = frozenset(TOOLS) - FORBIDDEN_TOOL_NAMES
