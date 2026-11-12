@@ -29,6 +29,7 @@ from flux.core.agent_runtime.trace_repository import RunTraceRepository
 from flux.core.billing.service import BillingService
 from flux.core.bot.conversation import BotConversationService
 from flux.core.bot.service import BotService
+from flux.core.bot.webhook_triggers import WebhookTriggerService
 from flux.core.capability_import.repository import ImportedCapabilityRepository
 from flux.core.capability_import.scanners import AgentScanner
 from flux.core.capability_import.service import CapabilityImportService
@@ -179,6 +180,8 @@ class Container:
     task_run_service: TaskRunService = field(init=False)
     #: Bot 模式：常驻 Bot 的生命周期编排与定时触发（对话模式不经过它）
     bots: BotService = field(init=False)
+    #: 外部例程触发：Webhook 验签 + GitHub 事件映射，验签后统一投递到事件总线
+    webhook_triggers: WebhookTriggerService = field(init=False)
     #: Bot 对话轮次：持久化 turn + 每 Bot 串行后台队列（legacy 对话也复用其助理逻辑）
     bot_conversation: BotConversationService = field(init=False)
     #: 正式飞书频道：加密回调入站建 turn，出站回复必须经审批卡放行
@@ -463,6 +466,8 @@ class Container:
             self,
             interval_seconds=self.settings.bot_scheduler_interval_seconds,  # type: ignore[attr-defined]
         )
+        # 外部 Webhook：验签后走事件总线，与进程内事件共用同一条 Bot / 例程派发链路。
+        self.webhook_triggers = WebhookTriggerService(self)
         # Bot 对话：一轮落一条 bot_turns，后台按 Bot 串行调用同一个助手逻辑。
         self.bot_conversation = BotConversationService(self)
         # 正式飞书频道：入站回调建 turn；出站草稿走审批卡，用户点「允许」后才发送。

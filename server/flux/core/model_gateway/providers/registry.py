@@ -1,8 +1,10 @@
 """Provider 装配。
 
-四家供应商（LOCAL / OPENAI / ANTHROPIC / DEEPSEEK）只服务 Flux 侧基础设施的模型
-调用（T2 压缩、扫描摘要等）——Agent 用什么模型是 Agent 自己的事，不经本注册表，
-Flux 也不允许为任何 agent 形态新增 provider（目标架构 §1 / §3.5）。
+供应商只服务 Flux 侧基础设施的模型调用（T2 压缩、扫描摘要等）与密钥库通道——
+Agent 用什么模型是 Agent 自己的事，不经本注册表（目标架构 §1）；Agent 要用的
+第三方模型仍可经密钥库通道下发。除 LOCAL / OPENAI / ANTHROPIC 外，Flux Bot 还把
+DeepSeek 与四家中国区供应商（QWEN / ZHIPU / KIMI / DOUBAO）作为一等公民接入：
+后五家都是 OpenAI 兼容协议的薄子类，`openai_compatible` 仍作为通用逃生口。
 
 是否可用由各自的 is_configured() 决定（无密钥即不可用），ModelRouter 按此过滤，
 所以 /api/v1/health/ready 的 providers 列表会自然只显示已配置的供应商。
@@ -19,10 +21,28 @@ from flux.core.agent_runtime.runtimes.base import ModelChannel
 from flux.core.model_gateway.base import ModelProviderBase
 from flux.core.model_gateway.providers.anthropic import AnthropicProvider
 from flux.core.model_gateway.providers.deepseek import DeepSeekProvider
+from flux.core.model_gateway.providers.doubao import DoubaoProvider
 from flux.core.model_gateway.providers.echo import EchoProvider
+from flux.core.model_gateway.providers.kimi import KimiProvider
 from flux.core.model_gateway.providers.openai import OpenAIProvider
 from flux.core.model_gateway.providers.openai_compatible import OpenAICompatibleProvider
+from flux.core.model_gateway.providers.qwen import QwenProvider
+from flux.core.model_gateway.providers.zhipu import ZhipuProvider
 from flux.enums import ModelProvider
+from flux.logging import get_logger
+
+logger = get_logger(__name__)
+
+#: provider 名称 → OpenAI 兼容适配器类。密钥库通道装配与密钥连通性探测共用这张表；
+#: 新增 OpenAI 兼容供应商只需在这里加一行（anthropic 协议不同，单独分支处理）。
+OPENAI_COMPATIBLE_PROVIDERS: dict[str, type[OpenAICompatibleProvider]] = {
+    "openai": OpenAIProvider,
+    "deepseek": DeepSeekProvider,
+    "qwen": QwenProvider,
+    "zhipu": ZhipuProvider,
+    "kimi": KimiProvider,
+    "doubao": DoubaoProvider,
+}
 
 
 class _OpenAICompatibleChannel(OpenAICompatibleProvider):
@@ -54,16 +74,9 @@ def build_channel_provider(
             timeout=timeout,
             max_retries=max_retries,
         )
-    if channel.provider == "openai":
-        return OpenAIProvider(
-            model,
-            api_key=channel.api_key,
-            base_url=channel.base_url,
-            timeout=timeout,
-            max_retries=max_retries,
-        )
-    if channel.provider == "deepseek":
-        return DeepSeekProvider(
+    provider_cls = OPENAI_COMPATIBLE_PROVIDERS.get(channel.provider)
+    if provider_cls is not None:
+        return provider_cls(
             model,
             api_key=channel.api_key,
             base_url=channel.base_url,
@@ -80,8 +93,8 @@ def build_channel_provider(
 
 
 def build_providers(settings: Settings) -> dict[ModelProvider, ModelProviderBase]:
-    """装配四个供应商。密钥由各适配器自行持有，绝不下发给 Agent（主规格 §14.3）。"""
-    return {
+    """装配全部供应商。密钥由各适配器自行持有，绝不下发给 Agent（主规格 §14.3）。"""
+    providers: dict[ModelProvider, ModelProviderBase] = {
         ModelProvider.LOCAL: EchoProvider(model_name=settings.local_model_name),
         ModelProvider.OPENAI: OpenAIProvider(
             model_name=settings.openai_model,
@@ -106,4 +119,37 @@ def build_providers(settings: Settings) -> dict[ModelProvider, ModelProviderBase
             timeout=settings.model_timeout_seconds,
             max_retries=settings.model_max_retries,
         ),
+        ModelProvider.QWEN: QwenProvider(
+            model_name=settings.qwen_model,
+            api_key=settings.qwen_api_key,
+            base_url=settings.qwen_base_url,
+            timeout=settings.model_timeout_seconds,
+            max_retries=settings.model_max_retries,
+        ),
+        ModelProvider.ZHIPU: ZhipuProvider(
+            model_name=settings.zhipu_model,
+            api_key=settings.zhipu_api_key,
+            base_url=settings.zhipu_base_url,
+            timeout=settings.model_timeout_seconds,
+            max_retries=settings.model_max_retries,
+        ),
+        ModelProvider.KIMI: KimiProvider(
+            model_name=settings.kimi_model,
+            api_key=settings.kimi_api_key,
+            base_url=settings.kimi_base_url,
+            timeout=settings.model_timeout_seconds,
+            max_retries=settings.model_max_retries,
+        ),
+        ModelProvider.DOUBAO: DoubaoProvider(
+            model_name=settings.doubao_model,
+            api_key=settings.doubao_api_key,
+            base_url=settings.doubao_base_url,
+            timeout=settings.model_timeout_seconds,
+            max_retries=settings.model_max_retries,
+        ),
     }
+    logger.info(
+        "model_gateway.providers configured=%s",
+        [str(name) for name, provider in providers.items() if provider.is_configured()],
+    )
+    return providers
