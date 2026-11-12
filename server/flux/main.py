@@ -40,6 +40,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # 并把历史"自由字符串"令牌迁移到 canonical id 上。
         await container.agents.load_from_db()
         await container.agent_tokens.migrate_legacy_tokens()
+        # Bot 对话 turn 不跨进程续跑：启动时把遗留的 queued/running 标记为 interrupted。
+        await container.bot_conversation.recover_interrupted()
         # P0-1：对账上一轮进程被杀时中断的 Apply（按磁盘事实恢复，幂等），
         # 与 Run 的 startup_recovery 并列——崩在落盘中途的提案不能永远停在 applying。
         await container.workspace.recover_interrupted_applies()

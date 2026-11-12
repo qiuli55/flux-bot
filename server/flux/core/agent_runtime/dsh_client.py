@@ -174,6 +174,9 @@ class DshRun:
     agent_id: str | None = None
     #: 本次 Run 归属的任务（用于注入 FLUX_TASK_ID；独立起 Run 时为 None）
     task_id: str | None = None
+    #: 本次 Run 的独立执行目录（来自 tasks.workspace）；None = 用 settings.dsh_workspace。
+    #: 每个 Run 各持一份，避免并发 Bot 共享同一个 cwd 互相覆盖文件。
+    workspace: str | None = None
     #: 任务级模型覆盖（移动端切换模型）；None = 用服务端配置的默认模型
     model: str | None = None
     #: 任务级模型通道（密钥库）；含明文 key，repr 已脱敏，不进任何对外快照
@@ -441,6 +444,7 @@ class FluxDshClient:
         model: str | None = None,
         channel: ModelChannel | None = None,
         permission_mode: str = "normal",
+        workspace: str | None = None,
     ) -> DshRun:
         """登记一条 Run（PENDING，落库）并把实际执行交给后台任务。
 
@@ -453,8 +457,15 @@ class FluxDshClient:
 
         `agent_id` 指定则由该 Agent 执行这次 Run（canonical UUID）；留空走内置 Agent，
         与既有链路完全一致。
+
+        `workspace` 是本次 Run 专属的执行目录（任务快照里的 `tasks.workspace`）。
+        为空时沿用 settings.dsh_workspace；非空时先建目录，再随 Run 一路带到 harness。
         """
         self.ensure_ready()
+        workspace = str(workspace or "").strip() or None
+        if workspace is not None:
+            workspace = str(Path(workspace).expanduser())
+            Path(workspace).mkdir(parents=True, exist_ok=True)
         # run_id 必须在准备 MCP patch 之前定下来：patch 的 X-Flux-Run-Id 头要写上它。
         run_id = run_id or uuid.uuid4().hex
         patch_path = await self.prepare_mcp_patch(agent_id, run_id=run_id)
@@ -466,6 +477,7 @@ class FluxDshClient:
             started_at=datetime.now(timezone.utc),
             agent_id=agent_id or self._mcp_agent_id,
             task_id=str(task_id) if task_id is not None else None,
+            workspace=workspace,
             model=(model or "").strip() or None,
             channel=channel,
             permission_mode=permission_mode,
@@ -543,9 +555,11 @@ class FluxDshClient:
             tap_token = llm_stream_tap.register(run_id=run_id, upstream=upstream, bus=self._bus)
             base_url = f"{tap_base_url(self._settings.dsh_mcp_url).rstrip('/')}/{tap_token}"
         try:
+            # 每个 Run 用自己的工作区（Bot 目录），不能让所有 Bot 共享 settings.dsh_workspace；
+            # 没有 task.workspace 的普通 Run 仍回退到原来的全局工作区。
             harness = self._harness_factory(
                 dsh_home=self._settings.dsh_home,
-                cwd=self._settings.dsh_workspace,
+                cwd=run.workspace or self._settings.dsh_workspace,
                 provider=provider,
                 model=run.model or self._settings.dsh_model,
                 max_tokens=self._settings.dsh_max_tokens,
@@ -694,7 +708,11 @@ class FluxDshClient:
         """
         return build_runtime_env(
             run_id=run.run_id,
-            workspace=self._settings.workspace_root or self._settings.dsh_workspace,
+            # FLUX_WORKSPACE 必须与本次 harness 的 cwd 一致：Bot 任务取任务快照，
+            # 独立 DSH API Run（无 task.workspace）保留原来的 workspace_root 回退。
+            workspace=run.workspace
+            or self._settings.workspace_root
+            or self._settings.dsh_workspace,
             task_id=run.task_id,
             agent_id=run.agent_id,
             mcp_endpoint=self._settings.dsh_mcp_url if self._settings.dsh_mcp_enabled else None,
@@ -740,6 +758,7 @@ class FluxDshClient:
         return {
             "enabled": self._settings.dsh_enabled,
             "home": self._settings.dsh_home,
+            # 服务级默认工作区快照，不是某个 Run 的目录；Bot Run 的独立目录在 DshRun 上。
             "workspace": self._settings.dsh_workspace,
             "provider": self._settings.dsh_provider,
             "model": self._settings.dsh_model,

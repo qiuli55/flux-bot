@@ -17,6 +17,13 @@ from flux.core import design_compile as comp
 ROOT = Path(__file__).resolve().parents[2]
 IR_PATH = ROOT / "doc" / "design-ir.json"
 CASES_DIR = ROOT / "doc" / "design-cases"
+DOC_DIR = ROOT / "doc"
+
+
+def _require_doc(path: Path) -> None:
+    if not path.exists():
+        pytest.skip(f"缺少设计契约夹具 {path}（这些文件随上游 Flux 仓库提供，不在本 Bot 仓库）")
+
 
 REQUIRED_NODE_KEYS = {
     "id",
@@ -44,6 +51,7 @@ REQUIRED_NODE_KEYS = {
 
 @pytest.fixture(scope="module")
 def ir_doc() -> dict[str, Any]:
+    _require_doc(IR_PATH)
     return json.loads(IR_PATH.read_text(encoding="utf-8"))
 
 
@@ -364,7 +372,9 @@ def test_font_family_aliases() -> None:
 
 def test_font_aliases_match_spec() -> None:
     """`doc/design-spec.json` 的 fonts.aliases 必须与编译层逐条一致（三端共用同一张表）。"""
-    spec = json.loads((ROOT / "doc" / "design-spec.json").read_text(encoding="utf-8"))
+    spec_path = DOC_DIR / "design-spec.json"
+    _require_doc(spec_path)
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
     for alias, expected in spec["fonts"]["aliases"].items():
         assert comp.font_family(alias) == expected, alias
     assert set(spec["fonts"]["enums"]) == {
@@ -574,6 +584,7 @@ def test_ir_contract_matches_doc(ir_doc: dict[str, Any]) -> None:
 
 
 def test_all_design_cases_compile() -> None:
+    _require_doc(CASES_DIR)
     paths = sorted(CASES_DIR.glob("*.json"))
     assert len(paths) == 11
     for path in paths:

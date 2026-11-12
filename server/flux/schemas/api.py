@@ -40,6 +40,13 @@ class AgentCreateRequest(BaseModel):
     runtime: Literal["dsh", "codex", "opencode"] = "dsh"
 
 
+class DevicePairRequest(BaseModel):
+    """手机用一次性配对码兑换设备令牌。"""
+
+    code: str = Field(min_length=1, max_length=32)
+    device_name: str = Field(default="", max_length=128)
+
+
 class AgentTokenIssueRequest(BaseModel):
     """为某个 Agent 签发一枚 MCP 接入令牌（目标架构 §3.2）。
 
@@ -103,9 +110,13 @@ class BotCreateRequest(BaseModel):
     #: 独立工作目录（绝对路径）；留空 = <dsh_home>/bots/<id>/workspace
     workspace: str | None = Field(default=None, max_length=512)
     schedule: str | None = Field(default=None, max_length=64)
+    #: 该 Bot 的 IANA 时区；留空 = 继承 FLUX_TIMEZONE
+    timezone: str | None = Field(default=None, max_length=64)
+    #: 错过触发点的处理策略：skip / skip_silent / catch_up
+    missed_run_policy: str | None = Field(default=None, max_length=16)
     #: 连续失败多少次自动暂停；0 = 永不自动暂停
     failure_threshold: int = Field(default=3, ge=0, le=20)
-    #: 每日 token 预算（UTC 自然日）；留空或 0 = 无上限
+    #: 每日 token 预算（按 FLUX_TIMEZONE 的自然日）；留空或 0 = 无上限
     token_budget: int | None = Field(default=None, ge=0, le=1_000_000_000)
     #: 开工失败时是否主动通知（写一条 bot_notifications）
     notify_on_failure: bool = True
@@ -137,6 +148,10 @@ class BotUpdateRequest(BaseModel):
     decision_mode: DecisionMode | None = None
     workspace: str | None = Field(default=None, max_length=512)
     schedule: str | None = Field(default=None, max_length=64)
+    #: 该 Bot 的 IANA 时区；显式传 null 表示继承 FLUX_TIMEZONE
+    timezone: str | None = Field(default=None, max_length=64)
+    #: 错过触发点的处理策略：skip / skip_silent / catch_up
+    missed_run_policy: str | None = Field(default=None, max_length=16)
     status: BotStatus | None = None
     failure_threshold: int | None = Field(default=None, ge=0, le=20)
     #: 每日 token 预算；显式传 null 表示改为无上限
@@ -184,6 +199,18 @@ class BotMemoryCreateRequest(BaseModel):
     content: str = Field(min_length=1, max_length=8000)
     kind: BotMemoryKind = BotMemoryKind.FACT
     relevance: BotMemoryRelevance = BotMemoryRelevance.DIRECT
+
+
+class BotTurnCreateRequest(BaseModel):
+    """给 Bot 发一条对话消息（异步轮次）。
+
+    HTTP 只落 queued 就返回；客户端用 GET /bots/{id}/turns/{turn_id} 长轮询结果。
+    `client_turn_id` 是幂等键：网络重试带同一个值不会产生第二轮。
+    """
+
+    content: str = Field(min_length=1, max_length=20_000)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=5)
+    client_turn_id: str | None = Field(default=None, max_length=128)
 
 
 class TaskMessageCreateRequest(BaseModel):

@@ -549,8 +549,12 @@ class TerminalService:
             confirm=KILL_CONFIRM_SECONDS,
         )
 
-    async def shutdown(self) -> None:
-        """进程退出前拒绝新任务、清理进程树，并把本进程留下的 active 会话收敛为 closed。"""
+    async def shutdown(self, *, close_sessions: bool = True) -> None:
+        """进程退出前拒绝新任务、清理进程树，并把本进程留下的 active 会话收敛为 closed。
+
+        `close_sessions=False` 供 `flux doctor` 之类只读命令使用：数据库可能不可达时
+        不去查/改会话表，避免一个只读自检因为数据库连接卡住而无法退出。
+        """
         if self._shutting_down:
             return
         self._shutting_down = True
@@ -579,25 +583,26 @@ class TerminalService:
 
         # By this point no new command can start. Only close sessions whose process
         # has actually gone away (or which never had a command process at all).
-        sessions: list[TerminalSession] = []
-        with contextlib.suppress(Exception):
-            sessions = await self._repo.list_sessions(
-                limit=10000,
-                kind=TerminalSessionKind.AGENT,
-                status=TerminalSessionStatus.ACTIVE,
-            )
-        for session in sessions:
-            process = self._processes.get(str(session.id))
-            if process is not None and process.poll() is None:
-                continue
+        if close_sessions:
+            sessions: list[TerminalSession] = []
             with contextlib.suppress(Exception):
-                await self._repo.set_status(session.id, TerminalSessionStatus.CLOSED)
-            with contextlib.suppress(Exception):
-                await self._emit(
-                    session.id,
-                    TerminalEventKind.SESSION_CLOSED,
-                    TerminalSource.USER,
+                sessions = await self._repo.list_sessions(
+                    limit=10000,
+                    kind=TerminalSessionKind.AGENT,
+                    status=TerminalSessionStatus.ACTIVE,
                 )
+            for session in sessions:
+                process = self._processes.get(str(session.id))
+                if process is not None and process.poll() is None:
+                    continue
+                with contextlib.suppress(Exception):
+                    await self._repo.set_status(session.id, TerminalSessionStatus.CLOSED)
+                with contextlib.suppress(Exception):
+                    await self._emit(
+                        session.id,
+                        TerminalEventKind.SESSION_CLOSED,
+                        TerminalSource.USER,
+                    )
 
         # Do not discard references to unconfirmed live processes: keeping them tracked
         # is preferable to falsely reporting a clean shutdown.

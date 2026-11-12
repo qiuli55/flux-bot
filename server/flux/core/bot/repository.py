@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -45,6 +45,8 @@ class BotRepository:
         status: str,
         schedule: str | None,
         next_run_at: datetime | None,
+        timezone: str | None = None,
+        missed_run_policy: str = "skip",
         failure_threshold: int = 3,
         token_budget: int | None = None,
         notify_on_failure: bool = True,
@@ -69,6 +71,8 @@ class BotRepository:
                 status=status,
                 schedule=schedule,
                 next_run_at=next_run_at,
+                timezone=timezone,
+                missed_run_policy=missed_run_policy,
                 failure_threshold=failure_threshold,
                 token_budget=token_budget,
                 notify_on_failure=notify_on_failure,
@@ -122,11 +126,20 @@ class BotRepository:
             return list(await session.scalars(statement))
 
     async def is_busy(self, bot_id: uuid.UUID) -> bool:
-        """Bot 是否还有一轮没跑完（防重叠：定时撞上上一轮时跳过本次）。"""
+        """Bot 是否还有一轮开工没跑完（防重叠：定时撞上上一轮时跳过本次）。
+
+        对话任务是同一 Bot 名下的普通 tasks 行，但它由 Bot 对话队列串行处理，
+        不代表「开工中的一轮」；结算与定时调度必须把它排除，否则聊天会永远占着忙。
+        """
         async with self._session_factory() as session:
+            chat_task_id = select(Bot.chat_task_id).where(Bot.id == bot_id).scalar_subquery()
             task_id = await session.scalar(
                 select(Task.id)
-                .where(Task.bot_id == bot_id, Task.status.in_(_ACTIVE_TASK_STATUSES))
+                .where(
+                    Task.bot_id == bot_id,
+                    Task.status.in_(_ACTIVE_TASK_STATUSES),
+                    or_(chat_task_id.is_(None), Task.id != chat_task_id),
+                )
                 .limit(1)
             )
             return task_id is not None

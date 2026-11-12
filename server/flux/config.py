@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import re
 from functools import lru_cache
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # backend/flux/config.py -> backend/flux -> backend -> 仓库根
@@ -23,16 +26,80 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _fallback_timezone_from_tz(cls, data: object) -> object:
+        """FLUX_TIMEZONE 未提供时，沿用标准 `TZ` 环境变量（合法 IANA 名称）。"""
+        if not isinstance(data, dict):
+            return data
+        # pydantic-settings 会把显式 env / .env / 构造参数合并进 data；没有该键
+        # 就说明 FLUX_TIMEZONE 未设置（或与默认值相同而被剥离）。此时才看 TZ。
+        if "timezone" not in data and "FLUX_TIMEZONE" not in os.environ:
+            tz = (os.environ.get("TZ") or "").strip().removeprefix(":")
+            if tz:
+                try:
+                    ZoneInfo(tz)
+                except (ZoneInfoNotFoundError, ValueError):
+                    pass
+                else:
+                    data = {**data, "timezone": tz}
+        return data
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, value: str) -> str:
+        """启动即校验时区名；非法值给出明确指向 FLUX_TIMEZONE 的错误。"""
+        name = (value or "").strip() or "UTC"
+        try:
+            ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(
+                f"FLUX_TIMEZONE 不是合法的 IANA 时区名：{name!r}（例：Asia/Shanghai）"
+            ) from exc
+        return name
+
     # --- 应用 ---
     app_name: str = "Flux"
     env: str = "local"
     log_level: str = "INFO"
     api_v1_prefix: str = "/api/v1"
+    # Bot 的 cron 表达式与每日 token 预算重置都按这个 IANA 时区解释（如 Asia/Shanghai）。
+    # 未设置 FLUX_TIMEZONE 时会回退到标准环境变量 TZ（仅当其值是合法 IANA 名称）；
+    # 两者都没有则使用 UTC。非法名称会在启动加载配置时直接报错。
+    timezone: str = "UTC"
     # REST 面单用户令牌（公网暴露前置，见 flux.api.auth）。留空 = 关闭鉴权，
     # 本地开发与桌面端（同机直连）零配置可用；公网部署必须显式设置。
     auth_token: str | None = None
+    # 未设置 auth_token 时的兜底策略（FLUX_ALLOW_NO_AUTH）：
+    #   None  = 旧行为（整体开放，仅 flux.main 保留，兼容既有测试）；
+    #   False = 仅允许同机回环直连，其余请求一律 401（Bot 节点默认，fail-closed）；
+    #   True  = 显式开放（仅限完全可信的内网，启动时告警）。
+    allow_no_auth: bool | None = None
     # Electron 桌面端用于“打开文件夹”的一次运行期能力令牌；普通 Web 客户端不能使用。
     desktop_control_token: str | None = None
+
+    # --- 设备配对（手机长期令牌）---
+    # 配对成功的设备令牌有效期（天）。0 = 永不过期。
+    device_token_ttl_days: int = 90
+    # 一次性配对码有效期（秒）。
+    pairing_code_ttl_seconds: int = 600
+
+    # --- 云桌面（按 Bot 隔离的桌面会话）---
+    # 桌面网关地址与长期网关令牌。地址 / 令牌的兼容别名见文件末尾「Bot 桌面」段，
+    # 统一解析在 flux.core.desktop.resolve；地址齐全且（长期凭据成对存在 或 配置了
+    # 票据密钥）时才视为已配置，绝不返回半个连接参数。
+    desktop_host: str | None = None
+    desktop_gateway_token: str | None = None
+    # 桌面网桥地址与密钥（可选，随会话下发给客户端）。
+    desktop_bridge: str | None = None
+    desktop_bridge_key: str | None = None
+    # 桌面票据签名密钥；留空时仍返回会话信息，但 ticket 为 null。
+    desktop_ticket_secret: str | None = None
+    # 桌面票据有效期（秒）。
+    desktop_ticket_ttl_seconds: int = 300
+    # 是否把长期 gateway_token / bridge_key 一并下发。网关启用票据校验后可关掉，
+    # 让手机端不再持有长期密钥。
+    desktop_send_gateway_token: bool = True
     # 脱敏映射表（context_redactions）的加密密钥（FLUX_CONTEXT_MECHANISM §10.1）。
     # 留空 = 映射不落库（fail-closed）：正文照常打码，只是不可回填。
     redaction_key: str | None = None
@@ -47,6 +114,9 @@ class Settings(BaseSettings):
     # --- 存储（主规格 §11.1）---
     database_url: str = "sqlite+aiosqlite:///./flux.db"
     redis_url: str = "redis://localhost:6379/0"
+    # doctor 的数据库探针上限（秒）。除了在协程层用 asyncio.wait_for 兜底，
+    # 还会作为 asyncpg 的连接超时，避免不可达主机把 `flux doctor` 拖住。
+    doctor_db_timeout_seconds: float = 5.0
 
     # --- 模型供应商（主规格 §5.3）---
     # 仅供 Flux 侧基础设施调用（T2 压缩、扫描摘要等），不是 Agent 的模型通道；
@@ -241,6 +311,9 @@ class Settings(BaseSettings):
     supervisor_run_timeout_seconds: float = 0.0
 
     # --- Bot 模式（常驻 Bot）---
+    # Bot 独立服务监听的端口（entrypoint.sh / Dockerfile 用 FLUX_BOT_PORT 传入）。
+    # Bot 节点据此在未显式配置 FLUX_DSH_MCP_URL 时推导同机 MCP 端点。
+    bot_port: int = 8600
     # 后台调度 worker：按 next_run_at 扫到期 Bot 并开工。测试里关掉，避免与用例抢时序。
     bot_scheduler_enabled: bool = True
     # 轮询间隔（秒）：cron 的最小粒度是分钟，30 秒足够且不会压垮 SQLite。
@@ -320,10 +393,12 @@ class Settings(BaseSettings):
     # App 进入「Bot 桌面」时向服务端要入口参数。隧道地址会随隧道重启变化，所以放在
     # 公开的 desktop.json 里由服务端代读；token / bridge_key 属于凭据，只从环境变量下发，
     # 不进 App 源码（公开仓库不泄漏），轮换也不需要重新发版。
+    # 与上面的 desktop_host / desktop_gateway_token / desktop_bridge 是同一组事实的
+    # 兼容别名（老部署仍可用）：公开 JSON 优先，其次主用字段，最后这些别名。
+    # 解析规则集中在 flux.core.desktop.resolve。
     desktop_config_url: str = "https://flux.qiuli55.top/fluxbot-mobile/desktop.json"
-    # 桌面访问令牌与桥接密钥；留空 = 桌面能力不可用（接口返回 configured=false）
+    # 桌面访问令牌的兼容别名（FLUX_DESKTOP_TOKEN）；桥接密钥统一用 desktop_bridge_key。
     desktop_token: str | None = None
-    desktop_bridge_key: str | None = None
     # desktop.json 读不到时的兜底地址（通常是上一次可用的隧道）
     desktop_gateway: str | None = None
     desktop_bridge_url: str | None = None

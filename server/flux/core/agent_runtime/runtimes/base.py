@@ -136,6 +136,9 @@ class RuntimeLaunch:
     instruction: str
     env: dict[str, str] = field(default_factory=dict)
     cwd: str = ""
+    #: 任务自带的执行目录（tasks.workspace 快照）；None = 使用 runtime 的默认工作区。
+    #: 与 cwd 分开：cwd 已包含默认回退，而这里只表示「任务确实有自己的目录」。
+    workspace: str | None = None
     session_id: str = ""
     task_id: str | None = None
     agent_id: str | None = None

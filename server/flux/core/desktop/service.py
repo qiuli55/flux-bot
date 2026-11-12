@@ -7,8 +7,10 @@ App 进「Bot 桌面」前向 `/api/v1/desktop` 要一份配置。数据分两�
 - 凭据（token / bridge_key）：只从进程环境变量取，**不下发到客户端源码**。
   仓库公开、APK 被反编译都不会直接暴露，轮换也只需改服务端环境变量。
 
-读不到公开配置时降级到环境变量里的兜底地址；凭据缺失则 `configured=false`，
-由 App 提示"桌面未配置"，绝不返回半个连接参数让客户端去猜。
+读不到公开配置时降级到环境变量里的兜底地址；地址或凭据不全则
+`configured=false`，由 App 提示"桌面未配置"，绝不返回半个连接参数让客户端去猜。
+字段别名（`desktop_host` / `desktop_gateway` 等）的解析规则见
+`flux.core.desktop.resolve`，会话票据接口复用同一份解析结果。
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from typing import Any
 import httpx
 
 from flux.config import Settings
+from flux.core.desktop.resolve import DesktopEndpoints, resolve_desktop_endpoints
 from flux.logging import get_logger
 
 logger = get_logger(__name__)
@@ -37,21 +40,48 @@ class DesktopService:
         self._cached_at = 0.0
         self._cached: dict[str, str] = {}
 
-    async def config(self) -> dict[str, Any]:
+    async def resolve(self) -> DesktopEndpoints:
+        """返回 ``desktop.json`` 优先、env 别名兜底的连接事实（凭据只走 env）。"""
         public = await self._public()
-        gateway = (public.get("gateway") or self._settings.desktop_gateway or "").strip()
-        raw_bridge = public.get("bridge") or self._settings.desktop_bridge_url or ""
-        bridge = raw_bridge.strip().rstrip("/")
-        token = (self._settings.desktop_token or "").strip()
-        bridge_key = (self._settings.desktop_bridge_key or "").strip()
+        return resolve_desktop_endpoints(self._settings, public)
+
+    async def config(self) -> dict[str, Any]:
+        """GET /api/v1/desktop 的响应体。
+
+        未配置时只返回 `configured=false` 与元数据，所有连接参数留空；配置完整时
+        按 `desktop_send_gateway_token` 决定是否下发长期凭据。票据模式下长期凭据
+        置为 null，客户端改走 `POST /bots/{id}/desktop/session`。
+        """
+        endpoints = await self.resolve()
+        if not endpoints.configured(self._settings.desktop_ticket_secret):
+            logger.warning(
+                "desktop.config.unconfigured gateway=%s bridge=%s long_lived_credentials=%s "
+                "ticket_secret=%s",
+                bool(endpoints.gateway),
+                bool(endpoints.bridge),
+                endpoints.has_long_lived_credentials,
+                bool((self._settings.desktop_ticket_secret or "").strip()),
+            )
+            return {
+                "configured": False,
+                "gateway": "",
+                "bridge": "",
+                "token": None,
+                "bridge_key": None,
+                "config_url": endpoints.config_url,
+                "tunnel_updated_at": endpoints.tunnel_updated_at,
+            }
+        send_credentials = (
+            self._settings.desktop_send_gateway_token and endpoints.has_long_lived_credentials
+        )
         return {
-            "configured": bool(gateway and bridge and token and bridge_key),
-            "gateway": gateway,
-            "bridge": bridge,
-            "token": token,
-            "bridge_key": bridge_key,
-            "config_url": self._settings.desktop_config_url,
-            "tunnel_updated_at": public.get("updated", ""),
+            "configured": True,
+            "gateway": endpoints.gateway,
+            "bridge": endpoints.bridge,
+            "token": endpoints.gateway_token if send_credentials else None,
+            "bridge_key": endpoints.bridge_key if send_credentials else None,
+            "config_url": endpoints.config_url,
+            "tunnel_updated_at": endpoints.tunnel_updated_at,
         }
 
     async def _public(self) -> dict[str, str]:
@@ -75,12 +105,23 @@ class DesktopService:
             payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
             # 公开配置只是"地址的快捷方式"，读不到不影响鉴权与其它接口。
-            logger.warning("读取桌面隧道配置失败，回退到环境变量: %s", exc)
+            logger.warning("desktop.config.public.fallback url=%s error=%s", url, exc)
             return {}
         if not isinstance(payload, dict):
+            logger.warning("desktop.config.public.fallback url=%s error=payload-not-object", url)
             return {}
-        self._cached = {key: value for key, value in payload.items() if isinstance(value, str)}
+        fetched = {key: value for key, value in payload.items() if isinstance(value, str)}
+        if not fetched:
+            logger.warning("desktop.config.public.fallback url=%s error=payload-empty", url)
+            return {}
+        self._cached = fetched
         self._cached_at = now
+        logger.info(
+            "desktop.config.public.fetched url=%s gateway=%s bridge=%s",
+            url,
+            bool(fetched.get("gateway")),
+            bool(fetched.get("bridge")),
+        )
         return self._cached
 
 
