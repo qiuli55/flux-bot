@@ -34,6 +34,7 @@ class BotRoutineRepository:
         schedule: str | None,
         next_run_at: datetime | None,
         enabled: bool = True,
+        event_triggers: list[str] | None = None,
     ) -> BotRoutine:
         async with self._session_factory() as session:
             row = BotRoutine(
@@ -44,6 +45,7 @@ class BotRoutineRepository:
                 schedule=schedule,
                 next_run_at=next_run_at,
                 enabled=enabled,
+                event_triggers=event_triggers,
             )
             session.add(row)
             await self._commit(session)
@@ -59,6 +61,17 @@ class BotRoutineRepository:
             select(BotRoutine)
             .where(BotRoutine.bot_id == bot_id)
             .order_by(BotRoutine.created_at.asc())
+        )
+        async with self._session_factory() as session:
+            return list(await session.scalars(statement))
+
+    async def list_enabled(self, *, limit: int = 500) -> list[BotRoutine]:
+        """全部启用中的例程（事件派发按 event_triggers 在内存里过滤）。"""
+        statement = (
+            select(BotRoutine)
+            .where(BotRoutine.enabled.is_(True))
+            .order_by(BotRoutine.bot_id.asc(), BotRoutine.created_at.asc())
+            .limit(limit)
         )
         async with self._session_factory() as session:
             return list(await session.scalars(statement))

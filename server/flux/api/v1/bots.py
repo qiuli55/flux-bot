@@ -268,6 +268,7 @@ async def create_bot_routine(
         instruction=payload.instruction,
         schedule=payload.schedule,
         enabled=payload.enabled,
+        event_triggers=payload.event_triggers,
     )
     return ok(row.to_dict())
 

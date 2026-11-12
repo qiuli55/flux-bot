@@ -344,6 +344,10 @@ class Settings(BaseSettings):
     bot_scheduler_enabled: bool = True
     # 轮询间隔（秒）：cron 的最小粒度是分钟，30 秒足够且不会压垮 SQLite。
     bot_scheduler_interval_seconds: float = 30.0
+    # 外部例程触发（Webhook）的 HMAC 密钥。留空 = fail-closed，拒绝所有入站请求。
+    # 通用入口校验 X-Flux-Signature；GitHub 入口校验 X-Hub-Signature-256。
+    routine_webhook_secret: str | None = None
+    github_webhook_secret: str | None = None
 
     # --- 助理知识库（RAG / wiki）---
     # 给助理建一份覆盖「全部对话 + docs + 项目记忆」的检索层（见 flux.core.knowledge）。
