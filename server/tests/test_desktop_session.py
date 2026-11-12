@@ -136,6 +136,30 @@ def test_gateway_token_can_be_withheld(settings: Settings, db_schema: None) -> N
     assert "bridge_key" not in data
 
 
+def test_ticket_must_match_requested_bot(settings: Settings) -> None:
+    """票据只能用于签发它的那台 Bot：换 Bot / 换 profile 一律拒绝。"""
+    bot_id = str(uuid.uuid4())
+    other_id = str(uuid.uuid4())
+    profile = desktop_profile(bot_id)
+    ticket = issue_desktop_ticket(
+        bot_id=bot_id,
+        profile=profile,
+        principal="device",
+        secret=TICKET_SECRET,
+        ttl_seconds=60,
+    )
+    assert ticket is not None
+
+    assert (
+        verify_desktop_ticket(
+            ticket, TICKET_SECRET, expected_bot_id=bot_id, expected_profile=profile
+        )
+        is not None
+    )
+    assert verify_desktop_ticket(ticket, TICKET_SECRET, expected_bot_id=other_id) is None
+    assert verify_desktop_ticket(ticket, TICKET_SECRET, expected_profile="botdeadbeef") is None
+
+
 def test_ticket_helpers_are_self_contained(settings: Settings) -> None:
     bot_id = str(uuid.uuid4())
     profile = desktop_profile(bot_id)

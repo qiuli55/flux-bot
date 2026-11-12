@@ -93,11 +93,18 @@ def verify_desktop_ticket(
     ticket: str | None,
     secret: str | None,
     now: datetime | int | float | None = None,
+    *,
+    expected_bot_id: str | uuid.UUID | None = None,
+    expected_profile: str | None = None,
 ) -> dict[str, Any] | None:
     """验签并校验过期时间；合法返回 payload，否则返回 None。
 
     桌面网关应按同一规则校验：拆成两段 → 用 secret 对第一段重算 HMAC-SHA256 →
     常量时间比较 → 解 base64url JSON → 检查 ``exp`` 大于当前 Unix 秒。
+
+    网关还必须把票据**绑定到本次请求的目标**：传入 ``expected_bot_id`` /
+    ``expected_profile`` 后，票据里的对应声明不匹配同样返回 None。否则一张 A Bot
+    的票据可以被拿去打开 B Bot 的桌面（票据本身是合法的，只是用错了地方）。
     """
     if not ticket or not secret or "." not in ticket:
         return None
@@ -122,6 +129,10 @@ def verify_desktop_ticket(
     except (TypeError, ValueError):
         return None
     if expires <= _now_seconds(now):
+        return None
+    if expected_bot_id is not None and str(payload.get("bot_id")) != str(expected_bot_id):
+        return None
+    if expected_profile is not None and str(payload.get("profile")) != expected_profile:
         return None
     return payload
 
