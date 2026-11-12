@@ -281,11 +281,25 @@ class TaskModelRequest(BaseModel):
     key_id: str | None = Field(default=None, max_length=64)
 
 
+#: 密钥库接受的供应商值。与 flux.core.agent_runtime.model_catalog.KEY_PROVIDERS 保持同步；
+#: openai_compatible 是通用逃生口，其余都是内置供应商（中国区四家为 2026-11-12 接入）。
+KeyProviderName = Literal[
+    "deepseek",
+    "openai",
+    "openai_compatible",
+    "anthropic",
+    "qwen",
+    "zhipu",
+    "kimi",
+    "doubao",
+]
+
+
 class ApiKeyCreateRequest(BaseModel):
     """在密钥库中登记一条 API Key。明文只在请求体里出现，落库即加密。"""
 
     name: str = Field(min_length=1, max_length=128)
-    provider: Literal["deepseek", "openai", "openai_compatible", "anthropic"]
+    provider: KeyProviderName
     base_url: str = Field(default="", max_length=256)
     api_key: str = Field(min_length=1, max_length=4096)
     models: list[str] = Field(default_factory=list)
@@ -298,7 +312,7 @@ class ApiKeyUpdateRequest(BaseModel):
     """修改密钥库条目；未出现的字段保持不变，api_key 留空也表示不改。"""
 
     name: str | None = Field(default=None, max_length=128)
-    provider: Literal["deepseek", "openai", "openai_compatible", "anthropic"] | None = None
+    provider: KeyProviderName | None = None
     base_url: str | None = Field(default=None, max_length=256)
     api_key: str | None = Field(default=None, max_length=4096)
     models: list[str] | None = None

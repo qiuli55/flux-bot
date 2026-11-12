@@ -11,6 +11,17 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from flux.core.model_gateway.providers.official_models import (
+    DOUBAO_BASE_URL,
+    DOUBAO_DEFAULT_MODEL,
+    KIMI_BASE_URL,
+    KIMI_DEFAULT_MODEL,
+    QWEN_BASE_URL,
+    QWEN_DEFAULT_MODEL,
+    ZHIPU_BASE_URL,
+    ZHIPU_DEFAULT_MODEL,
+)
+
 # backend/flux/config.py -> backend/flux -> backend -> 仓库根
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -130,6 +141,21 @@ class Settings(BaseSettings):
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-flash"
+    # 中国区供应商（2026-11-12 核验）：默认端点与模型 id 的唯一来源是
+    # flux.core.model_gateway.providers.official_models，这里只做同名配置项。
+    # 密钥同样只由对应 Provider 读取，绝不下发给 Agent（§14.3）。
+    qwen_api_key: str | None = None
+    qwen_base_url: str = QWEN_BASE_URL
+    qwen_model: str = QWEN_DEFAULT_MODEL
+    zhipu_api_key: str | None = None
+    zhipu_base_url: str = ZHIPU_BASE_URL
+    zhipu_model: str = ZHIPU_DEFAULT_MODEL
+    kimi_api_key: str | None = None
+    kimi_base_url: str = KIMI_BASE_URL
+    kimi_model: str = KIMI_DEFAULT_MODEL
+    doubao_api_key: str | None = None
+    doubao_base_url: str = DOUBAO_BASE_URL
+    doubao_model: str = DOUBAO_DEFAULT_MODEL
     local_model_base_url: str | None = None
     local_model_name: str = "local-echo"
     # Anthropic 的 max_tokens 是必填字段（做不到 OpenAI / DeepSeek 那样"不传=不限"），
