@@ -66,6 +66,8 @@ def settings(tmp_path) -> Settings:
         knowledge_worker_enabled=False,
         # Bot 调度循环同理：后台按 next_run_at 自动开工会让任务状态随用例时序漂移
         bot_scheduler_enabled=False,
+        # Email 轮询同理：默认关闭，需要验证轮询的用例自己显式打开 / 直接 tick()
+        email_trigger_enabled=False,
         # Webhook 密钥显式置空：避免开发机 .env 里的真实密钥让 fail-closed 断言失真
         routine_webhook_secret=None,
         github_webhook_secret=None,

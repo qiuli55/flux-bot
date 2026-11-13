@@ -99,6 +99,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # 关掉时 Bot 仍可手动 /run，只是不再自动触发。
         if app_settings.bot_scheduler_enabled:
             await container.bots.start()
+        # Email 入站触发：轮询已安装的 email 连接器，把新邮件发布到事件总线。
+        # 开关关闭或间隔 <= 0 时 start() 直接返回，不创建后台任务。
+        await container.email_trigger.start()
         yield
         if log_upload_task is not None and not log_upload_task.done():
             log_upload_task.cancel()
@@ -112,6 +115,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await container.supervisor_worker.stop()
         # 知识库索引同样先停：索引事务不能在引擎 dispose 之后还在写。
         await container.knowledge_worker.stop()
+        # Email 轮询先停：它发布的事件还要经过 Bot 派发，必须早于 bots.stop()；
+        # stop() 会 cancel 并 await 后台任务，避免引擎 dispose 时留下悬空协程。
+        await container.email_trigger.stop()
         # Bot 调度循环先停：定时开工要写 tasks / bots，必须在 dispose 之前收尾。
         await container.bots.stop()
         # Container.dispose() owns service shutdown ordering, including Human PTY.

@@ -158,6 +158,10 @@ SPEC_TABLES = {
     # 公开链接按不可猜测的 share_token 读取，仅 published 页面可访问。
     "artifact_pages",
     "artifact_page_revisions",
+    # §11.2 之外的新增表：Email 入站轮询游标（迁移 b7c2e4f9a1d3）。
+    # 每个 (account_key, mailbox) 一行，记录已处理的最大 IMAP UID 与最近轮询状态；
+    # 进程内去重集合重启即丢，持久化游标才能避免重复发布 email.received。
+    "email_trigger_cursors",
 }
 
 

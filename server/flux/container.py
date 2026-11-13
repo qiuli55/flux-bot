@@ -41,6 +41,7 @@ from flux.core.channels.wecom_bot import WeComBotChannel
 from flux.core.code_intelligence.service import CodeIntelligenceService
 from flux.core.connectors.calendar import CalendarConnectorService
 from flux.core.connectors.email import EmailConnectorService
+from flux.core.connectors.email_trigger import EmailTriggerService
 from flux.core.connectors.framework import ConnectorFrameworkService, build_default_catalog
 from flux.core.context.lifecycle import ContextLifecycle
 from flux.core.context.metrics import BackfillObserver
@@ -172,6 +173,8 @@ class Container:
     connector_framework: ConnectorFrameworkService = field(init=False)
     #: Email 连接器（IMAP 读信 / SMTP 发信），凭据复用同一把密钥库主密钥
     email: EmailConnectorService = field(init=False)
+    #: Email 入站触发：轮询已安装账号的新邮件，发现后发布 email.received
+    email_trigger: EmailTriggerService = field(init=False)
     #: Bot 桌面入口参数：公开隧道地址 + 环境变量里的凭据
     desktop: DesktopService = field(init=False)
     task_runs: TaskRunBridge = field(init=False)
@@ -297,6 +300,9 @@ class Container:
             self.session_factory,  # type: ignore[attr-defined]
             self.key_vault,
         )
+        # Email 入站触发只读邮件头并发布事件；后台循环由 main.py lifespan 起停，
+        # 未安装 email 连接器时不会发起任何 IMAP 请求。
+        self.email_trigger = EmailTriggerService(self)
         # 账号侧连接器目录：GitHub（OAuth）+ Email（api_key 即邮箱密码）+ Calendar；
         # 安装状态按 account_key 隔离。Agent 执行侧的 connector 注册表
         # （self.connectors）保持独立，互不替换。
@@ -771,6 +777,8 @@ class Container:
             return ModelProvider.LOCAL
 
     async def dispose(self, *, close_terminal_sessions: bool = True) -> None:
+        # Email 轮询先停：它会在事件总线上发布事件，不能跑在 Bus / 连接池收摊之后。
+        await self.email_trigger.stop()
         # 事件总线先停：取消并等待 Redis 监听任务，避免它在服务/数据库收尾后还在派发。
         # 进程内实现是空操作；停掉后仍可本地 publish（不再跨进程广播）。
         await self.bus.aclose()

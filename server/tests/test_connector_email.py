@@ -425,6 +425,41 @@ def test_list_returns_headers_only_newest_first(
     assert fake.logged_out is True
 
 
+def test_list_since_uid_returns_oldest_window(
+    settings: Settings,
+    db_schema: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """传 since_uid 时取水位线之后最老的 N 封；默认仍是最新的 N 封。"""
+    messages = {
+        str(uid).encode(): (_message_bytes(subject=f"message {uid}"), False) for uid in range(1, 21)
+    }
+    _patch_imap(monkeypatch, FakeIMAP(messages))
+
+    async def _scenario() -> None:
+        container = Container(settings)
+        try:
+            await container.connector_framework.install(
+                ACCOUNT_A,
+                "email",
+                auth_type="api_key",
+                api_key=PASSWORD,
+                settings=dict(INSTALL_SETTINGS),
+            )
+
+            default = await container.email.list_messages(ACCOUNT_A, limit=3)
+            assert [message["uid"] for message in default] == [20, 19, 18]
+
+            window = await container.email.list_messages(ACCOUNT_A, limit=3, since_uid=5)
+            assert [message["uid"] for message in window] == [6, 7, 8]
+            # 严格大于水位线：已处理过的那封不会被再次返回。
+            assert all(message["uid"] > 5 for message in window)
+        finally:
+            await container.dispose()
+
+    asyncio.run(_scenario())
+
+
 # --- 单封邮件 ---------------------------------------------------------------
 
 
