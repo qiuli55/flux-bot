@@ -2,7 +2,8 @@
 
 探测与启动口径按 `@anthropic-ai/claude-code` 的真实 CLI 行为：
 
-- `claude --version` → `2.0.14 (Claude Code)`（版本正则抽出 `2.0.14`）
+- `claude --version` → `2.1.323 (Claude Code)`（版本正则抽出 `2.1.323`；
+  [2026-11-12 快照] 镜像固定安装 2.1.323，见仓库根 Dockerfile 的 CLAUDE_CODE_VERSION）
 - `claude --print <prompt> --output-format stream-json --verbose` → 非交互跑一条指令，
   stdout 每行一个 JSON 事件（`system/init`、`assistant`、`user`、`result` 等）
 - 续聊：`--resume <session_id>`；MCP：`--mcp-config <file> --strict-mcp-config`
