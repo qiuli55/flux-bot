@@ -35,6 +35,7 @@ from flux.core.capability_import.repository import ImportedCapabilityRepository
 from flux.core.capability_import.scanners import AgentScanner
 from flux.core.capability_import.service import CapabilityImportService
 from flux.core.channels.feishu_bot import FeishuBotChannel
+from flux.core.channels.outbound_drafts import OutboundDraftService
 from flux.core.code_intelligence.service import CodeIntelligenceService
 from flux.core.connectors.framework import ConnectorFrameworkService, build_default_catalog
 from flux.core.context.lifecycle import ContextLifecycle
@@ -194,6 +195,8 @@ class Container:
     webhook_triggers: WebhookTriggerService = field(init=False)
     #: Bot 对话轮次：持久化 turn + 每 Bot 串行后台队列（legacy 对话也复用其助理逻辑）
     bot_conversation: BotConversationService = field(init=False)
+    #: 统一出站草稿：正文与状态落库，审批通过后原子认领并发送一次
+    outbound_drafts: OutboundDraftService = field(init=False)
     #: 正式飞书频道：加密回调入站建 turn，出站回复必须经审批卡放行
     feishu_bot: FeishuBotChannel = field(init=False)
     # IDE 行内补全（AI_COMPLETION_SPEC）：偏好/当前 Agent 落盘 + 模型解析 + 流式生成
@@ -492,6 +495,8 @@ class Container:
         self.webhook_triggers = WebhookTriggerService(self)
         # Bot 对话：一轮落一条 bot_turns，后台按 Bot 串行调用同一个助手逻辑。
         self.bot_conversation = BotConversationService(self)
+        # 统一出站草稿：飞书等频道把待发送正文落库，审批结果只做状态迁移。
+        self.outbound_drafts = OutboundDraftService(self.session_factory)  # type: ignore[attr-defined]
         # Bot 后台子任务：独立于对话轮次跑的 tasks 行，结果以 kind=subtask 消息回到父对话。
         # 它不碰 last_task_id / chat_task_id，也不参与开工忙闲锁。
         self.bot_subtasks = BotSubtaskService(self)

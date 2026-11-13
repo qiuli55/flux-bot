@@ -53,6 +53,21 @@ class TaskOrigin(StrEnum):
     SUBTASK = "subtask"
 
 
+class OutboundDraftStatus(StrEnum):
+    """出站草稿状态（outbound_drafts.status）。
+
+    只有 PENDING 能被审批放行或取消；SENDING 是发送中的原子认领态；
+    其余都是终态，一律不自动重试、不自动发送。
+    """
+
+    PENDING = "pending"
+    SENDING = "sending"
+    SENT = "sent"
+    DENIED = "denied"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+
 class BotStatus(StrEnum):
     """常驻 Bot 的生命周期（bots.status）。
 
