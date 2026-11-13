@@ -33,6 +33,15 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from flux.core.channels.inbound_media import (
+    DownloadedMedia,
+    Transcriber,
+    media_from_response,
+    pick_media_name,
+    safe_error,
+    save_media,
+    transcribe_audio,
+)
 from flux.core.channels.wecom_crypto import WeComCryptoError, decrypt_message, verify_signature
 from flux.core.event.bus import Events
 from flux.core.task_engine.approvals import (
@@ -40,7 +49,7 @@ from flux.core.task_engine.approvals import (
     outbound_approval_options,
     raise_approval,
 )
-from flux.errors import AIOSError, NotFoundError
+from flux.errors import AIOSError, NotFoundError, ValidationError
 from flux.logging import get_logger
 
 if TYPE_CHECKING:
@@ -114,6 +123,24 @@ class WeComCallbackResult:
     headers: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class _InboundMessage:
+    """解析后的入站消息：文本或一条待下载的媒体。"""
+
+    message_id: str
+    from_user: str
+    kind: str  # text / image / voice / file
+    text: str = ""
+    media_id: str = ""
+    file_name: str = ""
+    voice_format: str = ""
+    recognition: str = ""
+
+
+#: 媒体类型的中文名，用于缺凭据时给用户一句能看懂的解释。
+_KIND_LABELS = {"image": "图片", "voice": "语音", "file": "文件"}
+
+
 class WeComBotSender:
     """企业微信自建应用出站：access_token + 应用消息接口。
 
@@ -174,6 +201,21 @@ class WeComBotSender:
         )
         _payload(response, "发送企业微信消息")
 
+    async def download_media(self, media_id: str) -> DownloadedMedia:
+        """按官方 media/get 下载临时素材（MediaId 有效 3 天）。
+
+        成功时是二进制流；失败时企微返回 ``{errcode, errmsg}`` JSON，交给
+        `media_from_response` 识别并抛清晰错误。access_token 只放在查询串，
+        httpx 日志已由本模块的过滤器脱敏。
+        """
+        token = await self._access_token()
+        response = await self._send_stream(
+            "GET",
+            f"{self._api_base}/cgi-bin/media/get",
+            params={"access_token": token, "media_id": media_id},
+        )
+        return await media_from_response(response, label="下载企业微信媒体")
+
     async def aclose(self) -> None:
         if self._client is not None and self._owns_client:
             await self._client.aclose()
@@ -201,12 +243,21 @@ class WeComBotSender:
             return token
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        return await self._ensure_client().request(method, f"{self._api_base}{path}", **kwargs)
+
+    async def _send_stream(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        """媒体下载保持流式，落盘时由 save_upload 逐块检查 50MB 上限。"""
+        client = self._ensure_client()
+        request = client.build_request(method, url, **kwargs)
+        return await client.send(request, stream=True, follow_redirects=True)
+
+    def _ensure_client(self) -> httpx.AsyncClient:
         client = self._client
         if client is None:
             client = httpx.AsyncClient(timeout=self._timeout)
             self._client = client
             self._owns_client = True
-        return await client.request(method, f"{self._api_base}{path}", **kwargs)
+        return client
 
 
 def _int_or_zero(value: str | int | None) -> int:
@@ -248,9 +299,11 @@ class WeComBotChannel:
         api_base: str = "https://qyapi.weixin.qq.com",
         bot_id: str | None = None,
         sender: Any | None = None,
+        transcriber: Transcriber | None = None,
         turn_wait_seconds: float = 900.0,
     ) -> None:
         self._container = container
+        self._transcriber = transcriber
         self._corp_id = (corp_id or "").strip() or None
         self._agent_id = (str(agent_id).strip() if agent_id is not None else "") or None
         self._token = (token or "").strip() or None
@@ -367,19 +420,29 @@ class WeComBotChannel:
         if message is None:
             return WeComCallbackResult(400, "企业微信消息明文不是合法 XML")
 
-        msg_type = _xml_text(message, "MsgType")
-        if msg_type != "text":
+        msg_type = _xml_text(message, "MsgType").lower()
+        # 视频 / 位置 / 链接 / 事件等保持 200 忽略，与既有行为一致。
+        if msg_type not in {"text", "image", "voice", "file"}:
             logger.info("wecom.inbound.ignored type=%s", msg_type or "unknown")
             return WeComCallbackResult(200, _SUCCESS_BODY)
 
         message_id = _xml_text(message, "MsgId")
         from_user = _xml_text(message, "FromUserName")
-        text = _xml_text(message, "Content")
         if not message_id or not from_user:
             return WeComCallbackResult(400, "企业微信消息缺少 MsgId / FromUserName")
-        if not text:
-            logger.info("wecom.inbound.ignored type=text reason=empty")
-            return WeComCallbackResult(200, _SUCCESS_BODY)
+
+        if msg_type == "text":
+            text = _xml_text(message, "Content")
+            if not text:
+                logger.info("wecom.inbound.ignored type=text reason=empty")
+                return WeComCallbackResult(200, _SUCCESS_BODY)
+            parsed = _InboundMessage(
+                message_id=message_id, from_user=from_user, kind="text", text=text
+            )
+        else:
+            parsed = _parse_media_message(message, msg_type, message_id, from_user)
+            if isinstance(parsed, WeComCallbackResult):
+                return parsed
 
         # 以下都要知道这条频道归属哪个 Bot，否则 fail-closed。
         bot_id = self._bot_id
@@ -394,9 +457,42 @@ class WeComBotChannel:
             logger.warning("企业微信回调指向的 Bot 不存在 bot=%s", bot_id)
             return WeComCallbackResult(404, "FLUX_WECOM_BOT_ID 指向的 Bot 不存在")
 
+        if parsed.kind == "text":
+            files: list[Any] = []
+            content = parsed.text
+        else:
+            # 重推：turn 已存在就直接回 success，绝不再次下载媒体。
+            existing = await self._existing_turn(bot, message_id)
+            if existing is not None:
+                logger.info(
+                    "wecom.inbound.replay bot=%s message=%s turn=%s",
+                    bot_id,
+                    message_id,
+                    existing.id,
+                )
+                return WeComCallbackResult(200, _SUCCESS_BODY)
+            try:
+                files, content = await self._load_media(parsed)
+            except ValidationError as exc:
+                logger.warning(
+                    "企业微信入站媒体被拒绝 message=%s kind=%s reason=%s",
+                    message_id,
+                    parsed.kind,
+                    exc.message,
+                )
+                return WeComCallbackResult(200, _SUCCESS_BODY)
+            except Exception as exc:  # noqa: BLE001 - 下载异常不能拖垮进程
+                logger.warning(
+                    "企业微信入站媒体下载失败 message=%s kind=%s error=%s",
+                    message_id,
+                    parsed.kind,
+                    safe_error(exc),
+                )
+                return WeComCallbackResult(502, "企业微信媒体下载失败，请稍后重试")
+
         try:
             turn, created = await self._container.bot_conversation.create_turn(
-                bot, content=text, client_turn_id=message_id
+                bot, content=content, files=files, client_turn_id=message_id
             )
         except AIOSError as exc:
             logger.warning(
@@ -524,6 +620,51 @@ class WeComBotChannel:
             await close()
 
     # --- 内部 ---
+
+    async def _existing_turn(self, bot: Any, client_turn_id: str) -> Any | None:
+        finder = getattr(self._container.bot_conversation, "find_turn", None)
+        if finder is None:
+            return None
+        return await finder(bot, client_turn_id)
+
+    async def _load_media(self, parsed: _InboundMessage) -> tuple[list[Any], str]:
+        """下载一条图片/语音/文件并落盘；缺凭据时给中文说明而不是静默忽略。"""
+        label = _KIND_LABELS[parsed.kind]
+        sender = self._sender
+        if sender is None or not hasattr(sender, "download_media"):
+            logger.warning(
+                "企业微信入站媒体缺少应用凭据 message=%s kind=%s",
+                parsed.message_id,
+                parsed.kind,
+            )
+            return [], f"收到{label}，但未配置企业微信应用凭据，无法下载附件。"
+
+        media = await sender.download_media(parsed.media_id)
+        stem = {"image": "image", "voice": "voice", "file": "file"}[parsed.kind]
+        ext = f".{parsed.voice_format}" if parsed.kind == "voice" and parsed.voice_format else ""
+        name = pick_media_name(
+            preferred=parsed.file_name,
+            downloaded=media.name,
+            mime=media.mime,
+            stem=stem,
+            ext=ext or (".amr" if parsed.kind == "voice" else ""),
+        )
+        uploaded = await save_media(
+            self._container.settings,
+            DownloadedMedia(name=name, mime=media.mime, chunks=media.chunks),
+        )
+        if parsed.kind == "voice":
+            content = parsed.recognition or await transcribe_audio(self._transcriber, uploaded)
+        else:
+            content = ""
+        logger.info(
+            "企业微信入站媒体已落盘 message=%s kind=%s upload=%s bytes=%s",
+            parsed.message_id,
+            parsed.kind,
+            uploaded.id,
+            uploaded.size,
+        )
+        return [uploaded], content
 
     def _schedule_tracking(self, *, bot: Any, turn: Any, touser: str, message_id: str) -> None:
         task = asyncio.create_task(
@@ -698,6 +839,48 @@ def _xml_text(root: ET.Element, tag: str) -> str:
         return ""
     # 企业微信 XML 常用 CDATA；ElementTree 已还原为文本，这里只去首尾空白。
     return value.strip()
+
+
+def _parse_media_message(
+    message: ET.Element,
+    msg_type: str,
+    message_id: str,
+    from_user: str,
+) -> _InboundMessage | WeComCallbackResult:
+    """解析 image / voice / file 消息；缺 MediaId 属于永久问题，确认后忽略。"""
+    media_id = _xml_text(message, "MediaId")
+    if not media_id:
+        logger.info("wecom.inbound.ignored type=%s reason=missing_media_id", msg_type or "unknown")
+        return WeComCallbackResult(200, _SUCCESS_BODY)
+    if msg_type == "image":
+        return _InboundMessage(
+            message_id=message_id,
+            from_user=from_user,
+            kind="image",
+            media_id=media_id,
+        )
+    if msg_type == "voice":
+        return _InboundMessage(
+            message_id=message_id,
+            from_user=from_user,
+            kind="voice",
+            media_id=media_id,
+            voice_format=_voice_format(_xml_text(message, "Format")),
+            recognition=_xml_text(message, "Recognition"),
+        )
+    return _InboundMessage(
+        message_id=message_id,
+        from_user=from_user,
+        kind="file",
+        media_id=media_id,
+        file_name=_xml_text(message, "FileName"),
+    )
+
+
+def _voice_format(raw: str) -> str:
+    """语音格式只保留安全扩展名（amr / speex），避免拼进文件名时带奇怪字符。"""
+    value = raw.strip().lower().lstrip(".")
+    return value if re.fullmatch(r"[a-z0-9]{1,8}", value) else "amr"
 
 
 def _clip_text(text: str, max_bytes: int) -> str:

@@ -212,7 +212,8 @@ class BotTurnCreateRequest(BaseModel):
     `client_turn_id` 是幂等键：网络重试带同一个值不会产生第二轮。
     """
 
-    content: str = Field(min_length=1, max_length=20_000)
+    # 正文可留空——只发附件也是合法的一轮（与 /tasks/{id}/messages 同口径）。
+    content: str = Field(default="", max_length=20_000)
     attachment_ids: list[str] = Field(default_factory=list, max_length=5)
     client_turn_id: str | None = Field(default=None, max_length=128)
 
