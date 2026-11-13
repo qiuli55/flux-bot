@@ -267,6 +267,7 @@ async def create_bot_routine(
         name=payload.name,
         instruction=payload.instruction,
         schedule=payload.schedule,
+        run_at=payload.run_at,
         enabled=payload.enabled,
         event_triggers=payload.event_triggers,
     )

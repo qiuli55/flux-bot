@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -170,19 +171,23 @@ class BotRoutineCreateRequest(BaseModel):
 
     name: str = Field(min_length=1, max_length=64)
     instruction: str = Field(default="", max_length=8000)
-    #: 5 段 cron；留空 = 只手动触发
+    #: 5 段 cron；与 run_at 互斥，留空 = 非重复定时
     schedule: str | None = Field(default=None, max_length=64)
+    #: 一次性触发时刻（ISO 8601）；无时区按 Bot 时区解释，与 schedule 互斥
+    run_at: datetime | None = None
     enabled: bool = True
-    #: 可触发本例程的事件名；留空 = 只按 cron 跑
+    #: 可触发本例程的事件名；可与 schedule / run_at 组合，也可单独存在
     event_triggers: list[str] | None = Field(default=None, max_length=32)
 
 
 class BotRoutineUpdateRequest(BaseModel):
-    """部分更新例程；`schedule` 显式传 null 表示改成手动触发。"""
+    """部分更新例程；`schedule` 显式传 null 表示改成非 cron。"""
 
     name: str | None = Field(default=None, min_length=1, max_length=64)
     instruction: str | None = Field(default=None, max_length=8000)
     schedule: str | None = Field(default=None, max_length=64)
+    #: 显式传 run_at 表示改成一次性；与 schedule 互斥
+    run_at: datetime | None = None
     enabled: bool | None = None
     #: 显式传 null / [] 表示清空事件触发
     event_triggers: list[str] | None = Field(default=None, max_length=32)

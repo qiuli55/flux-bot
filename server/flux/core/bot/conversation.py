@@ -24,6 +24,7 @@ from flux.core.bot.turn_repository import TERMINAL_TURN_STATUSES, BotTurnReposit
 from flux.core.context.budget import history_message_limit
 from flux.core.github.service import normalize_account_key
 from flux.core.github.tools import GITHUB_TOOLS, run_github_tool
+from flux.core.mcp.tools.routine_tools import ROUTINE_TOOLS, run_routine_tool
 from flux.core.model_gateway.base import ChatMessage
 from flux.core.task_engine.assistant import AssistantTurn
 from flux.core.task_engine.context_usage import CONTEXT_MESSAGE_KINDS
@@ -422,23 +423,33 @@ class BotConversationService:
             )
         tool_kwargs = dict(github_kwargs)
         if subtask_bot is not None:
-            # 子任务工具只给 Bot 对话轮次：长活派到后台后，用户还能继续聊；
+            # 子任务 / 例程工具只给 Bot 对话轮次：长活派到后台后，用户还能继续聊；
             # 结果会以 kind=subtask 消息回到当前对话，不需要本轮阻塞等待。
+            # 例程工具让 Bot 直接按对话里的自然语言创建/管理自己的定时与事件触发。
             service = container.bot_subtasks
 
             async def _run_subtask(name: str, arguments: dict[str, Any]) -> Any:
                 return await run_subtask_tool(service, subtask_bot, name, arguments)
+
+            async def _run_routine(name: str, arguments: dict[str, Any]) -> Any:
+                return await run_routine_tool(container.bots, subtask_bot, name, arguments)
 
             existing_runner = tool_kwargs.get("tool_runner")
 
             async def _run_bot_tool(name: str, arguments: dict[str, Any]) -> Any:
                 if name.startswith("subtask_"):
                     return await _run_subtask(name, arguments)
+                if name.startswith("routine_"):
+                    return await _run_routine(name, arguments)
                 if existing_runner is not None:
                     return await existing_runner(name, arguments)
                 raise BadRequestError(f"当前对话不支持工具 {name}", details={"tool": name})
 
-            tool_kwargs["tools"] = [*tool_kwargs.get("tools", []), *SUBTASK_TOOLS]
+            tool_kwargs["tools"] = [
+                *tool_kwargs.get("tools", []),
+                *SUBTASK_TOOLS,
+                *ROUTINE_TOOLS,
+            ]
             tool_kwargs["tool_runner"] = _run_bot_tool
             subtask_note = (
                 "遇到耗时的长活（调研、批量整理、跨多个步骤的执行）时，优先调用 subtask_start "
@@ -446,10 +457,19 @@ class BotConversationService:
                 "子任务的结果会自动出现在这段对话里，"
                 "用户追问进度时可用 subtask_get / subtask_list 查询。"
             )
-            existing_note = str(tool_kwargs.get("tools_note") or "").strip()
-            tool_kwargs["tools_note"] = (
-                f"{existing_note}\n{subtask_note}" if existing_note else subtask_note
+            routine_note = (
+                "用户用自然语言提出定时/重复/一次性/事件触发的工作（例如「每天早上提醒我」"
+                "「明天下午三点做一次」「收到 GitHub push 或邮件时处理」）时，"
+                "由你直接调用 routine_create / routine_update / routine_pause / "
+                "routine_resume / routine_delete 为当前 Bot 管理例程，"
+                "不要让用户去设置页面或调用 API 手动配置。创建前先 routine_list，"
+                "已有同类例程就更新而不是重复创建；schedule 是 5 段 cron、run_at 是 "
+                "ISO 8601 时刻，二者都按 Bot 自己的时区解释且不能同时使用；"
+                "只跑一次的用 run_at，不要写成 cron。"
             )
+            existing_note = str(tool_kwargs.get("tools_note") or "").strip()
+            notes = [note for note in (existing_note, subtask_note, routine_note) if note]
+            tool_kwargs["tools_note"] = "\n".join(notes)
         try:
             # 任务选了自己的模型时，这一轮对话也用它回答（与后续 Agent 执行同一通道）
             channel = await container.key_vault.channel_for_task(task)

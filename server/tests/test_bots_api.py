@@ -15,6 +15,7 @@ import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
@@ -22,7 +23,7 @@ from fastapi.testclient import TestClient
 from flux.container import Container
 from flux.core.agent_runtime.runtimes.service import TaskRunService
 from flux.enums import TaskStatus
-from flux.errors import ConflictError
+from flux.errors import BadRequestError, ConflictError
 
 PREFIX = "/api/v1"
 
@@ -605,6 +606,170 @@ def test_routine_crud_via_api(client: TestClient) -> None:
 
     assert client.delete(f"{PREFIX}/bots/{bot['id']}/routines/{routine['id']}").status_code == 200
     assert client.get(f"{PREFIX}/bots/{bot['id']}/routines").json()["data"] == []
+
+
+def _as_utc(value: datetime) -> datetime:
+    return (
+        value.replace(tzinfo=timezone.utc)
+        if value.tzinfo is None
+        else value.astimezone(timezone.utc)
+    )
+
+
+def _utc_from_iso(value: str) -> datetime:
+    return _as_utc(datetime.fromisoformat(value))
+
+
+def test_routine_one_off_and_event_only_via_api(client: TestClient) -> None:
+    """一次性用 run_at（schedule 留空）；只订阅事件时 next_run_at 为空。"""
+    bot = _create(client, timezone="Asia/Shanghai")
+    run_at = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+    created = client.post(
+        f"{PREFIX}/bots/{bot['id']}/routines",
+        json={"name": "一次性", "instruction": "发邮件", "run_at": run_at.isoformat()},
+    )
+    assert created.status_code == 200, created.text
+    routine = created.json()["data"]
+    assert routine["schedule"] is None
+    assert _utc_from_iso(routine["next_run_at"]) == run_at
+
+    event = client.post(
+        f"{PREFIX}/bots/{bot['id']}/routines",
+        json={"name": "事件", "instruction": "处理", "event_triggers": ["email.received"]},
+    )
+    assert event.status_code == 200, event.text
+    data = event.json()["data"]
+    assert data["schedule"] is None
+    assert data["next_run_at"] is None
+    assert data["event_triggers"] == ["email.received"]
+
+
+def test_one_off_naive_run_at_uses_bot_timezone(client: TestClient) -> None:
+    bot = _create(client, timezone="Asia/Shanghai")
+    local = (datetime.now(ZoneInfo("Asia/Shanghai")) + timedelta(days=1)).replace(microsecond=0)
+    created = client.post(
+        f"{PREFIX}/bots/{bot['id']}/routines",
+        json={
+            "name": "本地时刻",
+            "instruction": "跑一次",
+            "run_at": local.replace(tzinfo=None).isoformat(),
+        },
+    )
+    assert created.status_code == 200, created.text
+    assert _utc_from_iso(created.json()["data"]["next_run_at"]) == local.astimezone(timezone.utc)
+
+
+def test_routine_create_requires_a_trigger_and_rejects_conflicts(client: TestClient) -> None:
+    bot = _create(client)
+    url = f"{PREFIX}/bots/{bot['id']}/routines"
+    run_at = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    assert client.post(url, json={"name": "空", "instruction": "x"}).status_code == 400
+    assert (
+        client.post(
+            url,
+            json={
+                "name": "冲突",
+                "instruction": "x",
+                "schedule": "0 9 * * *",
+                "run_at": run_at,
+            },
+        ).status_code
+        == 400
+    )
+    assert (
+        client.post(
+            url,
+            json={"name": "过去", "instruction": "x", "run_at": "2000-01-01T00:00:00Z"},
+        ).status_code
+        == 400
+    )
+
+
+def test_routine_pause_keeps_one_off_plan_and_resume_restores(client: TestClient) -> None:
+    bot = _create(client)
+    run_at = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+    routine = client.post(
+        f"{PREFIX}/bots/{bot['id']}/routines",
+        json={"name": "一次性", "instruction": "x", "run_at": run_at.isoformat()},
+    ).json()["data"]
+    url = f"{PREFIX}/bots/{bot['id']}/routines/{routine['id']}"
+
+    paused = client.patch(url, json={"enabled": False})
+    assert paused.status_code == 200, paused.text
+    assert paused.json()["data"]["enabled"] is False
+    # 暂停只停用：尚未执行的一次性时刻不能丢
+    assert _utc_from_iso(paused.json()["data"]["next_run_at"]) == run_at
+
+    resumed = client.patch(url, json={"enabled": True})
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["data"]["enabled"] is True
+    assert _utc_from_iso(resumed.json()["data"]["next_run_at"]) == run_at
+
+
+def test_routine_update_can_switch_between_cron_and_one_off(client: TestClient) -> None:
+    bot = _create(client)
+    routine = client.post(
+        f"{PREFIX}/bots/{bot['id']}/routines",
+        json={"name": "日报", "instruction": "写日报", "schedule": "0 9 * * *"},
+    ).json()["data"]
+    url = f"{PREFIX}/bots/{bot['id']}/routines/{routine['id']}"
+    run_at = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+
+    switched = client.patch(url, json={"run_at": run_at.isoformat()})
+    assert switched.status_code == 200, switched.text
+    data = switched.json()["data"]
+    assert data["schedule"] is None
+    assert _utc_from_iso(data["next_run_at"]) == run_at
+
+    cleared = client.patch(url, json={"schedule": None})
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["data"]["next_run_at"] is None
+
+
+def test_one_off_routine_runs_once_then_stops(container: Container) -> None:
+    async def _scenario() -> None:
+        bot = await container.bots.create(name="一次性巡检")
+        run_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        await container.bots.create_routine(
+            bot.id, name="只跑一次", instruction="发邮件", run_at=run_at
+        )
+
+        started = await container.bots.tick(run_at + timedelta(seconds=1))
+        assert len(started) == 1
+        task = await container.task_repo.get(uuid.UUID(started[0]))
+        assert task.description == "发邮件"
+        routines = await container.bots.list_routines(bot.id)
+        assert routines[0].next_run_at is None
+        assert routines[0].last_run_at is not None
+
+        # 已经跑过的一次性例程不再被调度
+        assert await container.bots.tick(run_at + timedelta(days=1)) == []
+
+    asyncio.run(_scenario())
+
+
+def test_spent_one_off_cannot_resume_without_new_run_at(container: Container) -> None:
+    async def _scenario() -> None:
+        bot = await container.bots.create(name="一次性巡检")
+        run_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        routine = await container.bots.create_routine(
+            bot.id, name="只跑一次", instruction="发邮件", run_at=run_at
+        )
+        await container.bots.tick(run_at + timedelta(seconds=1))
+
+        await container.bots.update_routine(bot.id, routine.id, {"enabled": False})
+        with pytest.raises(BadRequestError):
+            await container.bots.update_routine(bot.id, routine.id, {"enabled": True})
+
+        # 提供新的 run_at 后才能再预约
+        new_run_at = datetime.now(timezone.utc) + timedelta(days=1)
+        resumed = await container.bots.update_routine(
+            bot.id, routine.id, {"run_at": new_run_at, "enabled": True}
+        )
+        assert resumed.enabled is True
+        assert _as_utc(resumed.next_run_at) == new_run_at
+
+    asyncio.run(_scenario())
 
 
 def test_notifications_api_lists_and_marks_read(container: Container, client: TestClient) -> None:
