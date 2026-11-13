@@ -26,6 +26,8 @@ from flux.models.device import Device, PairingCode
 
 PREFIX = "/api/v1"
 ADMIN_TOKEN = "test-admin-token"
+#: 设备管理需要"这是谁"：测试默认把本机管理员当作主用户（Phase 1 起）。
+OWNER_ID = "1"
 #: 固定公网来源：限流按 client.host 分组，测试必须稳定命中同一个桶。
 PUBLIC_CLIENT = {"client": ("198.51.100.7", 41000)}
 ALPHABET = frozenset("ABCDEFGHJKLMNPQRSTUVWXYZ23456789")
@@ -37,7 +39,11 @@ def _auth(token: str) -> dict[str, str]:
 
 @contextmanager
 def _client_for(settings: Settings, **updates: object) -> Iterator[TestClient]:
-    secured = settings.model_copy(update={"auth_token": ADMIN_TOKEN, **updates})
+    # Phase 1 起签发配对码必须能解析"这是谁"：默认把管理员当作主用户，
+    # 需要验证拒绝路径的用例可显式传 owner_cloud_user_id=None 覆盖。
+    secured = settings.model_copy(
+        update={"auth_token": ADMIN_TOKEN, "owner_cloud_user_id": OWNER_ID, **updates}
+    )
     app = create_app(secured)
     with TestClient(app, **PUBLIC_CLIENT) as client:
         yield client
@@ -241,9 +247,11 @@ def test_last_seen_is_recorded_after_authenticated_request(
 def test_cli_devices_pair_returns_code(
     settings: Settings, db_schema: None, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    code = main(["devices", "pair"], settings=settings)
+    cli_settings = settings.model_copy(update={"owner_cloud_user_id": OWNER_ID})
+    code = main(["devices", "pair"], settings=cli_settings)
     payload = json.loads(capsys.readouterr().out)
 
     assert code == 0
     assert len(payload["data"]["code"]) == 8
     assert set(payload["data"]["code"]) <= ALPHABET
+    assert payload["data"]["cloud_user_id"] == OWNER_ID
