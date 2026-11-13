@@ -16,6 +16,11 @@
 #   1) --allowed-hosts 只写服务名会被 403 拒绝（客户端发的 Host 带端口）；
 #   2) 输出目录挂到镜像里不存在的 /data/output 会因 root:root 属主 EACCES。
 # 细节见下方各参数旁的注释与 docs/browser-agent.md 的「两个已知坑」。
+#
+# 2026-11-14：默认改为持久化 profile。--user-data-dir 落在 playwright-home 卷的
+# /home/node/profiles/<profile id>，浏览器进程重启与容器重建后登录态仍在；
+# 不再使用 --isolated。profile id 由 FLUX_BROWSER_PROFILE_ID 配置（默认 default），
+# 重置方式见 docs/browser-agent.md 与 scripts/reset-browser-profile.sh。
 
 services:
   flux-bot:
@@ -39,8 +44,15 @@ services:
       - "--browser"
       - "chromium"
       - "--no-sandbox"
-      # profile 只放内存：容器重建即清空，不残留登录态。
-      - "--isolated"
+      # profile 持久化到命名卷上的目录：浏览器进程重启（包括 MCP 空闲超时后
+      # 重新拉起）、容器 stop/start、compose down/up 之后登录态都还在。
+      # 不要同时使用 --isolated：它与 --user-data-dir 互斥，且会把 profile 只放内存。
+      # 目录按 profile id 分层，默认 default；多用户部署时把
+      # FLUX_BROWSER_PROFILE_ID 设为账号 / 用户 id，各人使用各自的子目录。
+      # 这里的 ${...} 由 docker compose 插值（shell 环境或项目根的 .env），
+      # 想写真正的字面量美元符要用 $$。
+      - "--user-data-dir"
+      - "/home/node/profiles/${FLUX_BROWSER_PROFILE_ID:-default}"
       - "--port"
       - "8931"
       - "--host"
@@ -67,10 +79,11 @@ services:
     restart: unless-stopped
     volumes:
       # 挂到 /home/node：该目录在镜像里已存在且属于 node，空命名卷首次挂载时
-      # 会继承其属主，因此 node 能直接往里写 output。若挂到镜像里不存在的路径
+      # 会继承其属主，因此 node 能直接往里写。若挂到镜像里不存在的路径
       # （例如 /data/output），Docker 会以 root:root 创建挂载点，node 写不进去。
-      # 截图与下载产物落到 playwright-home/output。profile 因 --isolated 放在
-      # 内存里；若改用 --user-data-dir 持久化 profile，需要再给它单独挂一个卷。
+      # 截图与下载产物落到 /home/node/output；持久化 profile 落在
+      # /home/node/profiles/<profile id>。二者共用同一个 node 可写的 home 卷，
+      # 重置 profile 时只删 profiles/<id> 子目录，不会连带删掉 output。
       - playwright-home:/home/node
     networks:
       - browser
