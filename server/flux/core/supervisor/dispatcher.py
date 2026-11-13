@@ -119,13 +119,13 @@ class SupervisorDispatcher:
         runs: TaskRunService,
         agents: AgentManager,
         *,
-        dsh: Any = None,
+        supervisor: Any = None,
     ) -> None:
         self._repo = repo
         self._tasks = tasks
         self._runs = runs
         self._agents = agents
-        self._dsh = dsh
+        self._supervisor = supervisor
 
     # --- 角色 ---
 
@@ -283,10 +283,10 @@ class SupervisorDispatcher:
         """停止工单：能停 Run 就停 Run，再按平台事实写一条 cancelled 报告。"""
         latest = (await self._repo.latest_assignments([ticket.id])).get(ticket.id)
         stopped_run = ""
-        if latest is not None and latest.run_id and self._dsh is not None:
+        if latest is not None and latest.run_id and self._supervisor is not None:
             try:
-                result = await self._dsh.cancel(latest.run_id)
-                stopped_run = str(getattr(result, "status", ""))
+                result = await self._supervisor.cancel(latest.run_id)
+                stopped_run = str(result)
             except NotFoundError:
                 stopped_run = ""
         if ticket.task_id is not None:
@@ -326,10 +326,10 @@ class SupervisorDispatcher:
         if assignment.status not in {"dispatched", "running"}:
             return {"ticket_id": str(ticket.id), "expired": False, "reason": "派活已结束"}
         stopped_run = ""
-        if assignment.run_id and self._dsh is not None:
+        if assignment.run_id and self._supervisor is not None:
             try:
-                result = await self._dsh.cancel(assignment.run_id)
-                stopped_run = str(getattr(result, "status", ""))
+                result = await self._supervisor.cancel(assignment.run_id)
+                stopped_run = str(result)
             except Exception:  # noqa: BLE001 - Run 已不在 / 通道异常都不能阻断回收
                 logger.warning(
                     "Supervisor 回收时停 Run 失败 assignment=%s run=%s",
