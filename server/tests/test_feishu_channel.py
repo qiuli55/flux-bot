@@ -13,9 +13,11 @@ import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -32,6 +34,11 @@ from flux.core.channels.feishu_crypto import (
     decrypt_payload,
     encrypt_payload,
     verify_signature,
+)
+from flux.core.channels.inbound_media import (
+    VOICE_ASR_FAILED_TEXT,
+    VOICE_NO_ASR_TEXT,
+    DownloadedMedia,
 )
 from flux.core.task_engine.assistant import AssistantTurn
 from flux.main import create_app
@@ -60,42 +67,79 @@ class _FakeBots:
 class _FakeConversation:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
-        self.seen: set[str] = set()
+        self.find_calls: list[str | None] = []
+        self.by_client_id: dict[str, Any] = {}
         self.turns: list[Any] = []
 
     async def create_turn(
-        self, bot: Any, *, content: str, client_turn_id: str | None = None
+        self,
+        bot: Any,
+        *,
+        content: str,
+        files: list[Any] | None = None,
+        client_turn_id: str | None = None,
     ) -> tuple[Any, bool]:
         self.calls.append(
             {
                 "bot_id": bot.id,
                 "content": content,
+                "files": list(files or ()),
                 "client_turn_id": client_turn_id,
             }
         )
-        if client_turn_id is not None and client_turn_id in self.seen:
-            existing = self.turns[0]
-            return existing, False
-        if client_turn_id is not None:
-            self.seen.add(client_turn_id)
+        if client_turn_id is not None and client_turn_id in self.by_client_id:
+            return self.by_client_id[client_turn_id], False
         turn = SimpleNamespace(id=uuid.uuid4(), task_id=uuid.uuid4())
         self.turns.append(turn)
+        if client_turn_id is not None:
+            self.by_client_id[client_turn_id] = turn
         return turn, True
+
+    async def find_turn(self, bot: Any, client_turn_id: str | None) -> Any | None:
+        self.find_calls.append(client_turn_id)
+        if client_turn_id is None:
+            return None
+        return self.by_client_id.get(client_turn_id)
 
     async def wait_for_turn(self, bot_id: uuid.UUID, turn_id: uuid.UUID, *, wait_seconds: float):
         return SimpleNamespace(id=turn_id, status="failed", reply_message_id=None)
 
 
+async def _chunks(*parts: bytes):
+    for part in parts:
+        yield part
+
+
 class _FakeSender:
-    def __init__(self, *, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        error: Exception | None = None,
+        payload: bytes = b"media-bytes",
+        mime: str = "application/octet-stream",
+        name: str = "",
+        parts: list[bytes] | None = None,
+    ) -> None:
         self.messages: list[tuple[str, str]] = []
         self.error = error
         self.closed = False
+        self.payload = payload
+        self.mime = mime
+        self.name = name
+        self.parts = parts
+        self.downloads: list[dict[str, Any]] = []
 
     async def send_text(self, chat_id: str, text: str) -> None:
         self.messages.append((chat_id, text))
         if self.error is not None:
             raise self.error
+
+    async def download_media(self, **kwargs: Any) -> DownloadedMedia:
+        self.downloads.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        parts = self.parts if self.parts is not None else [self.payload]
+        return DownloadedMedia(name=self.name, mime=self.mime, chunks=_chunks(*parts))
 
     async def aclose(self) -> None:
         self.closed = True
@@ -125,10 +169,12 @@ def _plain_body(
     text: str = "你好",
     event_type: str = "im.message.receive_v1",
     chat_id: str = CHAT_ID,
+    content: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     header: dict[str, Any] = {"event_id": "evt_test", "event_type": event_type}
     if token is not None:
         header["token"] = token
+    body = content if content is not None else {"text": text}
     return {
         "schema": "2.0",
         "header": header,
@@ -138,10 +184,22 @@ def _plain_body(
                 "message_id": message_id,
                 "chat_id": chat_id,
                 "message_type": message_type,
-                "content": json.dumps({"text": text}, ensure_ascii=False),
+                "content": json.dumps(body, ensure_ascii=False),
             },
         },
     }
+
+
+def _media_body(
+    message_type: str,
+    content: dict[str, Any],
+    *,
+    message_id: str = MESSAGE_ID,
+) -> bytes:
+    return json.dumps(
+        _plain_body(message_type=message_type, message_id=message_id, content=content),
+        ensure_ascii=False,
+    ).encode()
 
 
 def _signed_headers(raw: bytes, *, encrypt_key: str = ENCRYPT_KEY) -> dict[str, str]:
@@ -162,16 +220,24 @@ def _encrypted_envelope(
     return {"encrypt": encrypted}, body
 
 
-def _unit_channel(*, bot_id: str | None = None, **kwargs: Any) -> FeishuBotChannel:
+def _unit_channel(
+    *,
+    settings: Settings | None = None,
+    sender: Any | None = None,
+    bot_id: str | None = None,
+    **kwargs: Any,
+) -> FeishuBotChannel:
     bot = SimpleNamespace(id=uuid.uuid4(), name="飞书小助", status="active")
     container = SimpleNamespace(
         bots=_FakeBots(bot),
         bot_conversation=_FakeConversation(),
+        settings=settings,
     )
     return FeishuBotChannel(
         container,  # type: ignore[arg-type]
         verification_token=VERIFY_TOKEN,
         bot_id=bot_id or str(bot.id),
+        sender=sender,
         **kwargs,
     )
 
@@ -358,11 +424,15 @@ async def test_encrypted_event_creates_turn_and_is_idempotent() -> None:
     await channel.aclose()
 
 
-async def test_non_text_and_unknown_events_are_ignored() -> None:
+async def test_unsupported_message_types_and_unknown_events_are_ignored() -> None:
     channel = _unit_channel()
-    image = await channel.handle(json.dumps(_plain_body(message_type="image")).encode(), {})
-    assert image.status_code == 200
-    assert image.payload["ignored"] is True
+    # 表情 / 位置 / 链接 / 视频仍然 200 忽略；图片/文件/语音已支持，不再忽略。
+    for message_type in ("sticker", "location", "share_chat", "media", "video", "post"):
+        ignored = await channel.handle(
+            json.dumps(_plain_body(message_type=message_type)).encode(), {}
+        )
+        assert ignored.status_code == 200, message_type
+        assert ignored.payload["ignored"] is True, message_type
 
     other = await channel.handle(
         json.dumps(_plain_body(event_type="im.chat.updated_v1")).encode(), {}
@@ -375,6 +445,180 @@ async def test_non_text_and_unknown_events_are_ignored() -> None:
 
     conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
     assert conversation.calls == []
+    await channel.aclose()
+
+
+# --- 入站媒体 ---
+
+
+async def test_inbound_image_downloads_and_creates_turn(settings: Settings) -> None:
+    sender = _FakeSender(payload=b"\x89PNG-image", mime="image/png", name="photo.png")
+    channel = _unit_channel(settings=settings, sender=sender)
+
+    result = await channel.handle(_media_body("image", {"image_key": "img_key_1"}), {})
+    assert result.status_code == 200, result.payload
+    assert result.payload["created"] is True
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    call = conversation.calls[0]
+    assert call["content"] == ""
+    assert len(call["files"]) == 1
+    uploaded = call["files"][0]
+    assert uploaded.name == "photo.png"
+    assert uploaded.mime == "image/png"
+    assert uploaded.size == len(b"\x89PNG-image")
+    assert Path(uploaded.path).is_file()
+    assert Path(uploaded.path).resolve().is_relative_to(Path(settings.uploads_dir).resolve())
+    assert sender.downloads == [
+        {"message_id": MESSAGE_ID, "file_key": "img_key_1", "resource_type": "image"}
+    ]
+    await channel.aclose()
+
+
+async def test_inbound_file_keeps_platform_filename(settings: Settings) -> None:
+    sender = _FakeSender(payload=b"%PDF-1.7", mime="application/pdf")
+    channel = _unit_channel(settings=settings, sender=sender)
+
+    result = await channel.handle(
+        _media_body("file", {"file_key": "file_key_1", "file_name": "季度报告.pdf"}), {}
+    )
+    assert result.status_code == 200, result.payload
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    uploaded = conversation.calls[0]["files"][0]
+    assert uploaded.name == "季度报告.pdf"
+    assert uploaded.mime == "application/pdf"
+    assert uploaded.size == len(b"%PDF-1.7")
+    assert sender.downloads[0]["resource_type"] == "file"
+    await channel.aclose()
+
+
+async def test_inbound_voice_without_asr_keeps_audio_and_explains(settings: Settings) -> None:
+    sender = _FakeSender(payload=b"opus-bytes", mime="audio/opus")
+    channel = _unit_channel(settings=settings, sender=sender)
+
+    result = await channel.handle(_media_body("audio", {"file_key": "audio_key_1"}), {})
+    assert result.status_code == 200, result.payload
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    call = conversation.calls[0]
+    assert call["content"] == VOICE_NO_ASR_TEXT
+    assert len(call["files"]) == 1
+    assert call["files"][0].mime == "audio/opus"
+    # 语音必须用 type=file；type=audio 会被飞书拒绝。
+    assert sender.downloads[0]["resource_type"] == "file"
+    await channel.aclose()
+
+
+async def test_inbound_voice_uses_platform_recognition(settings: Settings) -> None:
+    sender = _FakeSender(payload=b"opus", mime="audio/opus")
+    channel = _unit_channel(settings=settings, sender=sender)
+
+    await channel.handle(
+        _media_body("audio", {"file_key": "audio_key_2", "recognition": "明天十点开会"}), {}
+    )
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    assert conversation.calls[0]["content"] == "明天十点开会"
+    assert len(conversation.calls[0]["files"]) == 1
+    await channel.aclose()
+
+
+async def test_inbound_voice_uses_injected_transcriber(settings: Settings) -> None:
+    class _Transcriber:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, str]] = []
+
+        async def transcribe(self, *, path: str, name: str, mime: str) -> str:
+            self.calls.append({"path": path, "name": name, "mime": mime})
+            return "转写出来的文字"
+
+    transcriber = _Transcriber()
+    sender = _FakeSender(payload=b"amr-bytes", mime="audio/amr")
+    channel = _unit_channel(settings=settings, sender=sender, transcriber=transcriber)
+
+    await channel.handle(_media_body("audio", {"file_key": "audio_key_3"}), {})
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    call = conversation.calls[0]
+    assert call["content"] == "转写出来的文字"
+    uploaded = call["files"][0]
+    assert transcriber.calls == [
+        {"path": uploaded.path, "name": uploaded.name, "mime": uploaded.mime}
+    ]
+    await channel.aclose()
+
+
+async def test_inbound_voice_transcriber_failure_is_explained(settings: Settings) -> None:
+    class _BrokenTranscriber:
+        async def transcribe(self, *, path: str, name: str, mime: str) -> str:
+            raise RuntimeError("asr boom access_token=secret")
+
+    sender = _FakeSender(payload=b"amr", mime="audio/amr")
+    channel = _unit_channel(settings=settings, sender=sender, transcriber=_BrokenTranscriber())
+
+    result = await channel.handle(_media_body("audio", {"file_key": "audio_key_4"}), {})
+    assert result.status_code == 200
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    call = conversation.calls[0]
+    assert call["content"] == VOICE_ASR_FAILED_TEXT
+    assert len(call["files"]) == 1
+    await channel.aclose()
+
+
+async def test_inbound_media_replay_does_not_download_twice(settings: Settings) -> None:
+    sender = _FakeSender(payload=b"img", mime="image/png", name="a.png")
+    channel = _unit_channel(settings=settings, sender=sender)
+    raw = _media_body("image", {"image_key": "img_replay"})
+
+    first = await channel.handle(raw, {})
+    second = await channel.handle(raw, {})
+    assert first.status_code == 200 and second.status_code == 200
+    assert first.payload["created"] is True
+    assert second.payload["created"] is False
+    assert second.payload["turn_id"] == first.payload["turn_id"]
+
+    assert len(sender.downloads) == 1
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    assert len(conversation.calls) == 1
+    await channel.aclose()
+
+
+async def test_inbound_media_over_50mb_is_acknowledged_without_upload(
+    settings: Settings,
+) -> None:
+    megabyte = b"x" * (1024 * 1024)
+    sender = _FakeSender(mime="application/octet-stream", parts=[megabyte] * 51)
+    channel = _unit_channel(settings=settings, sender=sender)
+
+    result = await channel.handle(_media_body("file", {"file_key": "huge"}), {})
+    assert result.status_code == 200
+    assert result.payload["ignored"] is True
+    assert "50MB" in result.payload["reason"]
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    assert conversation.calls == []
+    # 半成品必须清理掉，上传目录里不留任何文件
+    assert list(Path(settings.uploads_dir).glob("*")) == []
+    await channel.aclose()
+
+
+async def test_inbound_media_without_credentials_explains_in_chinese(
+    settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("DEBUG")
+    channel = _unit_channel(settings=settings)  # 没有 app_id/app_secret → 无发送端
+
+    result = await channel.handle(_media_body("image", {"image_key": "img_no_creds"}), {})
+    assert result.status_code == 200
+    assert result.payload["created"] is True
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    call = conversation.calls[0]
+    assert "未配置飞书应用凭据" in call["content"]
+    assert call["files"] == []
+    assert "access_token" not in caplog.text.lower()
     await channel.aclose()
 
 
@@ -665,5 +909,82 @@ def test_feishu_bot_sender_uses_official_send_api() -> None:
         assert send["json"]["receive_id"] == CHAT_ID
         assert send["json"]["msg_type"] == "text"
         assert json.loads(send["json"]["content"]) == {"text": "确认后的文本"}
+
+    asyncio.run(scenario())
+
+
+def test_feishu_sender_downloads_media_via_official_api() -> None:
+    """官方「获取消息中的资源文件」：路径、type 参数与鉴权头都要正确。"""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/tenant_access_token/internal"):
+            return httpx.Response(
+                200, json={"code": 0, "tenant_access_token": "t-token", "expire": 7200}
+            )
+        return httpx.Response(
+            200,
+            content=b"binary-image",
+            headers={
+                "content-type": "image/png",
+                "content-disposition": 'attachment; filename="download.png"',
+            },
+        )
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            sender = FeishuBotSender(
+                app_id="app",
+                app_secret="secret",
+                api_base="https://open.feishu.cn",
+                client=http_client,
+            )
+            media = await sender.download_media(
+                message_id="om_1", file_key="img_key", resource_type="image"
+            )
+            assert media.mime == "image/png"
+            assert media.name == "download.png"
+            chunks = [chunk async for chunk in media.chunks]
+            assert b"".join(chunks) == b"binary-image"
+
+            # 语音必须按官方要求用 type=file（type=audio 会 400）。
+            audio = await sender.download_media(
+                message_id="om_2", file_key="audio_key", resource_type="file"
+            )
+            _ = [chunk async for chunk in audio.chunks]
+            await sender.aclose()
+
+    asyncio.run(scenario())
+
+    assert [request.url.path for request in requests] == [
+        "/open-apis/auth/v3/tenant_access_token/internal",
+        "/open-apis/im/v1/messages/om_1/resources/img_key",
+        "/open-apis/im/v1/messages/om_2/resources/audio_key",
+    ]
+    image_call, audio_call = requests[1], requests[2]
+    assert image_call.method == "GET"
+    assert image_call.url.params["type"] == "image"
+    assert image_call.headers["Authorization"] == "Bearer t-token"
+    assert audio_call.url.params["type"] == "file"
+
+
+def test_feishu_sender_surfaces_json_error_instead_of_saving_it() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/tenant_access_token/internal"):
+            return httpx.Response(200, json={"code": 0, "tenant_access_token": "t", "expire": 7200})
+        return httpx.Response(
+            200,
+            json={"code": 234003, "msg": "resource not found"},
+            headers={"content-type": "application/json"},
+        )
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            sender = FeishuBotSender(app_id="app", app_secret="secret", client=http_client)
+            with pytest.raises(RuntimeError) as excinfo:
+                await sender.download_media(message_id="om", file_key="bad")
+            assert "resource not found" in str(excinfo.value)
+            await sender.aclose()
 
     asyncio.run(scenario())
