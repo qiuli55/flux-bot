@@ -347,22 +347,46 @@ class BotService:
         name: str,
         instruction: str = "",
         schedule: str | None = None,
+        run_at: datetime | str | None = None,
         enabled: bool = True,
         event_triggers: list[str] | None = None,
     ) -> BotRoutine:
+        """新建例程：cron 重复、run_at 一次性、event_triggers 事件触发可组合。
+
+        `schedule` 与 `run_at` 互斥；`event_triggers` 可以和任一组合，也可以单独存在。
+        至少提供三者之一，否则没有可执行的触发条件。
+        """
         bot = await self._repo.get(bot_id)
         cleaned = (name or "").strip()
         if not cleaned:
             raise BadRequestError("例程名称不能为空")
-        cron = self._cron(schedule, tz=self._zone_for(bot))
+        zone = self._zone_for(bot)
+        cron = self._cron(schedule, tz=zone)
+        run_at_utc = self._run_at(run_at, bot)
+        events = self._event_list(event_triggers)
+        if cron is not None and run_at_utc is not None:
+            raise BadRequestError(
+                "schedule 与 run_at 不能同时指定：重复定时用 schedule，只跑一次用 run_at",
+                details={"schedule": cron.expression, "run_at": run_at_utc.isoformat()},
+            )
+        if cron is None and run_at_utc is None and not events:
+            raise BadRequestError(
+                "例程至少需要 schedule、run_at、event_triggers 之一",
+                details={"bot_id": str(bot_id)},
+            )
+        if cron is not None:
+            next_run_at = cron.next_after(_utcnow()) if enabled else None
+        else:
+            # run_at 无论启停都保留计划时刻：暂停只停用，恢复时才能接着原计划跑。
+            next_run_at = run_at_utc
         routine = await self._routines.create(
             bot_id=bot_id,
             name=cleaned[:64],
             instruction=(instruction or "").strip()[:8000],
             schedule=cron.expression if cron else None,
-            next_run_at=cron.next_after(_utcnow()) if cron and enabled else None,
+            next_run_at=next_run_at,
             enabled=enabled,
-            event_triggers=self._event_list(event_triggers),
+            event_triggers=events,
         )
         await self._refresh_triggers()
         return routine
@@ -385,20 +409,55 @@ class BotService:
             values["name"] = name[:64]
         if "instruction" in changes:
             values["instruction"] = (changes["instruction"] or "").strip()[:8000]
-        if "schedule" in changes:
-            values["schedule"] = (
-                self._cron(changes["schedule"], tz=zone).expression if changes["schedule"] else None
-            )
-        if "enabled" in changes:
-            values["enabled"] = bool(changes["enabled"])
         if "event_triggers" in changes:
             values["event_triggers"] = self._event_list(changes["event_triggers"])
 
-        if "schedule" in values or "enabled" in values:
-            enabled = bool(values.get("enabled", routine.enabled))
-            schedule = values.get("schedule", routine.schedule)
+        schedule_given = "schedule" in changes
+        run_at_given = "run_at" in changes
+        enabled_given = "enabled" in changes
+
+        schedule = routine.schedule
+        if schedule_given:
+            cron = self._cron(changes["schedule"], tz=zone)
+            schedule = cron.expression if cron else None
+            values["schedule"] = schedule
+
+        run_at = self._run_at(changes["run_at"], bot) if run_at_given else None
+        if run_at is not None:
+            if schedule_given and schedule is not None:
+                raise BadRequestError(
+                    "schedule 与 run_at 不能同时指定：重复定时用 schedule，只跑一次用 run_at",
+                    details={"schedule": schedule, "run_at": run_at.isoformat()},
+                )
+            # run_at 表示一次性：自动清掉原 cron，只保留这一次触发时刻。
+            schedule = None
+            values["schedule"] = None
+
+        enabled = bool(changes["enabled"]) if enabled_given else bool(routine.enabled)
+        if enabled_given:
+            values["enabled"] = enabled
+        events = values.get("event_triggers", routine.event_triggers)
+
+        if run_at is not None:
+            values["next_run_at"] = run_at
+        elif schedule_given:
             cron = self._cron(schedule, tz=zone)
-            values["next_run_at"] = cron.next_after(_utcnow()) if cron and enabled else None
+            values["next_run_at"] = cron.next_after(_utcnow()) if cron else None
+        elif enabled_given and enabled and not routine.enabled:
+            cron = self._cron(schedule, tz=zone)
+            if cron is not None:
+                values["next_run_at"] = cron.next_after(_utcnow())
+            elif routine.next_run_at is not None:
+                # 尚未执行的一次性例程：恢复暂停前的原计划。
+                pass
+            elif not events:
+                raise BadRequestError(
+                    "该例程没有可执行的计划（一次性已跑完或未设置触发条件），"
+                    "请提供新的 run_at 或 schedule 后再恢复",
+                    details={"routine_id": str(routine_id)},
+                )
+        # 只把 enabled 改成 false 时保留 next_run_at：暂停只停用，恢复才重新计时。
+
         if not values:
             return routine
         updated = await self._routines.update(routine_id, values)
@@ -1013,6 +1072,38 @@ class BotService:
     def _cron_for(self, bot: Bot, expression: str | None) -> CronSchedule | None:
         """按 Bot 自己的时区解析 cron；未设置时继承进程级 FLUX_TIMEZONE。"""
         return self._cron(expression, tz=self._zone_for(bot))
+
+    def _run_at(self, value: datetime | str | None, bot: Bot) -> datetime | None:
+        """解析一次性触发时刻：无时区按 Bot 时区解释，统一转成 UTC。
+
+        一次性例程不新增列，复用 `next_run_at` 表达「只跑这一次」；因此这里必须
+        拒绝过去时刻，避免刚创建就被调度器当成已到期。
+        """
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            moment = value
+        elif isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise BadRequestError(
+                    f"run_at 不是合法的 ISO 8601 时间：{text}", details={"run_at": text}
+                ) from exc
+        else:
+            raise BadRequestError(
+                "run_at 必须是 ISO 8601 字符串或 datetime",
+                details={"run_at": str(value)},
+            )
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=self._zone_for(bot))
+        moment = moment.astimezone(timezone.utc)
+        if moment <= _utcnow():
+            raise BadRequestError("run_at 必须是未来时刻", details={"run_at": moment.isoformat()})
+        return moment
 
     def _zone(self, timezone: str | None) -> ZoneInfo:
         if not timezone:

@@ -183,6 +183,79 @@ class OutboundDraftService:
             await session.commit()
             return result.rowcount == 1
 
+    async def next_queued(self, *, channel: str, task_id: uuid.UUID) -> OutboundDraft | None:
+        """同一任务/频道里最早排队、尚未挂审批卡的 pending 草稿。
+
+        `decision_id IS NULL` 是「已落库但还没展示审批卡」的排队标记；卡片一旦
+        挂出就会回填 decision_id，因此这里不会把当前正在显示的草稿再取一次。
+        """
+        statement = (
+            select(OutboundDraft)
+            .where(
+                OutboundDraft.channel == channel,
+                OutboundDraft.task_id == task_id,
+                OutboundDraft.status == OutboundDraftStatus.PENDING.value,
+                OutboundDraft.decision_id.is_(None),
+            )
+            .order_by(OutboundDraft.created_at.asc(), OutboundDraft.id.asc())
+            .limit(1)
+        )
+        async with self._session_factory() as session:
+            return await session.scalar(statement)
+
+    async def claim_for_approval(
+        self, draft_id: uuid.UUID, decision_id: str
+    ) -> OutboundDraft | None:
+        """原子地把排队草稿（decision_id 为空）绑定到一张即将挂出的审批卡。
+
+        多个事件处理器同时想提升同一条草稿时，只有第一个能把 decision_id 从
+        NULL 写进去，其余拿到 None 并继续看下一条，保证一张卡只挂一次。
+        """
+        if not decision_id:
+            return None
+        now = _utcnow()
+        async with self._session_factory() as session:
+            result = await session.execute(
+                update(OutboundDraft)
+                .where(
+                    OutboundDraft.id == draft_id,
+                    OutboundDraft.status == OutboundDraftStatus.PENDING.value,
+                    OutboundDraft.decision_id.is_(None),
+                )
+                .values(decision_id=decision_id, updated_at=now)
+            )
+            if result.rowcount != 1:
+                await session.rollback()
+                return None
+            row = await session.get(OutboundDraft, draft_id)
+            await session.commit()
+            if row is None:  # pragma: no cover - 同一事务内被删除的极端情况
+                return None
+            logger.info(
+                "outbound_draft.approval_claimed id=%s channel=%s decision=%s",
+                row.id,
+                row.channel,
+                decision_id,
+            )
+            return row
+
+    async def release_approval(self, draft_id: uuid.UUID, decision_id: str) -> bool:
+        """挂卡失败时把草稿退回队列；只撤自己刚写入的那次绑定。"""
+        if not decision_id:
+            return False
+        async with self._session_factory() as session:
+            result = await session.execute(
+                update(OutboundDraft)
+                .where(
+                    OutboundDraft.id == draft_id,
+                    OutboundDraft.status == OutboundDraftStatus.PENDING.value,
+                    OutboundDraft.decision_id == decision_id,
+                )
+                .values(decision_id=None, updated_at=_utcnow())
+            )
+            await session.commit()
+            return result.rowcount == 1
+
     async def claim(self, draft_id: uuid.UUID) -> OutboundDraft | None:
         """原子认领 pending → sending；已被认领/已是终态时返回 None。"""
         now = _utcnow()

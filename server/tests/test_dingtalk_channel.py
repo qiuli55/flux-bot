@@ -218,6 +218,37 @@ def _wait_pending_decision(client: TestClient, task_id: str, timeout: float = 8.
     raise AssertionError("等待钉钉出站审批超时")
 
 
+def _wait_queued_drafts(
+    client: TestClient, task_id: str, count: int, timeout: float = 8.0
+) -> list[dict]:
+    """等该对话出现指定数量的「已落库、尚未挂卡」草稿，并按入队顺序返回。"""
+    deadline = time.monotonic() + timeout
+    rows: list[dict] = []
+    while time.monotonic() < deadline:
+        data = client.get(
+            f"{PREFIX}/outbound-drafts", params={"channel": "dingtalk", "status": "pending"}
+        ).json()["data"]
+        rows = [row for row in data if row["task_id"] == task_id and row["decision_id"] is None]
+        if len(rows) >= count:
+            return sorted(rows, key=lambda row: row["created_at"])
+        time.sleep(0.02)
+    raise AssertionError(f"等待钉钉排队草稿超时：期望 {count}，实际 {len(rows)}")
+
+
+def _wait_next_pending(
+    client: TestClient, task_id: str, previous_id: str, timeout: float = 8.0
+) -> dict:
+    """等上一张卡被解决后新挂出的那张卡。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        body = client.get(f"{PREFIX}/tasks/{task_id}").json()["data"]
+        pending = body.get("pending_decision")
+        if pending is not None and pending["id"] != previous_id:
+            return pending
+        time.sleep(0.02)
+    raise AssertionError("等待钉钉下一张出站审批卡超时")
+
+
 def _dingtalk_settings(settings: Settings, **updates: object) -> Settings:
     return settings.model_copy(
         update={
@@ -671,6 +702,118 @@ def test_send_error_is_logged_and_does_not_break_decision(
         assert failed["body"] == "echo: 你好"
         assert failed["error"]
         assert "echo: 你好" not in failed["error"]
+
+
+def test_pending_decision_queues_replies_and_drains_in_order(
+    settings: Settings, db_schema: None
+) -> None:
+    """BUG-H：已有待决策项时不丢回复，排队后按顺序逐条挂卡。"""
+    with _callback_client(settings) as (client, _container, context):
+        query, raw = _encrypted_request(_message_payload(msg_id="ding-q1", text="第一条"))
+        _assert_encrypted_success(client.post(WEBHOOK, params=query, content=raw))
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        task_id = bot["chat_task_id"]
+        card_a = _wait_pending_decision(client, task_id)
+
+        # 第二、三条回复在 A 卡未解决时到达：落库排队，不丢弃。
+        for msg_id, text in (("ding-q2", "第二条"), ("ding-q3", "第三条")):
+            query, raw = _encrypted_request(_message_payload(msg_id=msg_id, text=text))
+            _assert_encrypted_success(client.post(WEBHOOK, params=query, content=raw))
+        queued = _wait_queued_drafts(client, task_id, 2)
+        assert [row["body"] for row in queued] == ["echo: 第二条", "echo: 第三条"]
+
+        task = client.get(f"{PREFIX}/tasks/{task_id}").json()["data"]
+        assert task["pending_decision"]["id"] == card_a["id"]
+        assert all(row["status"] == "pending" for row in queued)
+
+        allowed = client.post(
+            f"{PREFIX}/tasks/{task_id}/decisions/choose",
+            json={"decision_id": card_a["id"], "action": "choose", "option": "允许"},
+        )
+        assert allowed.status_code == 200, allowed.text
+        card_b = _wait_next_pending(client, task_id, card_a["id"])
+        assert card_b["meta"]["draft_id"] == queued[0]["id"]
+        assert card_b["kind"] == DINGTALK_OUTBOUND_KIND
+        assert card_b["meta"]["message_id"] == "ding-q2"
+        assert [text for _dest, text in context["sender"].messages] == ["echo: 第一条"]
+
+        denied = client.post(
+            f"{PREFIX}/tasks/{task_id}/decisions/choose",
+            json={"decision_id": card_b["id"], "action": "choose", "option": "拒绝"},
+        )
+        assert denied.status_code == 200, denied.text
+        card_c = _wait_next_pending(client, task_id, card_b["id"])
+        assert card_c["meta"]["draft_id"] == queued[1]["id"]
+        assert card_c["meta"]["message_id"] == "ding-q3"
+        assert [text for _dest, text in context["sender"].messages] == ["echo: 第一条"]
+
+        allowed_c = client.post(
+            f"{PREFIX}/tasks/{task_id}/decisions/choose",
+            json={"decision_id": card_c["id"], "action": "choose", "option": "允许"},
+        )
+        assert allowed_c.status_code == 200, allowed_c.text
+        assert [text for _dest, text in context["sender"].messages] == [
+            "echo: 第一条",
+            "echo: 第三条",
+        ]
+        task = client.get(f"{PREFIX}/tasks/{task_id}").json()["data"]
+        assert task["pending_decision"] is None
+
+        drafts = client.get(f"{PREFIX}/outbound-drafts", params={"channel": "dingtalk"}).json()[
+            "data"
+        ]
+        assert [row["status"] for row in sorted(drafts, key=lambda row: row["created_at"])] == [
+            "sent",
+            "denied",
+            "sent",
+        ]
+
+
+def test_outbound_option_text_is_about_sending_not_commands(
+    settings: Settings, db_schema: None
+) -> None:
+    """BUG-I：出站卡片的描述/影响只谈发送，不复用终端命令文案。"""
+    with _callback_client(settings) as (client, _container, context):
+        query, raw = _encrypted_request(_message_payload())
+        _assert_encrypted_success(client.post(WEBHOOK, params=query, content=raw))
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        pending = _wait_pending_decision(client, bot["chat_task_id"])
+
+        assert [option["label"] for option in pending["options"]] == ["允许", "拒绝"]
+        allow, deny = pending["options"]
+        for option in (allow, deny):
+            text = f"{option['description']} {option['impact']}"
+            assert "命令" not in text
+            assert "终端" not in text
+            assert "执行" not in text
+        assert "发送" in allow["impact"]
+        assert "无法撤回" in allow["impact"]
+        assert "不会发送" in deny["impact"]
+        assert "草稿" in deny["impact"]
+
+
+def test_cancel_shown_draft_releases_card_and_promotes_next(
+    settings: Settings, db_schema: None
+) -> None:
+    """取消当前卡片对应的草稿也算决策已解决：下一张排队卡会自动出现。"""
+    with _callback_client(settings) as (client, _container, context):
+        query, raw = _encrypted_request(_message_payload(msg_id="ding-c1", text="第一条"))
+        _assert_encrypted_success(client.post(WEBHOOK, params=query, content=raw))
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        task_id = bot["chat_task_id"]
+        card_a = _wait_pending_decision(client, task_id)
+
+        query, raw = _encrypted_request(_message_payload(msg_id="ding-c2", text="第二条"))
+        _assert_encrypted_success(client.post(WEBHOOK, params=query, content=raw))
+        queued = _wait_queued_drafts(client, task_id, 1)
+
+        cancelled = client.post(f"{PREFIX}/outbound-drafts/{card_a['meta']['draft_id']}/cancel")
+        assert cancelled.status_code == 200, cancelled.text
+        assert cancelled.json()["data"]["status"] == "cancelled"
+
+        card_b = _wait_next_pending(client, task_id, card_a["id"])
+        assert card_b["meta"]["draft_id"] == queued[0]["id"]
+        assert context["sender"].messages == []
 
 
 def test_pending_draft_survives_process_restart(settings: Settings, db_schema: None) -> None:

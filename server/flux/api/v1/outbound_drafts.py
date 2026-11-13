@@ -7,13 +7,16 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends
 
 from flux.api.deps import get_container
 from flux.api.response import ok
 from flux.container import Container
-from flux.enums import OutboundDraftStatus
+from flux.core.event.bus import Events
+from flux.enums import DecisionStatus, OutboundDraftStatus, TaskStatus
 from flux.errors import BadRequestError, NotFoundError
 
 router = APIRouter(prefix="/outbound-drafts", tags=["outbound-drafts"])
@@ -82,9 +85,51 @@ async def cancel_outbound_draft(
     draft_id: str,
     container: Container = Depends(get_container),
 ) -> dict[str, object]:
-    """取消尚未发送的草稿；已发送 / 已拒绝 / 已取消 / 失败的草稿返回 409。"""
+    """取消尚未发送的草稿；已发送 / 已拒绝 / 已取消 / 失败的草稿返回 409。
+
+    如果取消的正是当前挂着审批卡的那条草稿，同时把对应决策点收尾并发一次
+    `task.approval_resolved`：卡片不会继续悬空，频道侧也会据此把下一条排队
+    回复提升出来（取消同样算「上一张卡已解决」）。
+    """
     row = await container.outbound_drafts.cancel(_draft_id(draft_id))
+    await _release_cancelled_decision(container, row)
     return ok(row.to_dict())
+
+
+async def _release_cancelled_decision(container: Container, row: Any) -> None:
+    """把已取消草稿对应的 pending 决策点置为终态并通知订阅者。"""
+    if not row.decision_id or row.task_id is None:
+        return
+    try:
+        task = await container.task_repo.get(row.task_id)
+    except NotFoundError:
+        return
+    pending = task.pending_decision()
+    if pending is None or pending.get("id") != row.decision_id:
+        # 排队的草稿（还没挂卡）或卡片已被别的路径解决，不需要再动决策点。
+        return
+    resolved_at = datetime.now(timezone.utc).isoformat()
+    task, _record = await container.task_repo.resolve_decision(
+        row.task_id,
+        row.decision_id,
+        status=DecisionStatus.REJECTED,
+        chosen=None,
+        note="出站草稿已取消，未发送",
+        resolved_at=resolved_at,
+    )
+    if task.status == TaskStatus.WAITING_FOR_USER_DECISION.value:
+        await container.task_repo.set_status(row.task_id, TaskStatus.RUNNING)
+    await container.bus.publish(
+        Events.APPROVAL_RESOLVED,
+        {
+            "task_id": str(row.task_id),
+            "decision_id": row.decision_id,
+            "result": "cancelled",
+            "chosen": None,
+            "kind": pending.get("kind"),
+            "meta": pending.get("meta") or {},
+        },
+    )
 
 
 __all__ = ["router"]

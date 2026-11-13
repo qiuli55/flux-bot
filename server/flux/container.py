@@ -5,6 +5,7 @@ M0 是单进程装配。后续拆分微服务（§17.2 后端服务拆分）时�
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -224,6 +225,8 @@ class Container:
     bot_conversation: BotConversationService = field(init=False)
     #: 统一出站草稿：正文与状态落库，审批通过后原子认领并发送一次
     outbound_drafts: OutboundDraftService = field(init=False)
+    #: 出站审批卡的串行闸门：三个频道共享，保证同一对话同一时刻只挂一张卡
+    outbound_approval_lock: asyncio.Lock = field(init=False)
     #: 频道入站活动（最近接收 / 近期错误）：进程内登记，重启清空
     channel_activity: ChannelActivityRegistry = field(init=False)
     #: 浏览器 MCP 探活（2 秒超时 + 30 秒缓存）：进程内单例，避免状态轮询打爆 sidecar
@@ -561,6 +564,9 @@ class Container:
         self.bot_conversation = BotConversationService(self)
         # 统一出站草稿：飞书等频道把待发送正文落库，审批结果只做状态迁移。
         self.outbound_drafts = OutboundDraftService(self.session_factory)  # type: ignore[attr-defined]
+        # 出站审批卡串行闸门：飞书 / 企业微信 / 钉钉共用一把锁，避免同一对话
+        # 同时挂出多张卡（`pending_decision()` 只认最后一张）。
+        self.outbound_approval_lock = asyncio.Lock()
         # 入站活动与浏览器探活都是进程内状态：不落库、重启清空，只服务状态接口。
         self.channel_activity = ChannelActivityRegistry()
         self.browser_probe = BrowserStatusProbe()

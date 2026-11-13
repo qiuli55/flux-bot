@@ -44,6 +44,48 @@ APPROVAL_DENY = "拒绝"
 APPROVAL_TIMEOUT_SECONDS = 600
 _POLL_INTERVAL_SECONDS = 0.5
 
+
+def _command_approval_options() -> list[dict[str, Any]]:
+    """命令审批卡的文案：只描述在终端会话里执行/不执行这条命令。"""
+    return [
+        {
+            "label": APPROVAL_ALLOW,
+            "description": "仅本次有效，执行完即失效",
+            "impact": "允许后该命令会立刻在终端会话中执行",
+            "recommended": False,
+        },
+        {
+            "label": APPROVAL_DENY,
+            "description": "默认建议：先拒绝，让 Agent 说明为什么非做不可",
+            "impact": "拒绝后命令不会执行，Agent 会收到明确错误",
+            "recommended": True,
+        },
+    ]
+
+
+def outbound_approval_options(channel_label: str) -> list[dict[str, Any]]:
+    """出站审批卡的文案：只描述发送/不发送这条回复，绝不提终端命令。
+
+    label 仍复用「允许 / 拒绝」，与 `choose` 接口的取值保持一致；description /
+    impact 单独成文，避免出站卡片误用命令审批的说法。
+    """
+    target = (channel_label or "").strip() or "对应频道"
+    return [
+        {
+            "label": APPROVAL_ALLOW,
+            "description": "仅本次有效，只发送这一条出站回复",
+            "impact": f"允许后会立即把这条回复发送到{target}；发送后无法撤回",
+            "recommended": False,
+        },
+        {
+            "label": APPROVAL_DENY,
+            "description": "默认建议：先拒绝，核对内容后再决定是否重发",
+            "impact": "拒绝后不会发送，草稿仍保留在草稿箱",
+            "recommended": True,
+        },
+    ]
+
+
 _FINAL_TASK_STATUSES = {
     TaskStatus.COMPLETED.value,
     TaskStatus.FAILED.value,
@@ -88,28 +130,19 @@ async def raise_approval(
     detail: str,
     meta: dict[str, Any],
     decision_id: str | None = None,
+    options: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """把一条审批请求写成强制 pending 的决策记录 + 对话消息，返回记录本身。
 
     `decision_id` 可选：调用方需要提前把审批 id 写进关联记录（如出站草稿）时，
     先自行生成并传入，保证两边在审批卡可见前就指向同一个 id。
+
+    `options` 可选：默认是命令审批文案；出站审批传入
+    `outbound_approval_options(...)`，让卡片描述「发送 / 不发送」而不是执行命令。
     """
     record = build_decision(
         question=title,
-        options=[
-            {
-                "label": APPROVAL_ALLOW,
-                "description": "仅本次有效，执行完即失效",
-                "impact": "允许后该命令会立刻在终端会话中执行",
-                "recommended": False,
-            },
-            {
-                "label": APPROVAL_DENY,
-                "description": "默认建议：先拒绝，让 Agent 说明为什么非做不可",
-                "impact": "拒绝后命令不会执行，Agent 会收到明确错误",
-                "recommended": True,
-            },
-        ],
+        options=options if options is not None else _command_approval_options(),
         context=detail,
         recommendation=None,
         # MANUAL 才能保证 pending；auto 模式也不允许代替用户批准
@@ -270,6 +303,7 @@ __all__ = [
     "ApprovalCancelledError",
     "ApprovalDeniedError",
     "ApprovalTimeoutError",
+    "outbound_approval_options",
     "raise_approval",
     "wait_for_approval",
 ]
