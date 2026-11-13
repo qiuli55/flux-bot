@@ -344,9 +344,13 @@ def _wait_log(
     bot_id: str,
     subtask_id: str,
     *,
-    timeout: float = 5.0,
+    timeout: float = 15.0,
 ) -> bool:
-    """等某条带 bot/subtask id 的日志出现（状态与结果先落库，日志紧随其后）。"""
+    """等某条带 bot/subtask id 的日志出现（状态与结果先落库，日志紧随其后）。
+
+    终态与结果先落库，收尾日志要等父对话消息与总线事件发完才写；全量测试并行
+    负载高时这段收尾可能明显变慢，故等待窗口留足余量，避免按机器负载偶发失败。
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if any(
