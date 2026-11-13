@@ -16,14 +16,18 @@ catalog / install / uninstall 走账号侧框架（`Container.connector_framewor
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 
 from flux.api.deps import get_container
 from flux.api.response import ok
 from flux.container import Container
 from flux.core.github.service import ACCOUNT_HEADER, normalize_account_key
 from flux.enums import Capability
-from flux.schemas.api import ConnectorExecuteRequest, ConnectorInstallRequest
+from flux.schemas.api import (
+    ConnectorExecuteRequest,
+    ConnectorInstallRequest,
+    EmailSendRequest,
+)
 
 router = APIRouter(prefix="/connectors", tags=["connectors"])
 
@@ -71,6 +75,66 @@ async def disconnect_github(
 ) -> dict[str, object]:
     account_key = _account_key(request)
     return ok(await container.github.disconnect(account_key))
+
+
+# --- Email（IMAP 收信 / SMTP 发信）----------------------------------------
+# 这些动作都要求当前账号已安装 email 连接器：未安装 404，凭据解密失败 503，
+# IMAP/SMTP 上游失败 502。响应里永远不出现密码；正文只在单封邮件接口返回。
+
+
+@router.get("/email/messages")
+async def list_email_messages(
+    request: Request,
+    mailbox: str = Query(default="INBOX", max_length=255),
+    limit: int = Query(default=20, ge=1, le=50),
+    container: Container = Depends(get_container),
+) -> dict[str, object]:
+    """列出邮件头（不含正文），最新的在前。"""
+    account_key = _account_key(request)
+    messages = await container.email.list_messages(account_key, mailbox=mailbox, limit=limit)
+    return ok({"messages": messages, "mailbox": mailbox, "count": len(messages)})
+
+
+@router.get("/email/messages/{message_id}")
+async def get_email_message(
+    message_id: str,
+    request: Request,
+    mailbox: str = Query(default="INBOX", max_length=255),
+    container: Container = Depends(get_container),
+) -> dict[str, object]:
+    """读取一封邮件；优先 text/plain，只有 HTML 时返回 HTML 正文。"""
+    account_key = _account_key(request)
+    message = await container.email.get_message(account_key, message_id, mailbox=mailbox)
+    return ok(message)
+
+
+@router.post("/email/send")
+async def send_email_message(
+    payload: EmailSendRequest,
+    request: Request,
+    container: Container = Depends(get_container),
+) -> dict[str, object]:
+    """通过 SMTP 发送一封邮件（不会自动发送，也不会创建草稿）。"""
+    account_key = _account_key(request)
+    result = await container.email.send_message(
+        account_key,
+        to=payload.to,
+        cc=payload.cc,
+        subject=payload.subject,
+        body=payload.body,
+        content_type=payload.content_type,
+    )
+    return ok(result)
+
+
+@router.post("/email/test")
+async def test_email_connection(
+    request: Request,
+    container: Container = Depends(get_container),
+) -> dict[str, object]:
+    """分别验证 IMAP / SMTP 连接与登录，不发送真实邮件。"""
+    account_key = _account_key(request)
+    return ok(await container.email.test_connection(account_key))
 
 
 @router.post("/{connector_id}/install")

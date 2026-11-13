@@ -554,15 +554,30 @@ class ConnectorInstallRequest(BaseModel):
 
     - api_key 类连接器：必须提供 `api_key`；
     - oauth 类连接器：本接口只做校验并提示改用对应登录流程（GitHub 为设备码登录）。
+    - email：`api_key` 是邮箱密码 / 应用专用密码，`settings` 承载 IMAP/SMTP
+      主机、端口与 SSL 开关；密码也可以放在 `settings.password`（两者须一致）。
+    - calendar：`settings` 承载 mode / url / username / password / timeout；
+      公开 ICS 订阅允许空密码。
     """
 
     auth_type: str | None = Field(default=None, max_length=32)
     api_key: str | None = Field(default=None, max_length=4096)
     #: 不传时使用 catalog 定义里的默认 scopes。
     scopes: list[str] | None = Field(default=None, max_length=64)
-    #: 连接器专属配置（日历：mode / url / username / password / timeout）。
-    #: 密码也可以放在 api_key；接口响应与日志都不会回显这里的内容。
+    #: 连接器专属配置（email 的 imap_host / smtp_host / port / ssl；
+    #: 日历的 mode / url / username / password / timeout）。
+    #: 与密码一起封装进加密凭据，绝不单独明文落库，接口响应与日志也不会回显。
     settings: dict[str, Any] | None = Field(default=None)
+
+
+class EmailSendRequest(BaseModel):
+    """发送一封邮件（不落草稿、不自动发送）。"""
+
+    to: str | list[str]
+    cc: str | list[str] | None = None
+    subject: str = Field(min_length=1, max_length=998)
+    body: str = Field(default="", max_length=262144)
+    content_type: str = Field(default="text/plain", max_length=32)
 
 
 class CalendarEventCreateRequest(BaseModel):
