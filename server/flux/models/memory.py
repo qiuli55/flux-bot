@@ -7,16 +7,19 @@
 User 条目的 key 恒为 NULL——同一唯一约束下多个 NULL 互相不冲突，两类写入共用一张表。
 
 Phase 2 起 User 层按人隔离：`cloud_user_id` 记录这条记忆属于哪个 Flux 云用户。
-Environment 层是平台规则，保持全局，该列留 NULL；历史 User 行的 NULL 归
-`FLUX_OWNER_CLOUD_USER_ID` 配置的主用户（见 `flux.core.user_scope`）。
+Phase 3 增加 Shared 层：`layer="shared"` + `space_id`，访问权由共享空间成员决定；
+User / Environment 行的 `space_id` 恒为 NULL。Environment 层是平台规则，保持全局，
+该列留 NULL；历史 User 行的 NULL 归 `FLUX_OWNER_CLOUD_USER_ID` 配置的主用户
+（见 `flux.core.user_scope`）。
 """
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, String, Text, UniqueConstraint
+from sqlalchemy import JSON, DateTime, ForeignKey, String, Text, UniqueConstraint, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from flux.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -32,8 +35,16 @@ class MemoryEntry(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     layer: Mapped[str] = mapped_column(String(16), index=True)
     # 平台维护条目的稳定标识（如 runtime.proposal_required）；User 条目为 NULL
     key: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    #: User 记忆的归属人（Flux 云用户 id）；Environment 恒为 NULL
+    #: User / Shared 记忆的归属人（Flux 云用户 id）；Environment 恒为 NULL
     cloud_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    #: Shared 记忆所属的共享空间；User / Environment 恒为 NULL。
+    #: 唯一约束仍是 (layer, key)：shared 行不用 key（恒 NULL），按 space_id 查询隔离。
+    space_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("spaces.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     content: Mapped[str] = mapped_column(Text)
     # 来源记录：这条记忆是"谁以什么方式"写的（user / platform），便于审计与清理
     source: Mapped[str] = mapped_column(String(64), default="", server_default="")
@@ -49,6 +60,7 @@ class MemoryEntry(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "layer": self.layer,
             "key": self.key,
             "cloud_user_id": self.cloud_user_id,
+            "space_id": str(self.space_id) if self.space_id is not None else None,
             "content": self.content,
             "source": self.source,
             "metadata": self.meta or {},

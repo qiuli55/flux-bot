@@ -91,6 +91,7 @@ class TaskRepository:
         bot_id: uuid.UUID | None = None,
         workspace: str | None = None,
         parent_task_id: uuid.UUID | None = None,
+        cloud_user_id: str | None = None,
     ) -> Task:
         """写入一条 pending 任务。project_id 指向不存在的项目时抛 NotFoundError。
 
@@ -126,6 +127,7 @@ class TaskRepository:
                 bot_id=bot_id,
                 parent_task_id=parent_task_id,
                 workspace=(workspace or "").strip() or None,
+                cloud_user_id=(cloud_user_id or "").strip() or None,
             )
             session.add(task)
             await self._commit(session)

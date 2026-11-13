@@ -905,11 +905,36 @@ async def raise_decision(
     return ok({"task": _task_dict(task), "decision": record, "message": message.to_dict()})
 
 
+async def _require_outbound_decision_owned(
+    container: Container, pending: dict[str, Any], cloud_user_id: str | None
+) -> None:
+    """出站审批卡里带 draft_id 时，先确认草稿属于当前登录人。"""
+    kind = str(pending.get("kind") or "")
+    if not kind.endswith("_outbound"):
+        return
+    meta = pending.get("meta")
+    meta = meta if isinstance(meta, dict) else {}
+    raw_draft_id = str(meta.get("draft_id") or "").strip()
+    if not raw_draft_id:
+        return
+    try:
+        draft_id = uuid.UUID(raw_draft_id)
+    except ValueError as exc:
+        raise NotFoundError(
+            f"出站草稿 {raw_draft_id} 不存在", details={"draft_id": raw_draft_id}
+        ) from exc
+    if cloud_user_id is None:
+        # 分不清是谁时 fail-closed：别人的审批一律不可见。
+        raise NotFoundError(f"出站草稿 {raw_draft_id} 不存在", details={"draft_id": raw_draft_id})
+    await container.outbound_drafts.get(draft_id, cloud_user_id=cloud_user_id)
+
+
 @router.post("/{task_id}/decisions/choose")
 async def choose_decision(
     task_id: str,
     payload: DecisionChooseRequest,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """用户对挂起的决策点做选择（文档 §5 模式 B）。
 
@@ -927,6 +952,8 @@ async def choose_decision(
             f"决策点 {payload.decision_id} 不是当前待决策项",
             details={"decision_id": payload.decision_id, "pending": pending.get("id")},
         )
+    # 出站草稿审批同样按人隔离：不能替别人放行 / 拒绝一条回复。
+    await _require_outbound_decision_owned(container, pending, cloud_user_id)
 
     if payload.action == "reject":
         record = reject_decision(pending, note=payload.note)

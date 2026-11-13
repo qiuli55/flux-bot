@@ -124,6 +124,8 @@ class _PendingTurn:
     bot_id: uuid.UUID
     content: str
     files: tuple[UploadedFile, ...] = ()
+    #: 本轮代表哪个 Flux 云用户；绑定 IM / API 登录人由调用方带进来。
+    cloud_user_id: str | None = None
 
 
 class BotConversationService:
@@ -156,6 +158,7 @@ class BotConversationService:
         content: str,
         files: list[UploadedFile] | None = None,
         client_turn_id: str | None = None,
+        cloud_user_id: str | None = None,
     ) -> tuple[BotTurn, bool]:
         """落一条 queued turn 并交给该 Bot 的后台队列。
 
@@ -194,7 +197,10 @@ class BotConversationService:
 
         task = await self._chat_task(bot)
         turn, created = await self._turns.create(
-            bot_id=bot.id, task_id=task.id, client_turn_id=client_turn_id
+            bot_id=bot.id,
+            task_id=task.id,
+            client_turn_id=client_turn_id,
+            cloud_user_id=cloud_user_id,
         )
         if created:
             self._enqueue(
@@ -203,6 +209,7 @@ class BotConversationService:
                     bot_id=bot.id,
                     content=text,
                     files=tuple(files),
+                    cloud_user_id=cloud_user_id,
                 )
             )
         return turn, created
@@ -433,7 +440,13 @@ class BotConversationService:
                 return await run_subtask_tool(service, subtask_bot, name, arguments)
 
             async def _run_routine(name: str, arguments: dict[str, Any]) -> Any:
-                return await run_routine_tool(container.bots, subtask_bot, name, arguments)
+                return await run_routine_tool(
+                    container.bots,
+                    subtask_bot,
+                    name,
+                    arguments,
+                    cloud_user_id=account_key or None,
+                )
 
             existing_runner = tool_kwargs.get("tool_runner")
 
@@ -667,6 +680,9 @@ class BotConversationService:
             return
 
         meta = {"turn_id": str(turn.id)}
+        # 本轮的人格：绑定的 IM 发送者 / API 登录人。没有则保持 NULL，
+        # 由 `complete_turn` 按历史口径回退到主用户。
+        turn_cloud_user_id = pending.cloud_user_id or turn.cloud_user_id
         files = list(pending.files)
         # 只有附件没有正文时，用户消息与记忆检索都用附件说明，避免落一条空消息。
         prompt_content = pending.content or attachments_brief(files)
@@ -678,12 +694,12 @@ class BotConversationService:
             memory = await container.bot_memories.render_block(
                 bot, group_id=None, query=prompt_content, limit=_MEMORY_LIMIT
             )
-            # 共享用户记忆叠加在 Bot 自己的记忆之上：两者并存，互不替代。
-            # 共享层失败只降级为「只有 Bot 记忆」，不能挡住这一轮对话。
-            shared_memory = await self._shared_memory_block()
+            # 三层记忆按本轮的人格注入：Environment（平台规则）+ 该用户的 User 层
+            # + 该用户所在共享空间的 Shared 层。绝不注入未按人隔离的全局画像/日志。
+            user_memory = await self._memory_block(turn_cloud_user_id)
             # 技能库注入：与记忆并列，失败只降级为「没有技能块」。
             skills = await self._skills_block(bot)
-            context_parts = [part for part in (memory, shared_memory, skills) if part]
+            context_parts = [part for part in (memory, user_memory, skills) if part]
             description = (bot.description or "").strip() or bot.name
             user_message = await self.begin_user_turn(
                 task,
@@ -700,6 +716,7 @@ class BotConversationService:
                 files=files,
                 description=description,
                 context="\n".join(context_parts) or None,
+                account_key=turn_cloud_user_id or "",
                 subtask_bot=bot,
                 advance_status=False,
                 stream_meta=meta,
@@ -716,15 +733,20 @@ class BotConversationService:
         finally:
             self._active_turns.pop(pending.bot_id, None)
 
-    async def _shared_memory_block(self) -> str:
-        """读取跨 Bot 共享记忆；任何失败都降级为空串，不影响本轮对话。"""
-        service = getattr(self._container, "shared_user_memory", None)
-        if service is None:
+    async def _memory_block(self, cloud_user_id: str | None) -> str:
+        """按本轮人格读取三层记忆（Environment + User + 共享空间 Shared）。
+
+        读取失败只降级为「没有记忆块」，不影响本轮对话。没有可解析的人时，
+        MemoryService 的既有口径是回退到配置的主用户（兼容历史行为）。
+        """
+        memory = getattr(self._container, "memory", None)
+        if memory is None:
             return ""
         try:
-            return await service.render_block()
-        except Exception:  # noqa: BLE001 - 共享记忆只是增强，失败不能打断 turn
-            logger.warning("共享用户记忆渲染失败，本轮仅使用 Bot 记忆", exc_info=True)
+            data = await memory.recall(cloud_user_id=cloud_user_id)
+            return str(data.get("content") or "")
+        except Exception:  # noqa: BLE001 - 记忆只是上下文增强，失败不能打断 turn
+            logger.warning("Bot 记忆渲染失败，本轮仅使用 Bot 记忆", exc_info=True)
             return ""
 
     async def _skills_block(self, bot: Bot) -> str:

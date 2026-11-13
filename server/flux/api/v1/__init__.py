@@ -9,6 +9,7 @@ from flux.api.v1 import (
     bots,
     browser,
     capabilities,
+    channel_bindings,
     channels_status,
     codex_account,
     connector_calendar,
@@ -29,6 +30,7 @@ from flux.api.v1 import (
     pages,
     projects,
     skills,
+    spaces,
     supervisor,
     tasks,
     terminal,
@@ -46,6 +48,9 @@ api_v1_router.include_router(channels_status.router)
 api_v1_router.include_router(browser.router)
 api_v1_router.include_router(billing.router)
 api_v1_router.include_router(keys.router)
+# Phase 3：IM 绑定与共享空间（都要求已登录的 Flux 账号）
+api_v1_router.include_router(channel_bindings.router)
+api_v1_router.include_router(spaces.router)
 api_v1_router.include_router(installations.router)
 api_v1_router.include_router(tasks.router)
 api_v1_router.include_router(bots.router)

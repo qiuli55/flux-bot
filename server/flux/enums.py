@@ -282,12 +282,24 @@ class MemoryLayer(StrEnum):
 
     - USER：跨 Workspace 的偏好与约定，用户确认后才写，可查可删；
     - PROJECT：每个 Workspace / Project 自动沉淀（底座是 Project Brain）；
-    - ENVIRONMENT：Flux 运行规则，全局、由平台代码维护，优先于普通项目上下文。
+    - ENVIRONMENT：Flux 运行规则，全局、由平台代码维护，优先于普通项目上下文；
+    - SHARED：某个共享空间内的记忆，只有该空间的成员能读写（Phase 3）。
     """
 
     USER = "user"
     PROJECT = "project"
     ENVIRONMENT = "environment"
+    SHARED = "shared"
+
+
+class SpaceRole(StrEnum):
+    """共享空间成员角色（Phase 3）。
+
+    只有 owner 能增删成员；owner / member 都能读写本空间的 shared 记忆。
+    """
+
+    OWNER = "owner"
+    MEMBER = "member"
 
 
 class AcceptMode(StrEnum):

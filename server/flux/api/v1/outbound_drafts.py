@@ -10,8 +10,9 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 
+from flux.api.account_scope import account_key_for_request
 from flux.api.deps import get_container
 from flux.api.response import ok
 from flux.container import Container
@@ -53,6 +54,7 @@ def _status(value: str) -> str:
 
 @router.get("")
 async def list_outbound_drafts(
+    request: Request,
     bot_id: str | None = None,
     channel: str | None = None,
     status: str | None = None,
@@ -62,11 +64,13 @@ async def list_outbound_drafts(
     """按 Bot / 频道 / 状态列出草稿，最新在前（正文随响应返回给用户自己看）。"""
     if limit < 1 or limit > 200:
         raise BadRequestError("limit 必须在 1~200 之间", details={"limit": limit})
+    cloud_user_id = account_key_for_request(request, container.settings)
     rows = await container.outbound_drafts.list(
         bot_id=_bot_uuid(bot_id) if bot_id else None,
         channel=(channel or "").strip() or None,
         status=_status(status) if status else None,
         limit=limit,
+        cloud_user_id=cloud_user_id,
     )
     return ok([row.to_dict() for row in rows], metadata={"count": len(rows)})
 
@@ -74,15 +78,18 @@ async def list_outbound_drafts(
 @router.get("/{draft_id}")
 async def get_outbound_draft(
     draft_id: str,
+    request: Request,
     container: Container = Depends(get_container),
 ) -> dict[str, object]:
-    row = await container.outbound_drafts.get(_draft_id(draft_id))
+    cloud_user_id = account_key_for_request(request, container.settings)
+    row = await container.outbound_drafts.get(_draft_id(draft_id), cloud_user_id=cloud_user_id)
     return ok(row.to_dict())
 
 
 @router.post("/{draft_id}/cancel")
 async def cancel_outbound_draft(
     draft_id: str,
+    request: Request,
     container: Container = Depends(get_container),
 ) -> dict[str, object]:
     """取消尚未发送的草稿；已发送 / 已拒绝 / 已取消 / 失败的草稿返回 409。
@@ -91,7 +98,8 @@ async def cancel_outbound_draft(
     `task.approval_resolved`：卡片不会继续悬空，频道侧也会据此把下一条排队
     回复提升出来（取消同样算「上一张卡已解决」）。
     """
-    row = await container.outbound_drafts.cancel(_draft_id(draft_id))
+    cloud_user_id = account_key_for_request(request, container.settings)
+    row = await container.outbound_drafts.cancel(_draft_id(draft_id), cloud_user_id=cloud_user_id)
     await _release_cancelled_decision(container, row)
     return ok(row.to_dict())
 

@@ -25,7 +25,7 @@ from flux.core.mcp.tools.base import (
     require_str,
 )
 from flux.enums import Capability, MemoryLayer
-from flux.errors import ValidationError
+from flux.errors import NotFoundError, ValidationError
 
 MEMORY_RECALL_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -66,7 +66,12 @@ async def memory_recall(ctx: ToolContext, params: dict[str, Any]) -> dict[str, A
         task_id = optional_str(params, "task_id")
         if task_id is not None:
             project_id = await _project_from_task(ctx, task_id)
-    return await ctx.container.memory.recall(project_id=project_id)
+    # MCP 请求没有登录态：本次 Run 的任务行是唯一可靠的「这是谁」。
+    # 解析不到时返回 None，由 MemoryService 按历史口径回退主用户。
+    return await ctx.container.memory.recall(
+        project_id=project_id,
+        cloud_user_id=await _cloud_user_for_run(ctx),
+    )
 
 
 async def memory_remember(ctx: ToolContext, params: dict[str, Any]) -> dict[str, Any]:
@@ -82,7 +87,8 @@ async def memory_remember(ctx: ToolContext, params: dict[str, Any]) -> dict[str,
             f"记忆内容不能超过 {MAX_REMEMBER_CHARS} 字",
             details={"param": "content", "max": MAX_REMEMBER_CHARS},
         )
-    entries = await ctx.container.memory.list_entries(layer=MemoryLayer.USER)
+    user_id = await _cloud_user_for_run(ctx)
+    entries = await ctx.container.memory.list_entries(layer=MemoryLayer.USER, cloud_user_id=user_id)
     normalized = _normalize(content)
     for entry in entries:
         if _normalize(entry.content) == normalized:
@@ -91,12 +97,28 @@ async def memory_remember(ctx: ToolContext, params: dict[str, Any]) -> dict[str,
         content=content,
         source="auto",
         meta={"auto": True, "origin": "agent", "agent_id": ctx.identity.agent_id},
+        cloud_user_id=user_id,
     )
     return {"saved": True, "duplicate": False, "id": str(entry.id), "content": entry.content}
 
 
 def _normalize(text: str) -> str:
     return " ".join((text or "").split()).lower()
+
+
+async def _cloud_user_for_run(ctx: ToolContext) -> str | None:
+    """本次 Run 代表哪个 Flux 云用户：run → task → tasks.cloud_user_id。"""
+    run_id = ctx.identity.run_id
+    if not run_id:
+        return None
+    run = await ctx.container.run_repo.get(run_id)
+    if run is None or run.task_id is None:
+        return None
+    try:
+        task = await ctx.container.task_repo.get(run.task_id)
+    except NotFoundError:
+        return None
+    return getattr(task, "cloud_user_id", None)
 
 
 async def _project_from_task(ctx: ToolContext, task_id: str) -> str | None:

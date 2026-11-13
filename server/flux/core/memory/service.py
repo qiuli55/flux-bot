@@ -37,6 +37,9 @@ from flux.models.memory import MemoryEntry
 #: 无法确定"这是谁"时的稳定错误码（与 devices / keys 保持一致）。
 CLOUD_LOGIN_REQUIRED = "cloud_login_required"
 
+#: 注入共享空间记忆的字符预算（与共享用户记忆的注入预算同量级）。
+SHARED_RENDER_MAX_CHARS = 2000
+
 if TYPE_CHECKING:  # pragma: no cover - 仅类型标注，避免与 project_brain 循环导入
     from flux.core.project_brain.service import ProjectBrain
 
@@ -66,6 +69,11 @@ def _is_expired(entry: MemoryEntry) -> bool:
     return _as_utc(entry.expires_at) <= _utcnow()
 
 
+def _fits(used: int, line: str, limit: int) -> bool:
+    """预算判断：不写回 used，由调用方决定是否采用。"""
+    return used + len(line) + 1 <= limit
+
+
 class MemoryService:
     def __init__(
         self,
@@ -88,10 +96,16 @@ class MemoryService:
         # 账号云同步（可选）：本机写入后推到云端；云端快照回填本地缓存。
         # 未装配时行为与原来完全一致（纯本地三层记忆）。
         self._cloud: Any = None
+        # 共享空间服务（可选）：Phase 3 装配。未装配时 shared 层为空，其余行为不变。
+        self._spaces: Any = None
 
     def attach_cloud(self, sync: Any) -> None:
         """接线账号级记忆同步；同步失败不能影响本地读写，错误由同步组件自行记账。"""
         self._cloud = sync
+
+    def attach_spaces(self, spaces: Any) -> None:
+        """接线共享空间服务；未装配时 Shared 层按空处理（不泄露任何空间内容）。"""
+        self._spaces = spaces
 
     # --- User Memory（用户确认后写入；可查可删）---
 
@@ -209,6 +223,131 @@ class MemoryService:
         )
         return entry
 
+    # --- Shared Memory（共享空间；只有空间成员可读写）---
+
+    async def write_shared(
+        self,
+        space_id: str | uuid.UUID,
+        *,
+        content: str,
+        cloud_user_id: str | None,
+        source: str = "user",
+        meta: dict | None = None,
+    ) -> MemoryEntry:
+        """写一条 Shared 记忆；调用方必须是该空间成员。
+
+        `cloud_user_id` 记录作者，但访问权只看空间成员关系——不按作者过滤。
+        """
+        spaces = self._require_spaces()
+        user = self._resolve_user(cloud_user_id)
+        if user is None:
+            raise PermissionDeniedError(
+                "该操作需要 Flux 账号登录（或由部署方设置 FLUX_OWNER_CLOUD_USER_ID）",
+                code=CLOUD_LOGIN_REQUIRED,
+            )
+        space = await spaces.require_member(space_id, user)
+        text = self._validate(content, where="Shared Memory")
+        await self._sweep_expired_shared(space.id)
+        entry = await self._repository.insert(
+            layer=MemoryLayer.SHARED,
+            content=text,
+            source=source.strip() or "user",
+            meta=meta,
+            expires_at=self._deadline(MemoryLayer.SHARED),
+            cloud_user_id=user,
+            space_id=space.id,
+        )
+        await self._repository.prune_shared(
+            space.id, keep=self._policies[MemoryLayer.SHARED].max_entries
+        )
+        return entry
+
+    async def list_shared(
+        self,
+        space_id: str | uuid.UUID,
+        *,
+        cloud_user_id: str | None,
+    ) -> list[MemoryEntry]:
+        """列出某个空间里未过期的 Shared 记忆；非成员按空间不存在处理。"""
+        spaces = self._require_spaces()
+        user = self._resolve_user(cloud_user_id)
+        if user is None:
+            return []
+        space = await spaces.require_member(space_id, user)
+        rows = await self._repository.list_shared(space_id=space.id)
+        return [entry for entry in rows if not _is_expired(entry)]
+
+    async def delete_shared(
+        self,
+        space_id: str | uuid.UUID,
+        entry_id: str | uuid.UUID,
+        *,
+        cloud_user_id: str | None,
+    ) -> None:
+        """删除一条 Shared 记忆；非成员或条目不属于该空间一律按不存在处理。"""
+        spaces = self._require_spaces()
+        user = self._resolve_user(cloud_user_id)
+        if user is None:
+            raise NotFoundError(f"记忆 {entry_id} 不存在", details={"memory_id": str(entry_id)})
+        space = await spaces.require_member(space_id, user)
+        entry = await self._repository.get(entry_id)
+        if entry.layer != MemoryLayer.SHARED.value or entry.space_id != space.id:
+            raise NotFoundError(f"记忆 {entry_id} 不存在", details={"memory_id": str(entry_id)})
+        await self._repository.delete(entry_id)
+
+    async def shared_entries(
+        self, cloud_user_id: str | None
+    ) -> list[tuple[Any, list[MemoryEntry]]]:
+        """当前用户所有空间里的 Shared 记忆，按空间分组（只含非空空间）。"""
+        spaces = self._spaces
+        user = normalize_cloud_user_id(cloud_user_id)
+        if spaces is None or user is None:
+            return []
+        memberships = await spaces.memberships(user)
+        if not memberships:
+            return []
+        by_space: dict[uuid.UUID, list[MemoryEntry]] = {}
+        rows = await self._repository.list_shared_in_spaces(
+            [space.id for space, _role in memberships]
+        )
+        for entry in rows:
+            if entry.space_id is None or _is_expired(entry):
+                continue
+            by_space.setdefault(entry.space_id, []).append(entry)
+        return [
+            (space, by_space[space.id]) for space, _role in memberships if by_space.get(space.id)
+        ]
+
+    async def render_shared_block(self, cloud_user_id: str | None) -> str:
+        """把当前用户所有共享空间的记忆压成一段上下文（预算内，失败降级空串）。
+
+        显式传入优先；内部调用（历史任务 NULL）回退到主用户，与 User 层同一口径。
+        """
+        try:
+            groups = await self.shared_entries(self._resolve_user(cloud_user_id))
+        except Exception:  # noqa: BLE001 - 共享记忆只是增强，不能挡住对话/开工
+            return ""
+        if not groups:
+            return ""
+        lines: list[str] = []
+        used = 0
+        for space, entries in groups:
+            header = f"共享空间「{space.name}」记忆（仅成员可见）："
+            if not _fits(used, header, SHARED_RENDER_MAX_CHARS):
+                break
+            used += len(header) + 1
+            lines.append(header)
+            for entry in entries:
+                text = " ".join((entry.content or "").split())
+                if not text:
+                    continue
+                line = f"- {text}"
+                if not _fits(used, line, SHARED_RENDER_MAX_CHARS):
+                    break
+                used += len(line) + 1
+                lines.append(line)
+        return "\n".join(lines) + "\n" if lines else ""
+
     # --- 查询 / 删除 ---
 
     async def list_entries(
@@ -232,6 +371,10 @@ class MemoryService:
             return await self.ensure_environment()
         if layer is MemoryLayer.USER:
             return await self._live(MemoryLayer.USER, owner)
+        if layer is MemoryLayer.SHARED:
+            return [
+                entry for _space, entries in await self.shared_entries(owner) for entry in entries
+            ]
         return await self.ensure_environment() + await self._live(MemoryLayer.USER, owner)
 
     async def delete(self, entry_id: str | uuid.UUID, *, cloud_user_id: str | None = None) -> None:
@@ -354,6 +497,21 @@ class MemoryService:
             body = "\n".join(f"- {entry.content}" for entry in entries)
             blocks.append(f"# {title}\n{body}")
 
+        # 共享空间：只拼入当前用户是成员的空间；非成员完全看不到（包括空间名）。
+        for space, entries in await self.shared_entries(owner):
+            layers.append(
+                {
+                    "layer": MemoryLayer.SHARED.value,
+                    "scope": "space",
+                    "priority": 1,
+                    "space_id": str(space.id),
+                    "space_name": space.name,
+                    "entries": [_entry_view(entry) for entry in entries],
+                }
+            )
+            body = "\n".join(f"- {entry.content}" for entry in entries)
+            blocks.append(f"# 共享空间「{space.name}」记忆（仅成员可见）\n{body}")
+
         if project_id is not None:
             if self._brain is None:
                 raise ValidationError("未接入 Project Brain，无法读取 Project Memory")
@@ -436,6 +594,19 @@ class MemoryService:
         if ttl is None:
             return None
         return _utcnow() + ttl
+
+    def _require_spaces(self) -> Any:
+        if self._spaces is None:
+            # 未装配共享空间能力时，Shared 层等同于「不存在任何空间」。
+            raise NotFoundError("共享空间不存在", details={"space_id": ""})
+        return self._spaces
+
+    async def _sweep_expired_shared(self, space_id: uuid.UUID) -> int:
+        rows = await self._repository.list_shared(space_id=space_id)
+        stale = [entry.id for entry in rows if _is_expired(entry)]
+        if not stale:
+            return 0
+        return await self._repository.delete_many(stale)
 
     async def _live(self, layer: MemoryLayer, owner: str | None = None) -> list[MemoryEntry]:
         if layer is MemoryLayer.USER:
