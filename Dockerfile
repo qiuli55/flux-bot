@@ -7,11 +7,14 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # Node 20 + Claude Code CLI：Bot 的 Agent 底座（npm 全局装 claude）
+# 固定版本：镜像可重建（latest 漂移会让 CLI 行为/事件流在无代码变更时改变）。
+# [2026-11-12 快照] npm registry：@anthropic-ai/claude-code 2.1.323
+ARG CLAUDE_CODE_VERSION=2.1.323
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates gnupg passwd util-linux \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g @anthropic-ai/claude-code \
+    && npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 flux \

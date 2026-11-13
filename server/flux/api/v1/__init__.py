@@ -5,6 +5,7 @@ from fastapi import APIRouter
 from flux.api.v1 import (
     agents,
     billing,
+    bot_subtasks,
     bots,
     capabilities,
     codex_account,
@@ -38,6 +39,7 @@ api_v1_router.include_router(keys.router)
 api_v1_router.include_router(installations.router)
 api_v1_router.include_router(tasks.router)
 api_v1_router.include_router(bots.router)
+api_v1_router.include_router(bot_subtasks.router)
 api_v1_router.include_router(desktop.router)
 api_v1_router.include_router(devices.router)
 api_v1_router.include_router(groups.router)

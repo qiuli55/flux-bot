@@ -791,6 +791,8 @@ class BotService:
         if jobs:
             # return_exceptions：单个派发失败不能挡住其余协程收尾，也不能让 stop() 本身失败
             await asyncio.gather(*jobs, return_exceptions=True)
+        # 子任务与调度/事件派发共用同一个停机时机：先取消并等待它们写库结束。
+        await self._container.bot_subtasks.shutdown()
         task, self._task = self._task, None
         if task is None:
             return

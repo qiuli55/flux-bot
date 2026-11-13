@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from flux.core.attachment_store import UploadedFile, size_label
+from flux.core.bot.subtasks import SUBTASK_TOOLS, run_subtask_tool
 from flux.core.bot.turn_repository import TERMINAL_TURN_STATUSES, BotTurnRepository
 from flux.core.context.budget import history_message_limit
 from flux.core.github.service import normalize_account_key
@@ -35,7 +36,7 @@ from flux.enums import (
     TaskOrigin,
     TaskStatus,
 )
-from flux.errors import ConflictError, NotFoundError, ValidationError
+from flux.errors import BadRequestError, ConflictError, NotFoundError, ValidationError
 from flux.logging import get_logger
 from flux.models.bot import Bot
 from flux.models.bot_turn import BotTurn
@@ -359,6 +360,7 @@ class BotConversationService:
         context: str | None = None,
         history_limit: int = _HISTORY_LIMIT,
         include_github: bool = True,
+        subtask_bot: Bot | None = None,
         advance_status: bool = True,
         stream_meta: dict[str, Any] | None = None,
         record_billing: bool = False,
@@ -412,6 +414,36 @@ class BotConversationService:
                     )
                 }
             )
+        tool_kwargs = dict(github_kwargs)
+        if subtask_bot is not None:
+            # 子任务工具只给 Bot 对话轮次：长活派到后台后，用户还能继续聊；
+            # 结果会以 kind=subtask 消息回到当前对话，不需要本轮阻塞等待。
+            service = container.bot_subtasks
+
+            async def _run_subtask(name: str, arguments: dict[str, Any]) -> Any:
+                return await run_subtask_tool(service, subtask_bot, name, arguments)
+
+            existing_runner = tool_kwargs.get("tool_runner")
+
+            async def _run_bot_tool(name: str, arguments: dict[str, Any]) -> Any:
+                if name.startswith("subtask_"):
+                    return await _run_subtask(name, arguments)
+                if existing_runner is not None:
+                    return await existing_runner(name, arguments)
+                raise BadRequestError(f"当前对话不支持工具 {name}", details={"tool": name})
+
+            tool_kwargs["tools"] = [*tool_kwargs.get("tools", []), *SUBTASK_TOOLS]
+            tool_kwargs["tool_runner"] = _run_bot_tool
+            subtask_note = (
+                "遇到耗时的长活（调研、批量整理、跨多个步骤的执行）时，优先调用 subtask_start "
+                "把它派成后台子任务，立即告诉用户已开始、可以继续聊；不要在本轮等它跑完。"
+                "子任务的结果会自动出现在这段对话里，"
+                "用户追问进度时可用 subtask_get / subtask_list 查询。"
+            )
+            existing_note = str(tool_kwargs.get("tools_note") or "").strip()
+            tool_kwargs["tools_note"] = (
+                f"{existing_note}\n{subtask_note}" if existing_note else subtask_note
+            )
         try:
             # 任务选了自己的模型时，这一轮对话也用它回答（与后续 Agent 执行同一通道）
             channel = await container.key_vault.channel_for_task(task)
@@ -427,7 +459,7 @@ class BotConversationService:
                 on_delta=_on_delta,
                 channel=channel,
                 model=(task.model or "").strip(),
-                **github_kwargs,
+                **tool_kwargs,
             )
         except Exception as exc:  # noqa: BLE001 - 先通知正在看的客户端，再按原样抛给调用方
             await container.task_stream.publish(
@@ -636,6 +668,7 @@ class BotConversationService:
                 files=list(pending.files),
                 description=description,
                 context="\n".join(context_parts) or None,
+                subtask_bot=bot,
                 advance_status=False,
                 stream_meta=meta,
                 record_billing=True,
