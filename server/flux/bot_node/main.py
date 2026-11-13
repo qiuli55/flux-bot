@@ -18,12 +18,15 @@ from flux.api.auth import require_rest_auth
 from flux.api.errors import register_exception_handlers
 from flux.api.v1 import (
     agents,
+    billing,
+    bot_subtasks,
     bots,
     capabilities,
     channels_dingtalk,
     channels_feishu,
     channels_wecom,
     codex_account,
+    connector_calendar,
     connectors,
     deliveries,
     desktop,
@@ -31,42 +34,59 @@ from flux.api.v1 import (
     groups,
     health,
     hooks,
+    installations,
     keys,
     memory,
     models,
+    outbound_drafts,
     pages,
     public_pages,
+    skills,
     tasks,
     uploads,
     user_memory,
+    vault,
 )
 from flux.config import Settings, get_settings
 from flux.container import Container
 from flux.core.mcp.server import router as mcp_router
+from flux.errors import ValidationError
 from flux.logging import configure_logging, get_logger
 from flux.version import VERSION
 
 logger = get_logger(__name__)
 
-# Bot 能用的业务路由。顺序只影响 OpenAPI 里的排列，不改变行为。
+# Bot 能用的业务路由。顺序与 flux.main 的 api_v1_router 保持一致（跳过 IDE 专属模块），
+# 只影响 OpenAPI 里的排列，不改变行为。
+# 有意排除的 IDE / 桌面工作台路由：projects / git / ide / terminal / workspace /
+# designs / supervisor——Bot 节点不提供这些产品能力。
 _BOT_ROUTERS = (
-    health,
-    agents,
-    bots,
-    devices,
-    groups,
-    tasks,
-    deliveries,
-    connectors,
-    desktop,
-    memory,
-    models,
-    keys,
-    capabilities,
-    uploads,
-    user_memory,
-    codex_account,
-    pages,
+    health.router,
+    agents.router,
+    billing.router,
+    keys.router,
+    installations.router,
+    tasks.router,
+    bots.router,
+    outbound_drafts.router,
+    bot_subtasks.router,
+    desktop.router,
+    devices.router,
+    groups.router,
+    memory.router,
+    models.router,
+    connector_calendar.router,
+    pages.router,
+    connectors.router,
+    capabilities.router,
+    deliveries.router,
+    uploads.router,
+    user_memory.router,
+    skills.router,
+    # 分配到 Bot 的技能接口（/bots/{bot_id}/skills）与技能包本体同属 skills 模块。
+    skills.bot_router,
+    codex_account.router,
+    vault.router,
 )
 
 #: 免 REST 鉴权的公开入口：Webhook 用 HMAC 签名自证身份，不能套本机令牌；
@@ -110,6 +130,38 @@ def _url_port(url: str) -> int | None:
     return None
 
 
+#: Bot 节点的底座 Agent；其 installation 推进到 READY 后，/bots/{id}/run 才不会 409。
+_BOT_AGENT_NAME = "claude-code"
+
+
+async def auto_connect_claude_code(container: Container, settings: Settings) -> None:
+    """按开关在启动时自动接入 Claude Code（等价于 `flux agents connect claude-code`）。
+
+    复用 InstallationService.connect：它内部会重新探测本机 CLI，只有确实找到
+    `claude` 可执行文件才允许把状态推进到 READY。未安装时 connect 抛
+    ValidationError，这里只记 WARNING 并返回——自动接入失败绝不能阻断 Bot 节点启动。
+    """
+    if not settings.auto_connect_claude_code:
+        return
+    try:
+        row = await container.installations.connect(_BOT_AGENT_NAME)
+    except ValidationError:
+        logger.warning(
+            "FLUX_AUTO_CONNECT_CLAUDE_CODE 已开启，但本机未找到 claude CLI"
+            "（%s 未安装）；跳过自动接入，POST /bots/{id}/run 仍会返回 409。"
+            "请确认镜像内已安装 claude，或手动执行 flux agents connect %s。",
+            _BOT_AGENT_NAME,
+            _BOT_AGENT_NAME,
+        )
+        return
+    logger.info(
+        "已自动接入 %s：installation 状态 %s（等价于 flux agents connect %s）",
+        _BOT_AGENT_NAME,
+        row.status,
+        _BOT_AGENT_NAME,
+    )
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     app_settings = resolve_bot_settings(settings or get_settings())
     configure_logging(app_settings.log_level, app_settings.log_dir_path)
@@ -147,6 +199,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Bot 开工要认 agent 档案与令牌，启动时先重建内存注册表。
         await container.agents.load_from_db()
         await container.agent_tokens.migrate_legacy_tokens()
+        # 可选：启动时自动把 claude-code 接入状态推进到 READY（默认关闭）。
+        await auto_connect_claude_code(container, app_settings)
         # 单进程部署：上一进程遗留的 Bot 对话 turn 不会自动续跑，统一收成 interrupted。
         await container.bot_conversation.recover_interrupted()
         # 上一轮进程被杀时中断的工作区 Apply 需要按磁盘事实恢复，否则 Bot 的改动会卡在 applying。
@@ -173,12 +227,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.container = container
     register_exception_handlers(app)
-    for module in _BOT_ROUTERS:
+    for router in _BOT_ROUTERS:
         app.include_router(
-            module.router,
+            router,
             prefix=app_settings.api_v1_prefix,
             # 健康探针免鉴权：Dockerfile 的 HEALTHCHECK 只带 curl，不能依赖令牌。
-            dependencies=[] if module is health else [Depends(require_rest_auth)],
+            dependencies=[] if router is health.router else [Depends(require_rest_auth)],
         )
     # 外部 Webhook：HMAC 验签自证身份，与主应用同一套入口。
     for module in _BOT_PUBLIC_ROUTERS:

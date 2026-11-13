@@ -356,6 +356,10 @@ class Settings(BaseSettings):
     # Bot 独立服务监听的端口（entrypoint.sh / Dockerfile 用 FLUX_BOT_PORT 传入）。
     # Bot 节点据此在未显式配置 FLUX_MCP_URL 时推导同机 MCP 端点。
     bot_port: int = 8600
+    # Bot 节点启动时自动接入 Claude Code（默认关闭）。开启后若能在 PATH 找到 claude
+    # CLI，就把 claude-code 的 installation 推进到 READY，等价于手动执行
+    # `flux agents connect claude-code`；找不到 CLI 时只记 WARNING，不阻断启动。
+    auto_connect_claude_code: bool = False
     # 后台调度 worker：按 next_run_at 扫到期 Bot 并开工。测试里关掉，避免与用例抢时序。
     bot_scheduler_enabled: bool = True
     # 轮询间隔（秒）：cron 的最小粒度是分钟，30 秒足够且不会压垮 SQLite。
