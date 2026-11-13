@@ -35,6 +35,9 @@ class Device(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
     )
+    #: 设备归属的 Flux 云用户 id（JWT sub，字符串）。历史行为 NULL；
+    #: NULL 的设备按 FLUX_OWNER_CLOUD_USER_ID 归属（见 flux.api.auth）。
+    cloud_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
     @property
     def revoked(self) -> bool:
@@ -51,6 +54,7 @@ class Device(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "revoked_at": _iso(self.revoked_at),
             "revoked": self.revoked,
             "expires_at": _iso(self.expires_at),
+            "cloud_user_id": self.cloud_user_id,
         }
 
 
@@ -63,3 +67,6 @@ class PairingCode(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     #: 命中该码后失败的兑换次数（审计用；真正的限流按来源 IP 在内存里做）。
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    #: 签发该码的人（Flux 云用户 id）。兑换出的设备继承它；历史行为 NULL，
+    #: NULL 时按 FLUX_OWNER_CLOUD_USER_ID 兜底（见 flux.core.devices.service）。
+    cloud_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)

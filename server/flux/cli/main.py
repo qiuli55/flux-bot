@@ -623,17 +623,37 @@ async def _cmd_agents_remove(container: Container, args: argparse.Namespace) -> 
 # --- logs ---
 
 
+def _require_owner_cloud_user_id(settings: Settings) -> str:
+    """CLI 没有云端登录态，只能以部署方配置的主用户身份管理设备。
+
+    未配置 FLUX_OWNER_CLOUD_USER_ID 时明确报错，而不是列出"所有人的设备"
+    或把新配对码写成无主——这两种行为都会破坏按用户隔离。
+    """
+    owner = (settings.owner_cloud_user_id or "").strip()
+    if not owner:
+        raise ConfigurationError(
+            "未配置 FLUX_OWNER_CLOUD_USER_ID：CLI 无法确定设备归属",
+            details={
+                "hint": "在 .env 设置 FLUX_OWNER_CLOUD_USER_ID=<主用户的 Flux 云账号 user id>",
+            },
+        )
+    return owner
+
+
 async def _cmd_devices_pair(container: Container) -> dict[str, Any]:
-    code, expires_at = await container.devices.issue_pairing_code()
+    owner = _require_owner_cloud_user_id(container.settings)
+    code, expires_at = await container.devices.issue_pairing_code(cloud_user_id=owner)
     return {
         "code": code,
         "expires_at": expires_at.isoformat(),
+        "cloud_user_id": owner,
         "hint": "在手机 App 的配对页输入该 8 位配对码；配对码单次有效",
     }
 
 
 async def _cmd_devices_list(container: Container) -> dict[str, Any]:
-    devices = await container.devices.list()
+    owner = _require_owner_cloud_user_id(container.settings)
+    devices = await container.devices.list(cloud_user_id=owner)
     return {
         "count": len(devices),
         "devices": [device.to_dict() for device in devices],
@@ -641,7 +661,8 @@ async def _cmd_devices_list(container: Container) -> dict[str, Any]:
 
 
 async def _cmd_devices_revoke(container: Container, args: argparse.Namespace) -> dict[str, Any]:
-    device = await container.devices.revoke(args.id)
+    owner = _require_owner_cloud_user_id(container.settings)
+    device = await container.devices.revoke(args.id, cloud_user_id=owner)
     return {"device": device.to_dict(), "revoked": True}
 
 

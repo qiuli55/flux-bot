@@ -16,6 +16,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from flux.config import Settings
 from flux.main import create_app
+from tests.cloud_jwt import CLOUD_TEST_SECRET, mint_cloud_token
 
 TOKEN = "test-token-3f9c1d7a"
 
@@ -38,6 +39,14 @@ def secured_apply_settings(apply_settings: Settings) -> Settings:
     `apply_settings` 基础上加令牌，不能用裸 `settings`。
     """
     return apply_settings.model_copy(update={"auth_token": TOKEN})
+
+
+@pytest.fixture()
+def secured_cloud_apply_settings(apply_settings: Settings) -> Settings:
+    """带工作区根、本机令牌与账号云共享密钥的配置（WS 云登录态用例）。"""
+    return apply_settings.model_copy(
+        update={"auth_token": TOKEN, "cloud_secret_key": CLOUD_TEST_SECRET}
+    )
 
 
 @pytest.fixture()
@@ -190,5 +199,23 @@ def test_human_websocket_accepts_auth_header_when_rest_is_secured(
         with test_client.websocket_connect(
             f"/api/v1/terminal/pty/sessions/{session_id}/ws",
             headers=_auth(TOKEN),
+        ) as websocket:
+            websocket.send_json({"type": "stop", "force": True})
+
+
+@pytest.mark.skipif(os.name == "nt", reason="native PTY is not enabled on Windows")
+def test_human_websocket_accepts_cloud_jwt_when_rest_is_secured(
+    secured_cloud_apply_settings: Settings, db_schema: None
+) -> None:
+    """只登录账号云、没有 FLUX_AUTH_TOKEN 的用户也能用 WS（与 REST 云登录态对齐）。"""
+    app = create_app(secured_cloud_apply_settings)
+    with TestClient(app, **PUBLIC_CLIENT) as test_client:
+        created = test_client.post("/api/v1/terminal/pty/sessions", headers=_auth(TOKEN))
+        assert created.status_code == 200
+        session_id = created.json()["data"]["id"]
+
+        with test_client.websocket_connect(
+            f"/api/v1/terminal/pty/sessions/{session_id}/ws",
+            headers=_auth(mint_cloud_token("2")),
         ) as websocket:
             websocket.send_json({"type": "stop", "force": True})
