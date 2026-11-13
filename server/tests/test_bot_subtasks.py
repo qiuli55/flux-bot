@@ -27,6 +27,7 @@ from flux.container import Container
 from flux.core.agent_runtime.manager import AgentSpec
 from flux.core.bot.subtasks import run_subtask_tool
 from flux.core.event.bus import Events
+from flux.core.mcp.tools.routine_tools import ROUTINE_TOOL_NAMES
 from flux.core.task_engine.assistant import AssistantTurn
 from flux.enums import AgentRole
 from flux.errors import BadRequestError, ValidationError
@@ -836,6 +837,22 @@ def test_bot_chat_turn_injects_subtask_tools(settings: Settings, tmp_path: Path)
         assert "subtask_start" in call["tools_note"]
 
 
+def test_bot_chat_turn_injects_routine_tools(settings: Settings, tmp_path: Path) -> None:
+    """Bot 对话轮次能看到例程工具：用户自然语言提的定时/一次性/事件触发由 Bot 自己建。"""
+    with _kernel_app(settings, tmp_path) as (client, _log, _sentinel):
+        fake = _fake(client)
+        bot = _create_bot(client)
+        turn_response = client.post(f"{PREFIX}/bots/{bot['id']}/turns", json={"content": "你好"})
+        turn_id = turn_response.json()["data"]["turn"]["id"]
+        assert _wait_turn(client, bot["id"], turn_id)["status"] == "completed"
+
+        call = fake.calls[-1]
+        names = {tool["function"]["name"] for tool in call["tools"]}
+        assert names >= ROUTINE_TOOL_NAMES
+        assert "routine_create" in call["tools_note"]
+        assert "不要让用户去设置页面" in call["tools_note"]
+
+
 def test_legacy_task_turn_does_not_get_subtask_tools(settings: Settings, tmp_path: Path) -> None:
     with _kernel_app(settings, tmp_path) as (client, _log, _sentinel):
         fake = _fake(client)
@@ -846,6 +863,7 @@ def test_legacy_task_turn_does_not_get_subtask_tools(settings: Settings, tmp_pat
         call = fake.calls[-1]
         assert call.get("tools") is None
         assert "subtask" not in str(call.get("tools_note") or "")
+        assert "routine_create" not in str(call.get("tools_note") or "")
 
 
 def test_subtask_tool_runner_starts_gets_and_lists(settings: Settings, tmp_path: Path) -> None:

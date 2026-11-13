@@ -84,7 +84,13 @@ def _create_bot(client: TestClient, **overrides: object) -> dict:
 
 
 def _create_routine(client: TestClient, bot_id: str, **overrides: object) -> dict:
-    payload: dict[str, object] = {"name": "hook routine", "instruction": "检查事件"}
+    # 新契约要求例程至少有一种触发条件；默认订阅 webhook.manual，
+    # 定向触发用例仍按 routine_id 语义验证，不依赖订阅匹配。
+    payload: dict[str, object] = {
+        "name": "hook routine",
+        "instruction": "检查事件",
+        "event_triggers": ["webhook.manual"],
+    }
     payload.update(overrides)
     response = client.post(f"{PREFIX}/bots/{bot_id}/routines", json=payload)
     assert response.status_code == 200, response.text
@@ -616,9 +622,14 @@ def test_targeted_routine_launches_without_subscription(
         )
         bot = await container.bots.create(name="targeted bot")
         routine = await container.bots.create_routine(
-            bot.id, name="targeted", instruction="定向执行"
+            bot.id,
+            name="targeted",
+            instruction="定向执行",
+            # 新契约要求至少一种触发条件；这里故意订阅别的事件，
+            # 以证明定向触发不依赖 routine.event_triggers 是否包含本次事件。
+            event_triggers=["webhook.other"],
         )
-        assert routine.event_triggers is None
+        assert routine.event_triggers == ["webhook.other"]
 
         await container.bots.start()
         try:
