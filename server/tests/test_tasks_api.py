@@ -46,6 +46,8 @@ _RESPONSE_KEYS = {
     "avatar_color",
     # Bot 模式：这条任务由哪个常驻 Bot 开工（为空 = 普通对话）
     "bot_id",
+    # Bot 后台子任务：指回父对话任务（普通任务为空）
+    "parent_task_id",
 }
 
 

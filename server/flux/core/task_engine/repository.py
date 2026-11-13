@@ -249,6 +249,21 @@ class TaskRepository:
             await self._commit(session)
             return task
 
+    async def start_if_pending(self, task_id: uuid.UUID) -> Task | None:
+        """pending → running；已经不 pending 时返回 None（不覆盖别处写入的终态）。
+
+        后台子任务的启动与取消会并发：用户可能在后台协程真正开跑前就点了取消。
+        判断与写入必须在同一个事务里，否则 running 会把刚写好的 cancelled 顶回去，
+        任务永远停在 running。
+        """
+        async with self._session_factory() as session:
+            task = await self._require(session, task_id)
+            if task.status != TaskStatus.PENDING.value:
+                return None
+            task.status = TaskStatus.RUNNING.value
+            await self._commit(session)
+            return task
+
     async def finish_if_active(
         self,
         task_id: uuid.UUID,

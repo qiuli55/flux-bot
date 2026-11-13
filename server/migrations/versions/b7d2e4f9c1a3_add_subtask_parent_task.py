@@ -5,7 +5,7 @@ Bot 对话里的长活可以派成独立子任务，用户继续聊天。子任�
 状态与结果以 kind=subtask 的消息追加到父对话里。
 
 Revision ID: b7d2e4f9c1a3
-Revises: f4b7e1c9a260
+Revises: a4c8d2e61f97
 Create Date: 2026-11-13 10:00:00.000000
 
 """
@@ -17,7 +17,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "b7d2e4f9c1a3"
-down_revision: str | Sequence[str] | None = "f4b7e1c9a260"
+down_revision: str | Sequence[str] | None = "a4c8d2e61f97"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

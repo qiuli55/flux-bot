@@ -187,7 +187,12 @@ class BotSubtaskService:
         if job is not None and not job.done():
             job.cancel()
             await asyncio.gather(job, return_exceptions=True)
-        logger.info("Bot 子任务已取消 bot=%s subtask=%s", bot.id, subtask_id)
+        logger.info(
+            "Bot 子任务已取消 bot=%s subtask=%s parent=%s",
+            bot.id,
+            subtask_id,
+            finished.parent_task_id,
+        )
         return finished
 
     async def shutdown(self) -> None:
@@ -211,7 +216,12 @@ class BotSubtaskService:
                 logger.warning("停机时收尾子任务 %s 失败", subtask_id, exc_info=True)
                 continue
             if updated is not None:
-                logger.info("停机时子任务被标记为 cancelled subtask=%s", subtask_id)
+                logger.info(
+                    "停机时子任务被标记为 cancelled bot=%s subtask=%s parent=%s",
+                    updated.bot_id,
+                    subtask_id,
+                    updated.parent_task_id,
+                )
         self._cancelled.clear()
 
     # --- 后台 job ---
@@ -237,9 +247,19 @@ class BotSubtaskService:
 
         display = _title_for(title, instruction)
         try:
-            running = await container.task_repo.set_status(subtask_id, TaskStatus.RUNNING)
+            # 只有当它还是 pending 时才进入 running：用户在启动前点了取消时，
+            # 这里不能把已写好的 cancelled 顶回 running。
+            running = await container.task_repo.start_if_pending(subtask_id)
         except NotFoundError:
             logger.warning("子任务 %s 在开始前已被删除", subtask_id)
+            return
+        if running is None:
+            logger.info(
+                "子任务在启动前已结束，跳过 running 收尾 subtask=%s bot=%s parent=%s",
+                subtask_id,
+                task.bot_id,
+                task.parent_task_id,
+            )
             return
         task = running
         await self._publish_parent(
@@ -265,13 +285,31 @@ class BotSubtaskService:
             )
         except asyncio.CancelledError:
             # cancel()/shutdown() 已负责收尾；这里只让协程正常退出。
-            logger.info("子任务被取消 subtask=%s", subtask_id)
+            logger.info(
+                "子任务被取消 subtask=%s bot=%s parent=%s",
+                subtask_id,
+                task.bot_id,
+                task.parent_task_id,
+            )
             raise
         except Exception as exc:  # noqa: BLE001 - 失败必须落成可查询的终态
             error = str(exc).strip()[:_ERROR_CHARS] or "模型调用失败"
-            logger.warning("子任务失败 subtask=%s error=%s", subtask_id, error)
             if subtask_id in self._cancelled:
+                # 取消已先一步收尾：此时抛出的异常不是「失败」，别记成一条假的失败终态。
+                logger.info(
+                    "子任务已取消，忽略模型调用异常 subtask=%s bot=%s error=%s",
+                    subtask_id,
+                    task.bot_id,
+                    error,
+                )
                 return
+            logger.warning(
+                "子任务失败 subtask=%s bot=%s parent=%s error=%s",
+                subtask_id,
+                task.bot_id,
+                task.parent_task_id,
+                error,
+            )
             await self._finish(
                 task,
                 TaskStatus.FAILED,
@@ -316,7 +354,12 @@ class BotSubtaskService:
         """收尾：落终态 + 结果，再往父对话追加状态消息并广播。"""
         finished = await self._container.task_repo.finish_if_active(task.id, status, result)
         if finished is None:
-            logger.info("子任务 %s 已是终态，跳过重复收尾", task.id)
+            logger.info(
+                "子任务已是终态，跳过重复收尾 bot=%s subtask=%s status=%s",
+                task.bot_id,
+                task.id,
+                status.value,
+            )
             return None
         await self._publish_parent(
             finished,

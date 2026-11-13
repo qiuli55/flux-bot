@@ -7,9 +7,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
@@ -95,7 +98,11 @@ def _container(client: TestClient) -> Container:
 
 
 def _create_subtask(
-    client: TestClient, bot_id: str, *, instruction: str = "整理本周周报", title: str | None = "周报"
+    client: TestClient,
+    bot_id: str,
+    *,
+    instruction: str = "整理本周周报",
+    title: str | None = "周报",
 ):
     body: dict[str, Any] = {"instruction": instruction}
     if title is not None:
@@ -129,9 +136,7 @@ def _wait_subtask(
 
 
 def _wait_turn(client: TestClient, bot_id: str, turn_id: str, timeout: float = 5) -> dict:
-    response = client.get(
-        f"{PREFIX}/bots/{bot_id}/turns/{turn_id}", params={"wait": timeout}
-    )
+    response = client.get(f"{PREFIX}/bots/{bot_id}/turns/{turn_id}", params={"wait": timeout})
     assert response.status_code == 200, response.text
     return response.json()["data"]["turn"]
 
@@ -144,6 +149,31 @@ def _conversation(client: TestClient, bot_id: str) -> dict:
 
 def _subtask_messages(conversation: dict) -> list[dict]:
     return [message for message in conversation["messages"] if message["kind"] == "subtask"]
+
+
+@contextmanager
+def _capture_subtask_logs() -> Iterator[list[logging.LogRecord]]:
+    """抓子任务模块自己的日志。
+
+    不走 caplog：`create_app` 会重建根 logger 的 handler，测试里再挂一个专属 handler
+    最稳，也不受全局日志级别影响。
+    """
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    module_logger = logging.getLogger("flux.core.bot.subtasks")
+    previous_level = module_logger.level
+    module_logger.addHandler(handler)
+    module_logger.setLevel(logging.INFO)
+    try:
+        yield records
+    finally:
+        module_logger.removeHandler(handler)
+        module_logger.setLevel(previous_level)
+
+
+def _log_text(records: list[logging.LogRecord]) -> list[str]:
+    return [record.getMessage() for record in records]
 
 
 # --- 正常路径 ---
@@ -169,6 +199,15 @@ def test_subtask_completes_and_posts_status_to_parent_conversation(client: TestC
     done = _wait_subtask(client, bot["id"], subtask["id"])
     assert done["status"] == "completed"
     assert "整理本周周报" in done["result"]["reply"]
+
+    completed_only = client.get(
+        f"{PREFIX}/bots/{bot['id']}/subtasks", params={"status": "completed"}
+    ).json()["data"]
+    assert [item["id"] for item in completed_only] == [subtask["id"]]
+    failed_only = client.get(
+        f"{PREFIX}/bots/{bot['id']}/subtasks", params={"status": "failed"}
+    ).json()["data"]
+    assert failed_only == []
 
     conversation = _conversation(client, bot["id"])
     assert conversation["chat_task_id"] == subtask["parent_task_id"]
@@ -219,11 +258,12 @@ def test_chat_turn_can_run_while_subtask_is_still_running(client: TestClient) ->
 
     completed = _wait_subtask(client, bot["id"], subtask_id)
     assert completed["status"] == "completed"
-    statuses = [
-        message["payload"]["status"] for message in _subtask_messages(_conversation(client, bot["id"]))
-    ]
+    messages = _subtask_messages(_conversation(client, bot["id"]))
+    statuses = [message["payload"]["status"] for message in messages]
     assert statuses == ["running", "completed"]
-    assert "先回我一句" in fake.calls[-2]["message"]
+    # 两条调用是并发的，落库顺序不保证：按内容找聊天那一轮，而不是假设 calls[-2]。
+    call_messages = [str(call.get("message") or "") for call in fake.calls]
+    assert any("先回我一句" in message for message in call_messages)
 
 
 def test_failed_subtask_surfaces_error_without_traceback(client: TestClient) -> None:
@@ -243,6 +283,55 @@ def test_failed_subtask_surfaces_error_without_traceback(client: TestClient) -> 
     assert "Traceback" not in str(messages[-1]["payload"])
     event_names = [name for name, _payload in _container(client).bus.history]
     assert Events.SUBTASK_FAILED in event_names
+
+
+# --- 日志 ---
+
+
+def test_created_running_completed_transitions_are_logged(client: TestClient) -> None:
+    _fake(client)
+    bot = _create_bot(client)
+
+    with _capture_subtask_logs() as records:
+        subtask_id = _create_subtask(client, bot["id"]).json()["data"]["id"]
+        _wait_subtask(client, bot["id"], subtask_id)
+
+    messages = _log_text(records)
+    for marker in ("已创建", "开始", "完成"):
+        assert any(
+            marker in message and bot["id"] in message and subtask_id in message
+            for message in messages
+        ), f"{marker} 日志缺少 bot/subtask id：{messages}"
+
+
+def test_failed_and_cancelled_transitions_are_logged(client: TestClient) -> None:
+    _fake(client, error=RuntimeError("模型炸了"))
+    bot = _create_bot(client)
+    with _capture_subtask_logs() as records:
+        failed_id = _create_subtask(client, bot["id"], instruction="会失败").json()["data"]["id"]
+        _wait_subtask(client, bot["id"], failed_id)
+    failed_logs = _log_text(records)
+    assert any(
+        "失败" in message and bot["id"] in message and failed_id in message
+        for message in failed_logs
+    ), failed_logs
+    # 失败原因进日志，但整段指令不进（日志不承载 prompt）
+    assert any("模型炸了" in message for message in failed_logs)
+    assert not any("会失败" in message for message in failed_logs)
+
+    slow = _fake(client, delay=5.0)
+    with _capture_subtask_logs() as records:
+        cancelled_id = _create_subtask(
+            client, bot["id"], instruction="很慢的任务", title="慢活"
+        ).json()["data"]["id"]
+        assert slow.entered.wait(5)
+        response = client.post(f"{PREFIX}/bots/{bot['id']}/subtasks/{cancelled_id}/cancel")
+        assert response.status_code == 200, response.text
+    cancelled_logs = _log_text(records)
+    assert any(
+        "已取消" in message and bot["id"] in message and cancelled_id in message
+        for message in cancelled_logs
+    ), cancelled_logs
 
 
 # --- 取消 ---
@@ -272,6 +361,21 @@ def test_cancel_inflight_subtask_and_reject_second_cancel(client: TestClient) ->
     assert asserted["status"] == "cancelled"
 
 
+def test_cancel_immediately_after_create_stays_cancelled(client: TestClient) -> None:
+    """取消可能赶在后台协程启动之前：running 的写入不能把 cancelled 顶回去。"""
+    _fake(client, delay=5.0)
+    bot = _create_bot(client)
+    subtask_id = _create_subtask(client, bot["id"], instruction="还没开始").json()["data"]["id"]
+
+    cancelled = client.post(f"{PREFIX}/bots/{bot['id']}/subtasks/{subtask_id}/cancel")
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["data"]["status"] == "cancelled"
+
+    # 给后台 job 一点时间；它若还在跑，也不能把状态改回 running/completed。
+    time.sleep(0.2)
+    assert _get_subtask(client, bot["id"], subtask_id)["status"] == "cancelled"
+
+
 # --- 4xx ---
 
 
@@ -280,19 +384,29 @@ def test_invalid_requests_return_4xx(client: TestClient) -> None:
     bot = _create_bot(client)
     unknown = uuid.uuid4()
 
-    missing_bot = client.post(
-        f"{PREFIX}/bots/{unknown}/subtasks", json={"instruction": "还有人吗"}
-    )
+    missing_bot = client.post(f"{PREFIX}/bots/{unknown}/subtasks", json={"instruction": "还有人吗"})
     assert missing_bot.status_code == 404, missing_bot.text
 
     missing_list = client.get(f"{PREFIX}/bots/{unknown}/subtasks")
     assert missing_list.status_code == 404, missing_list.text
+
+    missing_get = client.get(f"{PREFIX}/bots/{unknown}/subtasks/{unknown}")
+    assert missing_get.status_code == 404, missing_get.text
+
+    missing_cancel = client.post(f"{PREFIX}/bots/{unknown}/subtasks/{unknown}/cancel")
+    assert missing_cancel.status_code == 404, missing_cancel.text
 
     empty = _create_subtask(client, bot["id"], instruction="")
     assert empty.status_code == 422, empty.text
 
     whitespace = _create_subtask(client, bot["id"], instruction="   ")
     assert whitespace.status_code == 422, whitespace.text
+
+    missing_instruction = client.post(f"{PREFIX}/bots/{bot['id']}/subtasks", json={})
+    assert missing_instruction.status_code == 422, missing_instruction.text
+
+    too_long_title = _create_subtask(client, bot["id"], title="长" * 201)
+    assert too_long_title.status_code == 422, too_long_title.text
 
     unknown_subtask = client.get(f"{PREFIX}/bots/{bot['id']}/subtasks/{unknown}")
     assert unknown_subtask.status_code == 404, unknown_subtask.text
@@ -305,6 +419,24 @@ def test_invalid_requests_return_4xx(client: TestClient) -> None:
 
     bad_limit = client.get(f"{PREFIX}/bots/{bot['id']}/subtasks", params={"limit": 0})
     assert bad_limit.status_code == 400, bad_limit.text
+
+
+def test_subtask_is_scoped_to_its_own_bot(client: TestClient) -> None:
+    """别的 Bot 拿着 id 也查不到/取消不了：按不存在处理，不泄露归属。"""
+    _fake(client)
+    owner = _create_bot(client, name="主人")
+    other = _create_bot(client, name="路人")
+    subtask_id = _create_subtask(client, owner["id"]).json()["data"]["id"]
+    _wait_subtask(client, owner["id"], subtask_id)
+
+    fetched = client.get(f"{PREFIX}/bots/{other['id']}/subtasks/{subtask_id}")
+    assert fetched.status_code == 404, fetched.text
+
+    cancelled = client.post(f"{PREFIX}/bots/{other['id']}/subtasks/{subtask_id}/cancel")
+    assert cancelled.status_code == 404, cancelled.text
+
+    # 子任务仍然属于原 Bot，状态没被上面的请求改动
+    assert _get_subtask(client, owner["id"], subtask_id)["status"] == "completed"
 
 
 # --- 列表过滤 ---
@@ -323,7 +455,10 @@ def test_subtasks_are_hidden_from_default_task_lists(client: TestClient) -> None
     bot_tasks = client.get(f"{PREFIX}/bots/{bot['id']}/tasks").json()["data"]
     assert subtask_id not in {item["id"] for item in bot_tasks}
 
-    explicit = client.get(f"{PREFIX}/tasks", params={"origin": "subtask"}).json()["data"]
+    # 首页列表默认还会挡掉 Bot 任务；显式按 origin 查子任务时要连 Bot 任务一起看。
+    explicit = client.get(
+        f"{PREFIX}/tasks", params={"origin": "subtask", "include_bot_tasks": True}
+    ).json()["data"]
     assert subtask_id in {item["id"] for item in explicit}
 
     listed = client.get(f"{PREFIX}/bots/{bot['id']}/subtasks").json()["data"]
@@ -342,7 +477,7 @@ def test_bot_chat_turn_injects_subtask_tools(client: TestClient) -> None:
 
     call = fake.calls[-1]
     names = {tool["function"]["name"] for tool in call["tools"]}
-    assert SUBTASK_TOOL_NAMES <= names
+    assert names >= SUBTASK_TOOL_NAMES
     assert "subtask_start" in call["tools_note"]
 
 
@@ -406,7 +541,8 @@ def test_subtasks_do_not_block_bot_launch_lock(container: Container) -> None:
         bot = await container.bots.create(name="巡检", description="检查磁盘")
         subtask = await container.bot_subtasks.create(bot, instruction="很长的工作")
 
-        assert fake.entered.wait(5)
+        # 事件循环里不能用阻塞的 Event.wait：它会挡住刚 create 的 job，永远进不到模型调用。
+        assert await asyncio.to_thread(fake.entered.wait, 5)
         assert await container.bots._repo.is_busy(bot.id) is False
         assert subtask.parent_task_id is not None
 
@@ -438,11 +574,17 @@ def test_shutdown_cancels_inflight_subtask(container: Container) -> None:
         bot = await container.bots.create(name="停机", description="长活")
         subtask = await container.bot_subtasks.create(bot, instruction="慢慢来")
 
-        assert fake.entered.wait(5)
-        await asyncio.wait_for(container.bot_subtasks.shutdown(), timeout=5)
+        assert await asyncio.to_thread(fake.entered.wait, 5)
+        with _capture_subtask_logs() as records:
+            await asyncio.wait_for(container.bot_subtasks.shutdown(), timeout=5)
 
         saved = await container.task_repo.get(subtask.id)
         assert saved.status == "cancelled"
+        # 停机收尾也必须留一条带 bot/subtask id 的 cancelled 日志
+        assert any(
+            "cancelled" in message and str(bot.id) in message and str(subtask.id) in message
+            for message in _log_text(records)
+        ), _log_text(records)
         assert container.bot_subtasks._jobs == set()
         assert container.bot_subtasks._tasks_by_subtask == {}
 
@@ -456,7 +598,7 @@ def test_dispose_does_not_hang_with_inflight_subtask(container: Container) -> No
         bot = await container.bots.create(name="退出", description="长活")
         await container.bot_subtasks.create(bot, instruction="慢慢来")
 
-        assert fake.entered.wait(5)
+        assert await asyncio.to_thread(fake.entered.wait, 5)
         await asyncio.wait_for(container.dispose(), timeout=10)
 
     asyncio.run(scenario())
