@@ -62,6 +62,36 @@ FLUX_BIND_ADDR=0.0.0.0    # 此时必须同时设置 FLUX_AUTH_TOKEN
 旧的无鉴权行为只能显式开启：`FLUX_ALLOW_NO_AUTH=true`。它仅适用于完全可信的内网，
 启动时会打印 WARNING；不要与公网暴露一起使用。
 
+### 接入 Claude Code
+
+镜像里已经装好 `@anthropic-ai/claude-code`，但 Claude Code 的接入状态还需要登记为
+READY。全新部署如果没有做这一步，`POST /api/v1/bots/{id}/run` 会返回 409
+`claude-code 尚未接入`。手动接入：
+
+```bash
+# Docker 部署（在容器内执行，等价于容器启动时的一次性初始化）
+docker compose exec flux-bot flux agents connect claude-code
+```
+
+也可以调用管理 API（Bot 节点已挂载 `/api/v1/installations`）：
+
+```bash
+curl -s -X POST http://127.0.0.1:8600/api/v1/installations/connect \
+  -H "Authorization: Bearer $FLUX_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"agent": "claude-code"}'
+```
+
+如果希望部署后自动完成这一步，在 `.env` 设置：
+
+```bash
+FLUX_AUTO_CONNECT_CLAUDE_CODE=true
+```
+
+开启后 Bot 节点启动时会检查 PATH：找到 `claude` 就把 `claude-code` 自动推进到 READY
+并记录日志；找不到只打印 WARNING，服务照常启动（`/run` 仍会 409）。该开关默认
+`false`，接入与否保持显式可控。
+
 ### 设备配对
 
 手机不再共用 `FLUX_AUTH_TOKEN`，而是用一次性配对码换一枚只属于自己的长期设备令牌
