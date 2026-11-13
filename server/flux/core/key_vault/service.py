@@ -115,7 +115,8 @@ class KeyVaultService:
         if not supports_provider(runtime, row.provider):
             provider_title = PROVIDER_TITLES.get(row.provider, row.provider)
             raise BadRequestError(
-                f"当前 Agent 的 runtime（{runtime or 'dsh'}）不能使用 {provider_title} 协议的密钥",
+                f"当前 Agent 的 runtime（{runtime or 'claude-code'}）不能使用"
+                f" {provider_title} 协议的密钥",
                 details={"key_id": str(row.id), "provider": row.provider, "runtime": runtime},
             )
         models = [str(item).strip() for item in (row.models or []) if str(item).strip()]
@@ -287,7 +288,7 @@ class KeyVaultService:
         return await self._channel(row, model)
 
     async def channel_for_key(self, key_id: str, model: str) -> ModelChannel:
-        """按 key + 模型解析通道（/dsh/runs 的显式选择用）。"""
+        """按 key + 模型解析通道（Run 创建时的显式选择用）。"""
         row = await self.get(key_id)
         if not row.enabled:
             raise BadRequestError(f"密钥 {row.name!r} 已停用", details={"key_id": str(row.id)})

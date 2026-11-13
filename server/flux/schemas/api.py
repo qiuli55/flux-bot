@@ -35,9 +35,9 @@ class AgentCreateRequest(BaseModel):
     skills: list[str] = Field(default_factory=list)
     tools: list[str] = Field(default_factory=list)
     permissions: list[Capability] = Field(default_factory=list)
-    #: 执行该 Agent 的 runtime（P2-1 §6.2）：内置 DSH 默认，或本机 CLI（codex / opencode）。
+    #: 执行该 Agent 的 runtime（P2-1 §6.2）：默认 Claude Code，或本机 CLI（codex / opencode）。
     #: 取值在边界即校验（非法 → 422），并由 AgentManager 再校验一次（内部调用方同样受约束）。
-    runtime: Literal["dsh", "codex", "opencode"] = "dsh"
+    runtime: Literal["claude-code", "codex", "opencode"] = "claude-code"
 
 
 class DevicePairRequest(BaseModel):
@@ -107,7 +107,7 @@ class BotCreateRequest(BaseModel):
     #: 无人值守是 Bot 的常态；需要人工把关时显式改成 normal / plan / full
     permission_mode: PermissionMode = PermissionMode.UNATTENDED
     decision_mode: DecisionMode = DecisionMode.AUTO
-    #: 独立工作目录（绝对路径）；留空 = <dsh_home>/bots/<id>/workspace
+    #: 独立工作目录（绝对路径）；留空 = <runtime_home>/bots/<id>/workspace
     workspace: str | None = Field(default=None, max_length=512)
     schedule: str | None = Field(default=None, max_length=64)
     #: 该 Bot 的 IANA 时区；留空 = 继承 FLUX_TIMEZONE
@@ -215,6 +215,17 @@ class BotTurnCreateRequest(BaseModel):
     content: str = Field(min_length=1, max_length=20_000)
     attachment_ids: list[str] = Field(default_factory=list, max_length=5)
     client_turn_id: str | None = Field(default=None, max_length=128)
+
+
+class BotSubtaskCreateRequest(BaseModel):
+    """给 Bot 派一条后台子任务。
+
+    子任务独立于对话轮次运行：接口立即返回子任务任务体，用户随后仍可继续聊天；
+    开始/完成/失败/取消都会以 kind=subtask 的消息追加到父对话。
+    """
+
+    instruction: str = Field(min_length=1, max_length=8000)
+    title: str | None = Field(default=None, max_length=200)
 
 
 class TaskMessageCreateRequest(BaseModel):

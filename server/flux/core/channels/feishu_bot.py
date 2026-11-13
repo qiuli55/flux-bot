@@ -11,16 +11,15 @@ Bot 的对话轮次，出站也必须经过审批闸门，而不是直接把报�
   不要重推；
 - `message_id` 作为 `client_turn_id`，重推不会产生第二轮。
 
-出站红线：**任何发给外部联系人的文本都不得自动发送**。turn 完成后只生成一份
-待发送草稿，并调用 `raise_approval` 在对话里挂一张「允许 / 拒绝」卡。只有用户
-选择「允许」后，`on_approval_resolved` 才会真正调用飞书发送接口；拒绝、超时或
-进程重启导致草稿丢失时一律不发。
+出站红线：**任何发给外部联系人的文本都不得自动发送**。turn 完成后只把待发送
+正文落进 `outbound_drafts`（pending），并调用 `raise_approval` 在对话里挂一张
+「允许 / 拒绝」卡。只有用户选择「允许」后，`on_approval_resolved` 才会原子认领
+草稿并真正调用飞书发送接口；拒绝、超时或进程重启时草稿仍留在库里，绝不自动发送。
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import hmac
 import json
 import time
@@ -28,7 +27,6 @@ import uuid
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -49,8 +47,6 @@ __all__ = [
     "FeishuBotChannel",
     "FeishuBotSender",
     "FeishuCallbackResult",
-    "FeishuDraftStore",
-    "FeishuOutboundDraft",
     "MESSAGE_EVENT_TYPE",
 ]
 
@@ -62,8 +58,6 @@ FEISHU_OUTBOUND_KIND = "feishu_outbound"
 MAX_TEXT_CHARS = 4000
 #: 审批卡里展示的草稿摘录上限
 _DETAIL_TEXT_CHARS = 1500
-#: 内存草稿上限：拒绝/超时的草稿不会立即清理，超过后丢弃最旧的
-_MAX_DRAFTS = 500
 
 
 @dataclass(frozen=True)
@@ -72,66 +66,6 @@ class FeishuCallbackResult:
 
     status_code: int
     payload: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class FeishuOutboundDraft:
-    """一份等待审批的飞书出站文本。正文只留在进程内，meta 里只放 id 与哈希。"""
-
-    id: str
-    text: str
-    chat_id: str
-    message_id: str
-    bot_id: uuid.UUID
-    task_id: uuid.UUID
-    turn_id: uuid.UUID
-    text_hash: str
-    created_at: datetime
-
-
-class FeishuDraftStore:
-    """进程内草稿表：审批通过时取走并删除，保证同一条草稿最多发送一次。"""
-
-    def __init__(self, *, limit: int = _MAX_DRAFTS) -> None:
-        self._items: dict[str, FeishuOutboundDraft] = {}
-        self._limit = max(1, int(limit))
-
-    def create(
-        self,
-        *,
-        text: str,
-        chat_id: str,
-        message_id: str,
-        bot_id: uuid.UUID,
-        task_id: uuid.UUID,
-        turn_id: uuid.UUID,
-    ) -> FeishuOutboundDraft:
-        if len(self._items) >= self._limit:
-            oldest = next(iter(self._items), None)
-            if oldest is not None:
-                self._items.pop(oldest, None)
-        draft = FeishuOutboundDraft(
-            id=uuid.uuid4().hex,
-            text=text,
-            chat_id=chat_id,
-            message_id=message_id,
-            bot_id=bot_id,
-            task_id=task_id,
-            turn_id=turn_id,
-            text_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
-            created_at=datetime.now(timezone.utc),
-        )
-        self._items[draft.id] = draft
-        return draft
-
-    def take(self, draft_id: str) -> FeishuOutboundDraft | None:
-        return self._items.pop(draft_id, None)
-
-    def get(self, draft_id: str) -> FeishuOutboundDraft | None:
-        return self._items.get(draft_id)
-
-    def __len__(self) -> int:
-        return len(self._items)
 
 
 class FeishuBotSender:
@@ -259,16 +193,11 @@ class FeishuBotChannel:
             )
         else:
             self._sender = None
-        self._drafts = FeishuDraftStore()
         self._background: set[asyncio.Task[Any]] = set()
         #: 同一对话任务同一时刻只挂一张出站审批卡，避免连续两轮各挂一张后
         #: `pending_decision()` 只认最后一张，前一张永远无法被选中。
         self._approval_lock = asyncio.Lock()
         self._turn_wait_seconds = max(1.0, float(turn_wait_seconds))
-
-    @property
-    def drafts(self) -> FeishuDraftStore:
-        return self._drafts
 
     async def handle(
         self, body: bytes, headers: Mapping[str, str] | None = None
@@ -377,48 +306,87 @@ class FeishuBotChannel:
         return FeishuCallbackResult(200, {"created": created, "turn_id": str(turn.id)})
 
     async def on_approval_resolved(self, event: str, payload: dict[str, Any]) -> None:
-        """审批结果监听：只有「允许」才发送，且同一条草稿最多发送一次。"""
+        """审批结果监听：只有「允许」才发送，且同一条草稿最多发送一次。
+
+        草稿状态迁移全部交给频道无关的 `OutboundDraftService`：认领失败说明
+        草稿已被处理（重复放行 / 已拒绝 / 已取消），这里直接跳过，绝不重复发送。
+        """
         if event != Events.APPROVAL_RESOLVED:
             return
         if payload.get("kind") != FEISHU_OUTBOUND_KIND:
             return
-        if payload.get("result") != "allowed" or payload.get("chosen") != APPROVAL_ALLOW:
-            logger.info(
-                "feishu.outbound.skip decision=%s result=%s",
-                payload.get("decision_id"),
-                payload.get("result"),
-            )
-            return
 
         meta = payload.get("meta")
         meta = meta if isinstance(meta, dict) else {}
-        draft_id = str(meta.get("draft_id") or "").strip()
-        if not draft_id:
+        raw_draft_id = str(meta.get("draft_id") or "").strip()
+        if not raw_draft_id:
             logger.warning("飞书出站审批缺少 draft_id，已跳过")
             return
+        try:
+            draft_id = uuid.UUID(raw_draft_id)
+        except ValueError:
+            logger.warning("飞书出站审批的 draft_id 非法，已跳过 draft=%s", raw_draft_id)
+            return
 
-        draft = self._drafts.take(draft_id)
+        service = getattr(self._container, "outbound_drafts", None)
+        if service is None:  # pragma: no cover - 装配错误，按 fail-closed 跳过
+            logger.error("出站草稿服务未装配，审批结果已忽略 draft=%s", raw_draft_id)
+            return
+
+        if payload.get("result") != "allowed" or payload.get("chosen") != APPROVAL_ALLOW:
+            await service.mark_denied(draft_id)
+            logger.info(
+                "feishu.outbound.skip decision=%s result=%s draft=%s",
+                payload.get("decision_id"),
+                payload.get("result"),
+                raw_draft_id,
+            )
+            return
+
+        draft = await service.claim(draft_id)
         if draft is None:
-            logger.info("飞书出站草稿不存在或已发送 draft=%s", draft_id)
+            logger.info("飞书出站草稿不存在或已被处理 draft=%s", raw_draft_id)
+            return
+        dest = draft.dest if isinstance(draft.dest, dict) else {}
+        chat_id = str(dest.get("chat_id") or "").strip()
+        if draft.channel != "feishu" or not chat_id:
+            await service.mark_failed(draft.id, "channel_or_dest_mismatch")
+            logger.error(
+                "飞书出站草稿的频道或目标不匹配 draft=%s channel=%s dest_keys=%s",
+                draft.id,
+                draft.channel,
+                sorted(dest),
+            )
             return
         sender = self._sender
         if sender is None:
+            # 不是「取走即丢」：标 failed 并保留正文，配置好凭据后仍可在草稿箱看到。
+            await service.mark_failed(draft.id, "sender_not_configured")
             logger.error(
                 "未配置飞书应用凭据，审批通过的草稿无法发送 draft=%s chat=%s",
                 draft.id,
-                draft.chat_id,
+                chat_id,
             )
             return
         try:
-            await sender.send_text(draft.chat_id, draft.text)
-        except Exception:  # noqa: BLE001 - 发送失败只记录，不能拖垮决策接口
-            logger.exception("飞书出站发送失败 draft=%s chat=%s", draft.id, draft.chat_id)
+            await sender.send_text(chat_id, draft.body)
+        except Exception as exc:  # noqa: BLE001 - 发送失败只记录，不能拖垮决策接口
+            await service.mark_failed(draft.id, exc)
+            logger.exception(
+                "飞书出站发送失败 draft=%s chat=%s hash=%s chars=%s",
+                draft.id,
+                chat_id,
+                draft.body_hash,
+                len(draft.body or ""),
+            )
             return
+        await service.mark_sent(draft.id)
         logger.info(
-            "飞书出站已发送 draft=%s chat=%s chars=%s",
+            "飞书出站已发送 draft=%s chat=%s hash=%s chars=%s",
             draft.id,
-            draft.chat_id,
-            len(draft.text),
+            chat_id,
+            draft.body_hash,
+            len(draft.body or ""),
         )
 
     async def aclose(self) -> None:
@@ -498,39 +466,46 @@ class FeishuBotChannel:
                     logger.info("飞书 turn 回复为空，不生成出站草稿 turn=%s", turn.id)
                     return
 
-                draft = self._drafts.create(
-                    text=text,
-                    chat_id=chat_id,
-                    message_id=message_id,
+                service = self._container.outbound_drafts
+                # 先生成审批 id 并写进草稿，保证审批卡出现的瞬间两边已经能互相定位。
+                decision_id = uuid.uuid4().hex
+                draft = await service.create(
+                    channel="feishu",
+                    body=text,
+                    dest={"chat_id": chat_id, "message_id": message_id},
                     bot_id=bot.id,
                     task_id=final.task_id,
                     turn_id=final.id,
+                    decision_id=decision_id,
                 )
                 await raise_approval(
                     self._container,
                     task_id=final.task_id,
                     run_id=None,
                     kind=FEISHU_OUTBOUND_KIND,
+                    decision_id=decision_id,
                     title="飞书回复等待你确认",
                     detail=(
                         f"准备发送到飞书会话 {chat_id}（消息 {message_id}）：\n\n{_excerpt(text)}"
                     ),
                     meta={
                         "channel": "feishu",
-                        "draft_id": draft.id,
+                        "draft_id": str(draft.id),
                         "chat_id": chat_id,
                         "message_id": message_id,
                         "bot_id": str(bot.id),
                         "turn_id": str(final.id),
-                        "text_hash": draft.text_hash,
+                        "text_hash": draft.body_hash,
                         "chars": len(text),
                     },
                 )
                 logger.info(
-                    "飞书出站审批已创建 draft=%s turn=%s task=%s",
+                    "飞书出站审批已创建 draft=%s turn=%s task=%s hash=%s chars=%s",
                     draft.id,
                     final.id,
                     final.task_id,
+                    draft.body_hash,
+                    len(text),
                 )
         except asyncio.CancelledError:
             raise

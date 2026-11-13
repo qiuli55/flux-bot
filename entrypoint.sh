@@ -3,7 +3,7 @@
 set -e
 
 # 所有持久化目录都落在 /data 卷里；~/.flux（密钥库主密钥等）也随 HOME 一起进卷。
-DATA_DIRS="${FLUX_UPLOADS_DIR:-/data/uploads} ${FLUX_DELIVERIES_DIR:-/data/deliveries} ${FLUX_DSH_WORKSPACE:-/data/dsh-ws} ${FLUX_WORKSPACE_ROOT:-/data/workspace} ${FLUX_DSH_HOME:-/data/dsh-home}"
+DATA_DIRS="${FLUX_UPLOADS_DIR:-/data/uploads} ${FLUX_DELIVERIES_DIR:-/data/deliveries} ${FLUX_RUNTIME_WORKSPACE:-/data/runtime-ws} ${FLUX_WORKSPACE_ROOT:-/data/workspace} ${FLUX_RUNTIME_HOME:-/data/runtime-home}"
 
 mkdir -p $DATA_DIRS "$HOME" "$HOME/.flux"
 chmod 700 "$HOME/.flux"

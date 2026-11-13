@@ -1,0 +1,224 @@
+# Bot 浏览器自动化（Browser Agent）
+
+本文说明 Bot 执行内核当前有没有浏览器能力、如何通过扩展 MCP 注入一个浏览器
+sidecar，以及这样做时哪些安全边界必须自己守住。
+
+## 当前状态
+
+- **执行内核没有浏览器工具。** Claude Code 内核每轮拿到的隔离 `mcp.json` 里只有
+  Flux 自己的 `flux` server（项目读取 / 提案 / 终端），没有导航、点击、截图之类的
+  工具。Agent 默认只能读文件、跑命令、走 Flux MCP。
+- **`server/flux/core/desktop` 的 noVNC 云桌面不是 Agent 能力。** 它是一套
+  「给人看、给人操作」的远程桌面入口：Flux 只负责解析隧道地址、签发短期票据，
+  把手机 / 浏览器接到 Hermes 云电脑的 noVNC 页面。Agent 既不能调用它，也拿不到
+  页面 DOM 或截图；它解决的是「人远程看这台 Bot 的桌面」，不是「Bot 自己上网」。
+- 因此，需要 Bot 真正操作网页时，必须显式接入一个 **MCP 浏览器 server**。下面的
+  扩展点是通用入口；本仓库另外附带一个可选的 Playwright MCP overlay 作为已验证
+  形状的参考实现。
+
+## 通过扩展点接入浏览器
+
+Claude Code 内核支持在隔离配置里追加额外的 MCP server：
+
+- 配置项：`FLUX_CLAUDE_EXTRA_MCP_SERVERS`（`server/flux/config.py`）
+- 取值：一个 JSON 对象字符串，形状与 Claude Code 的 `mcpServers` 一致
+- 解析与校验：`server/flux/core/agent_runtime/extra_mcp.py`
+- 注入位置：每轮 Run 的 `<FLUX_RUNTIME_HOME>/runs/task-<task_id>/claude-home/mcp.json`
+
+只接受 **http / sse 型远程 server**。`stdio` / `command` 型会被直接丢弃：那等于
+让一份配置字符串在 Flux 容器里拉起任意进程，属于刻意不开放的攻击面。Flux 自己的
+`flux` 是保留名，配置了同名条目也不会覆盖真实端点。
+
+### 1. 起一个 Playwright MCP sidecar（可选 overlay）
+
+仓库根的 `docker-compose.browser.yml` 是一个**可选** overlay，不改基础镜像、
+`Dockerfile` 或 `docker-compose.yml`。它新增：
+
+- `playwright-mcp`：官方 Playwright MCP 镜像，长驻 streamable HTTP 服务，
+  端点 `http://playwright-mcp:8931/mcp`；
+- 只加入专用 `browser` 网络的 `flux-bot`，并注入 `browser` 这个额外 MCP server。
+
+#### 版本快照
+
+以下值是 **[2026-11-12 快照]**，不是「永远最新」声明：
+
+| 项目 | 值 |
+| --- | --- |
+| npm 包 | `@playwright/mcp` 最新版 `0.0.85`（2026-11-09 发布） |
+| 官方镜像 | `mcr.microsoft.com/playwright/mcp:v0.0.85` |
+| 镜像 digest | `sha256:cc70a6922ff856f3aba0fe97d0d94220dc9a7f367f6d332facc6d81d9a91e60e`（多架构索引） |
+| MCP 端点 | `http://playwright-mcp:8931/mcp` |
+
+来源：
+
+- npm registry：<https://registry.npmjs.org/@playwright%2Fmcp>
+- mcr.microsoft.com tag list：<https://mcr.microsoft.com/v2/playwright/mcp/tags/list>
+- 官方 README（长驻服务示例与全部命令行参数）：<https://github.com/microsoft/playwright-mcp>
+
+overlay 里的完整镜像引用是：
+
+```text
+mcr.microsoft.com/playwright/mcp:v0.0.85@sha256:cc70a6922ff856f3aba0fe97d0d94220dc9a7f367f6d332facc6d81d9a91e60e
+```
+
+tag 与 digest 同时写是刻意的：tag 方便人读，digest 保证就算 tag 被重新指向，
+拉到的仍是快照当天的同一份内容。
+
+#### 启动
+
+必须把基础编排一起叠加，否则 `flux-bot` 的镜像、`./data` 卷和 `.env` 都会丢：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.browser.yml up -d
+```
+
+overlay 的关键配置：
+
+- **不写 `ports:`**，只 `expose: "8931"`：端口只在 compose 网络内可见，宿主机和
+  局域网都连不上；能连上 sidecar 的只有 `browser` 网络里的 `flux-bot`。
+- `--headless --browser chromium --no-sandbox`：容器内无显示器，Chromium 以
+  root 运行时需要 `--no-sandbox`（官方 README 的容器示例同样如此）。
+- `--isolated`：浏览器 profile 放在内存里，容器重建即清空，不残留登录态。**代价**
+  是每次重启都是全新 profile；若确实需要持久化登录态，改成 `--user-data-dir
+  /data/profile` 并给该路径单独挂一个命名卷（不要复用宿主机的真实浏览器 profile）。
+- `--allowed-hosts playwright-mcp`：该服务默认只接受 `localhost` / 回环地址和
+  `--host` 取值作为 Host 头；容器间用服务名访问，不把 `playwright-mcp` 列进来会
+  被拒绝。
+- `--output-dir /data/output`：截图 / 下载产物落在命名卷 `playwright-output` 上，
+  容器重建不丢。
+- `shm_size: "1gb"` + `init: true`：Chromium 对共享内存的需求远大于 docker 默认
+  的 64MB；`init` 负责回收僵尸进程。
+- 基础编排里的 `flux-bot` 保留 `default` 网络（宿主机 8600 端口发布照常工作），
+  额外加入 `browser` 网络，从而能按服务名解析到 `playwright-mcp`。
+
+#### 出站网络：为什么不用 `internal: true`
+
+`browser` 网络是普通 bridge 网络，**没有** 设 `internal: true`。原因很直接：
+浏览器要访问互联网，而 `internal: true` 会切断 sidecar 的所有外部路由，
+Playwright 连一个站点都打不开，浏览器能力就失去了意义。
+
+代价是这个 sidecar 默认拥有不受限的出站访问。需要收紧时，**由运维在 sidecar
+之外**做 egress 过滤，例如：
+
+- 在宿主机防火墙 / 网关上只放行任务需要的域名或 IP 段；
+- 给 sidecar 配一个正向代理，只允许白名单目标；
+- 用单独的网络命名空间 / 独立主机承载高风险任务。
+
+注意：Playwright MCP 的 `--allowed-origins` / `--blocked-origins` 只约束浏览器
+能导航到哪些源，**不是**安全边界（官方 README 明确说明），不能拿来替代网络层
+egress 控制。
+
+#### 验证
+
+```bash
+# 1) 只做静态渲染校验，不拉镜像、不启动容器
+docker compose -f docker-compose.yml -f docker-compose.browser.yml config >/dev/null
+
+# 2) 启动并确认两个容器都在运行
+docker compose -f docker-compose.yml -f docker-compose.browser.yml up -d
+docker compose -f docker-compose.yml -f docker-compose.browser.yml ps
+
+# 3) 看 sidecar 是否已在监听 8931
+docker compose -f docker-compose.yml -f docker-compose.browser.yml logs playwright-mcp
+
+# 4) 从 flux-bot 容器内验证按服务名可达（任意 HTTP 响应都算连通；
+#    GET 一个 MCP 端点通常返回 400/405/406，连接被拒或 DNS 失败才是不通）
+docker compose -f docker-compose.yml -f docker-compose.browser.yml exec flux-bot \
+  curl -sS -o /dev/null -w '%{http_code}\n' http://playwright-mcp:8931/mcp
+```
+
+然后发起一轮 Bot 任务，启动日志里应出现：
+
+```text
+Claude 本轮注入扩展 MCP server：browser
+```
+
+同时可以检查该任务目录下的 `mcp.json`，应同时包含 `flux` 和 `browser` 两个条目。
+若日志里只有拒绝原因，按下面的配置约束核对。若 Claude Code 运行期连不上，先在
+`flux-bot` 里重跑第 4 步区分网络问题与端点路径问题。
+
+> **未验证声明**：本文档编写时（2026-11-12）**没有在本机构建、拉取或运行过**该
+> 镜像，**镜像大小未实测**。版本、digest、启动参数与端点来自上面的公开 registry /
+> README；仓库测试只对 compose 文件做 YAML 静态解析，不会联网或启动容器。
+
+#### 不叠加 overlay 时
+
+只想要浏览器能力、不用本仓库 overlay 也可以，把 sidecar 接到与 `flux-bot` 相同的
+网络，并在部署环境的 `.env` 里写一行（实际值必须是一行 JSON）：
+
+```dotenv
+FLUX_CLAUDE_EXTRA_MCP_SERVERS={"browser":{"type":"http","url":"http://playwright-mcp:8931/mcp"}}
+```
+
+需要多个 server 时放进同一个对象即可：
+
+```dotenv
+FLUX_CLAUDE_EXTRA_MCP_SERVERS={"browser":{"type":"http","url":"http://playwright-mcp:8931/mcp"},"search":{"type":"sse","url":"http://search-mcp:9000/sse"}}
+```
+
+如果 sidecar 需要鉴权，用 `headers` 传令牌（不要把真实密钥提交进仓库）：
+
+```dotenv
+FLUX_CLAUDE_EXTRA_MCP_SERVERS={"browser":{"type":"http","url":"http://playwright-mcp:8931/mcp","headers":{"Authorization":"Bearer <token, keep secret>"}}}
+```
+
+端点路径以所选实现为准；Playwright MCP 的长驻 HTTP 端点是 `/mcp`。填错时 Claude
+Code 只会在运行时连不上，不会在启动时替你校验。
+
+配置约束（不满足的条目会被丢弃并留一条 warning）：
+
+| 字段 | 要求 |
+| --- | --- |
+| server 名 | ASCII `[A-Za-z0-9_-]{1,64}`；`flux` 为保留名 |
+| `type` | 只允许 `http` / `sse` |
+| `url` | 必须是 `http://` 或 `https://` 字符串 |
+| `headers` | 可选；必须是字符串到字符串的对象 |
+
+日志只记录 **server 名与拒绝原因**，不会打印 `headers` 的值（可能含令牌）。
+
+### 2. 权限模式
+
+扩展 server 的工具**不会**获得额外放行，它们与 `flux` 工具走同一套 Claude Code
+权限行为（映射见 `server/flux/core/agent_runtime/runtimes/cli.py` 的
+`_CLAUDE_PERMISSION_MODES`）：
+
+- `plan`：只读规划，浏览器工具同样受只读限制；
+- `normal`：映射到 Claude Code 的 `default` 模式。Bot 以 `claude -p`（print /
+  headless）方式运行，`default` 模式下没有交互式终端可以应答审批，因此凡是需要
+  授权的工具调用（MCP 工具、Bash、文件编辑）都会被**直接拒绝**。也就是说目前
+  `normal` 下 `browser` 等扩展 server 的工具实际不可用，而不是「逐次询问」；
+- `unattended` / `full`：映射到 `bypassPermissions`，工具调用整体放行。
+
+`--permission-prompt-tool` 审批桥已在 PR #23
+（<https://github.com/qiuli55/flux-bot/pull/23>，分支 `feat/claude-approval-bridge`，
+尚未合并）中实现，不再是内核待办项。合并后 `normal` 会把浏览器等工具的调用转成
+Flux 审批卡而不是直接拒绝；在合并之前，`normal` 仍然直接拒绝这类调用，使用浏览器
+必须切到 `unattended` / `full`。浏览器操作往往伴随登录态和对外副作用，放开前先确认
+任务与站点范围。依据：Claude Code 文档 `permission-modes` 与 `headless`。
+
+## 安全注意事项
+
+1. **allowed origins / allowed hosts 不是安全边界。** 对 MCP server 来说，能连上
+   它的进程就能驱动浏览器；`Origin` / `Host` 校验只防浏览器跨站与 DNS rebinding，
+   不防同网络里的其它容器。因此：sidecar 不要发布端口到宿主机或公网，只挂在
+   Flux 所在的专用网络；需要鉴权时用 `headers` 令牌，并同时限制网络可达范围。
+2. **出站范围要自己收紧。** overlay 的 `browser` 网络刻意允许浏览器访问互联网
+   （`internal: true` 会让浏览器直接不可用），所以默认没有出站白名单。高风险部署
+   应在宿主机 / 网关做 egress 过滤或前置代理，不要依赖 MCP server 的 origins 参数。
+3. **使用隔离的浏览器 profile。** 不要挂载用户真实浏览器的 profile / Cookie /
+   已登录会话。overlay 用 `--isolated` 把 profile 放在内存里，容器重建即清空；
+   若改用 `--user-data-dir`，给它独立卷，并按需在任务结束后清理，避免不同 Bot /
+   任务之间串号。
+4. **出站动作要审批。** 登录、下单、发帖、提交表单、下载文件都属于对外副作用。
+   `unattended` / `full` 模式不会逐次询问，只适合低风险或已明确授权的任务。注意
+   目前 `normal` 在 headless 下并不能「逐次审批」——未经预授权的浏览器工具调用会
+   被直接拒绝，所以它只适合验证配置，不适合放开副作用。逐次审批的审批桥已由 PR #23
+   （<https://github.com/qiuli55/flux-bot/pull/23>，分支 `feat/claude-approval-bridge`，
+   尚未合并）实现，合并后 `normal` 才会把这些调用转成 Flux 审批卡；在那之前高风险
+   操作应使用 `unattended` / `full` 并自行确认授权范围，或只给 sidecar 配置只读
+   站点白名单（注意白名单不是安全边界）。
+5. **不要把密钥写进仓库。** `headers` 里的令牌只放部署环境的 `.env`；日志虽然不打
+   印 header 值，但 `.env`、`mcp.json`（0600）本身仍需按凭据管理。
+6. **不要用 noVNC 桌面地址充当 MCP 端点。** 云桌面是人工入口，不是 Agent 接口；
+   把隧道地址填进 `FLUX_CLAUDE_EXTRA_MCP_SERVERS` 只会让内核连到一个网页而不是
+   MCP 服务。
