@@ -14,9 +14,11 @@ import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -35,6 +37,11 @@ from flux.core.channels.dingtalk_crypto import (
     decrypt_message,
     encrypt_message,
     verify_signature,
+)
+from flux.core.channels.inbound_media import (
+    VOICE_ASR_FAILED_TEXT,
+    VOICE_NO_ASR_TEXT,
+    DownloadedMedia,
 )
 from flux.core.task_engine.assistant import AssistantTurn
 from flux.main import create_app
@@ -68,35 +75,81 @@ class _FakeBots:
 class _FakeConversation:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
-        self.seen: set[str] = set()
+        self.find_calls: list[str | None] = []
+        self.by_client_id: dict[str, Any] = {}
         self.turns: list[Any] = []
 
     async def create_turn(
-        self, bot: Any, *, content: str, client_turn_id: str | None = None
+        self,
+        bot: Any,
+        *,
+        content: str,
+        files: list[Any] | None = None,
+        client_turn_id: str | None = None,
     ) -> tuple[Any, bool]:
-        self.calls.append({"bot_id": bot.id, "content": content, "client_turn_id": client_turn_id})
-        if client_turn_id is not None and client_turn_id in self.seen:
-            return self.turns[0], False
-        if client_turn_id is not None:
-            self.seen.add(client_turn_id)
+        self.calls.append(
+            {
+                "bot_id": bot.id,
+                "content": content,
+                "files": list(files or ()),
+                "client_turn_id": client_turn_id,
+            }
+        )
+        if client_turn_id is not None and client_turn_id in self.by_client_id:
+            return self.by_client_id[client_turn_id], False
         turn = SimpleNamespace(id=uuid.uuid4(), task_id=uuid.uuid4())
         self.turns.append(turn)
+        if client_turn_id is not None:
+            self.by_client_id[client_turn_id] = turn
         return turn, True
+
+    async def find_turn(self, bot: Any, client_turn_id: str | None) -> Any | None:
+        self.find_calls.append(client_turn_id)
+        if client_turn_id is None:
+            return None
+        return self.by_client_id.get(client_turn_id)
 
     async def wait_for_turn(self, bot_id: uuid.UUID, turn_id: uuid.UUID, *, wait_seconds: float):
         return SimpleNamespace(id=turn_id, status="failed", reply_message_id=None)
 
 
+async def _chunks(*parts: bytes):
+    for part in parts:
+        yield part
+
+
 class _FakeSender:
-    def __init__(self, *, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        error: Exception | None = None,
+        payload: bytes = b"media-bytes",
+        mime: str = "application/octet-stream",
+        name: str = "",
+        parts: list[bytes] | None = None,
+    ) -> None:
         self.messages: list[tuple[dict[str, Any], str]] = []
         self.error = error
         self.closed = False
+        self.payload = payload
+        self.mime = mime
+        self.name = name
+        self.parts = parts
+        self.downloads: list[dict[str, Any]] = []
 
     async def send_text(self, dest: dict[str, Any], text: str) -> None:
         self.messages.append((dict(dest), text))
         if self.error is not None:
             raise self.error
+
+    async def download_media(
+        self, *, download_code: str, robot_code: str | None = None
+    ) -> DownloadedMedia:
+        self.downloads.append({"download_code": download_code, "robot_code": robot_code})
+        if self.error is not None:
+            raise self.error
+        parts = self.parts if self.parts is not None else [self.payload]
+        return DownloadedMedia(name=self.name, mime=self.mime, chunks=_chunks(*parts))
 
     async def aclose(self) -> None:
         self.closed = True
@@ -145,6 +198,19 @@ def _message_payload(
     }
 
 
+def _media_payload(
+    msgtype: str,
+    *,
+    msg_id: str = MSG_ID,
+    body: dict[str, Any] | None = None,
+    **overrides: Any,
+) -> dict[str, Any]:
+    """官方媒体回调把字段放在与 msgtype 同名的子对象里（picture / audio / file）。"""
+    payload = _message_payload(msgtype=msgtype, msg_id=msg_id, **overrides)
+    payload[msgtype] = body or {}
+    return payload
+
+
 def _encrypted_request(
     payload: dict[str, Any],
     *,
@@ -183,11 +249,18 @@ def _assert_encrypted_success(response: Any) -> str:
     return message
 
 
-def _unit_channel(*, bot_id: str | None = None, **kwargs: Any) -> DingTalkBotChannel:
+def _unit_channel(
+    *,
+    settings: Settings | None = None,
+    sender: Any | None = None,
+    bot_id: str | None = None,
+    **kwargs: Any,
+) -> DingTalkBotChannel:
     bot = SimpleNamespace(id=uuid.uuid4(), name="钉钉小助", status="active")
     container = SimpleNamespace(
         bots=_FakeBots(bot),
         bot_conversation=_FakeConversation(),
+        settings=settings,
     )
     return DingTalkBotChannel(
         container,  # type: ignore[arg-type]
@@ -195,6 +268,7 @@ def _unit_channel(*, bot_id: str | None = None, **kwargs: Any) -> DingTalkBotCha
         token=TOKEN,
         aes_key=AES_KEY,
         bot_id=bot_id or str(bot.id),
+        sender=sender,
         **kwargs,
     )
 
@@ -544,12 +618,14 @@ async def test_v2_event_envelope_is_supported() -> None:
     await channel.aclose()
 
 
-async def test_non_text_and_unknown_events_are_ignored_but_acknowledged() -> None:
+async def test_unsupported_types_and_unknown_events_are_ignored_but_acknowledged() -> None:
     channel = _unit_channel()
-    query, raw = _encrypted_request(_message_payload(msgtype="picture"))
-    result = await channel.handle(raw, query, {})
-    assert result.status_code == 200
-    assert set(result.payload) == {"msg_signature", "timeStamp", "nonce", "encrypt"}
+    # 视频 / 表情 / 位置 / 链接仍忽略；图片/语音/文件已支持，不再忽略。
+    for msgtype in ("video", "sticker", "location", "link"):
+        query, raw = _encrypted_request(_message_payload(msgtype=msgtype))
+        result = await channel.handle(raw, query, {})
+        assert result.status_code == 200, msgtype
+        assert set(result.payload) == {"msg_signature", "timeStamp", "nonce", "encrypt"}
 
     query, raw = _encrypted_request(_message_payload(event_type="user_add_org"))
     result = await channel.handle(raw, query, {})
@@ -586,6 +662,208 @@ async def test_logs_do_not_contain_secrets_or_body(caplog: pytest.LogCaptureFixt
     assert payload["text"]["content"] not in logs
     assert raw.decode("utf-8") not in logs
     assert query["signature"] not in logs
+    await channel.aclose()
+
+
+# --- 入站媒体 ---
+
+
+async def _handle_media(
+    channel: DingTalkBotChannel,
+    *,
+    msgtype: str,
+    body: dict[str, Any],
+    msg_id: str = MSG_ID,
+):
+    query, raw = _encrypted_request(_media_payload(msgtype, msg_id=msg_id, body=body))
+    return await channel.handle(raw, query, {})
+
+
+async def test_inbound_picture_downloads_and_creates_turn(settings: Settings) -> None:
+    sender = _FakeSender(payload=b"png-bytes", mime="image/png", name="ding-photo.png")
+    channel = _unit_channel(settings=settings, sender=sender)
+
+    result = await _handle_media(
+        channel,
+        msgtype="picture",
+        body={"downloadCode": "PIC_CODE_1", "photoURL": "https://example.invalid/p.png"},
+    )
+    assert result.status_code == 200
+    assert set(result.payload) == {"msg_signature", "timeStamp", "nonce", "encrypt"}
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    call = conversation.calls[0]
+    assert call["content"] == ""
+    uploaded = call["files"][0]
+    assert uploaded.name == "ding-photo.png"
+    assert uploaded.mime == "image/png"
+    assert uploaded.size == len(b"png-bytes")
+    assert Path(uploaded.path).is_file()
+    assert Path(uploaded.path).resolve().is_relative_to(Path(settings.uploads_dir).resolve())
+    assert sender.downloads == [{"download_code": "PIC_CODE_1", "robot_code": ROBOT_CODE}]
+    await channel.aclose()
+
+
+async def test_inbound_file_keeps_platform_filename(settings: Settings) -> None:
+    sender = _FakeSender(payload=b"docx-body", mime="application/octet-stream")
+    channel = _unit_channel(settings=settings, sender=sender)
+
+    result = await _handle_media(
+        channel,
+        msgtype="file",
+        body={"downloadCode": "FILE_CODE_1", "fileName": "周报.docx"},
+    )
+    assert result.status_code == 200
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    uploaded = conversation.calls[0]["files"][0]
+    assert uploaded.name == "周报.docx"
+    assert uploaded.size == len(b"docx-body")
+    await channel.aclose()
+
+
+async def test_inbound_audio_without_asr_keeps_audio_and_explains(settings: Settings) -> None:
+    sender = _FakeSender(payload=b"amr", mime="audio/amr")
+    channel = _unit_channel(settings=settings, sender=sender)
+
+    result = await _handle_media(
+        channel, msgtype="audio", body={"downloadCode": "AUDIO_CODE_1", "duration": 3000}
+    )
+    assert result.status_code == 200
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    call = conversation.calls[0]
+    assert call["content"] == VOICE_NO_ASR_TEXT
+    assert call["files"][0].mime == "audio/amr"
+    assert sender.downloads[0]["download_code"] == "AUDIO_CODE_1"
+    await channel.aclose()
+
+
+async def test_inbound_audio_uses_platform_recognition(settings: Settings) -> None:
+    sender = _FakeSender(payload=b"amr", mime="audio/amr")
+    channel = _unit_channel(settings=settings, sender=sender)
+
+    await _handle_media(
+        channel,
+        msgtype="audio",
+        body={"downloadCode": "AUDIO_CODE_2", "recognition": "把空调调到二十六度"},
+    )
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    assert conversation.calls[0]["content"] == "把空调调到二十六度"
+    assert len(conversation.calls[0]["files"]) == 1
+    await channel.aclose()
+
+
+async def test_inbound_audio_uses_injected_transcriber(settings: Settings) -> None:
+    class _Transcriber:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, str]] = []
+
+        async def transcribe(self, *, path: str, name: str, mime: str) -> str:
+            self.calls.append({"path": path, "name": name, "mime": mime})
+            return "钉钉转写结果"
+
+    transcriber = _Transcriber()
+    sender = _FakeSender(payload=b"amr", mime="audio/amr")
+    channel = _unit_channel(settings=settings, sender=sender, transcriber=transcriber)
+
+    await _handle_media(channel, msgtype="audio", body={"downloadCode": "AUDIO_CODE_3"})
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    uploaded = conversation.calls[0]["files"][0]
+    assert conversation.calls[0]["content"] == "钉钉转写结果"
+    assert transcriber.calls == [
+        {"path": uploaded.path, "name": uploaded.name, "mime": uploaded.mime}
+    ]
+    await channel.aclose()
+
+
+async def test_inbound_audio_transcriber_failure_is_explained(settings: Settings) -> None:
+    class _BrokenTranscriber:
+        async def transcribe(self, *, path: str, name: str, mime: str) -> str:
+            raise RuntimeError("asr failed access_token=leak")
+
+    sender = _FakeSender(payload=b"amr", mime="audio/amr")
+    channel = _unit_channel(settings=settings, sender=sender, transcriber=_BrokenTranscriber())
+
+    result = await _handle_media(channel, msgtype="audio", body={"downloadCode": "AUDIO_CODE_4"})
+    assert result.status_code == 200
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    assert conversation.calls[0]["content"] == VOICE_ASR_FAILED_TEXT
+    assert len(conversation.calls[0]["files"]) == 1
+    await channel.aclose()
+
+
+async def test_inbound_media_replay_does_not_download_twice(settings: Settings) -> None:
+    sender = _FakeSender(payload=b"img", mime="image/png", name="a.png")
+    channel = _unit_channel(settings=settings, sender=sender)
+
+    first = await _handle_media(
+        channel, msgtype="picture", body={"downloadCode": "PIC_REPLAY"}, msg_id="MSG_REPLAY"
+    )
+    second = await _handle_media(
+        channel, msgtype="picture", body={"downloadCode": "PIC_REPLAY"}, msg_id="MSG_REPLAY"
+    )
+    assert first.status_code == 200 and second.status_code == 200
+    assert len(sender.downloads) == 1
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    assert len(conversation.calls) == 1
+    assert conversation.find_calls == ["MSG_REPLAY", "MSG_REPLAY"]
+    await channel.aclose()
+
+
+async def test_inbound_media_over_50mb_is_acknowledged_without_upload(
+    settings: Settings,
+) -> None:
+    megabyte = b"x" * (1024 * 1024)
+    sender = _FakeSender(mime="application/octet-stream", parts=[megabyte] * 51)
+    channel = _unit_channel(settings=settings, sender=sender)
+
+    result = await _handle_media(channel, msgtype="file", body={"downloadCode": "HUGE"})
+    assert result.status_code == 200
+    assert set(result.payload) == {"msg_signature", "timeStamp", "nonce", "encrypt"}
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    assert conversation.calls == []
+    assert list(Path(settings.uploads_dir).glob("*")) == []
+    await channel.aclose()
+
+
+async def test_inbound_media_without_credentials_explains_in_chinese(
+    settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("DEBUG")
+    channel = _unit_channel(settings=settings)  # 没有 app_secret → 无发送端
+
+    result = await _handle_media(channel, msgtype="picture", body={"downloadCode": "PIC_NO_CREDS"})
+    assert result.status_code == 200
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    call = conversation.calls[0]
+    assert "未配置钉钉应用凭据" in call["content"]
+    assert call["files"] == []
+    assert APP_SECRET not in caplog.text
+    await channel.aclose()
+
+
+async def test_inbound_media_accepts_image_and_voice_aliases(settings: Settings) -> None:
+    sender = _FakeSender(payload=b"img", mime="image/png", name="alias.png")
+    channel = _unit_channel(settings=settings, sender=sender)
+
+    await _handle_media(
+        channel, msgtype="image", body={"downloadCode": "ALIAS_PIC"}, msg_id="MSG_ALIAS_1"
+    )
+    await _handle_media(
+        channel, msgtype="voice", body={"downloadCode": "ALIAS_VOICE"}, msg_id="MSG_ALIAS_2"
+    )
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    assert len(conversation.calls) == 2
+    assert conversation.calls[1]["content"] == VOICE_NO_ASR_TEXT
+    assert len(conversation.calls[1]["files"]) == 1
     await channel.aclose()
 
 
@@ -924,5 +1202,76 @@ def test_dingtalk_bot_sender_uses_official_robot_api() -> None:
         assert single["json"]["robotCode"] == ROBOT_CODE
         assert single["json"]["userIds"] == [STAFF_ID]
         assert json.loads(single["json"]["msgParam"]) == {"content": "单聊文本"}
+
+    asyncio.run(scenario())
+
+
+def test_dingtalk_sender_downloads_media_via_official_two_step_api() -> None:
+    """官方两步下载：messageFiles/download 换 downloadUrl，再 GET 预签名地址。"""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1.0/oauth2/accessToken":
+            return httpx.Response(200, json={"accessToken": "ding-token", "expireIn": 7200})
+        if request.url.path == "/v1.0/robot/messageFiles/download":
+            return httpx.Response(
+                200, json={"downloadUrl": "https://oss.example.com/dl/abc?sign=1"}
+            )
+        return httpx.Response(
+            200,
+            content=b"ding-bytes",
+            headers={
+                "content-type": "image/png",
+                "content-disposition": 'attachment; filename="ding.png"',
+            },
+        )
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            sender = DingTalkBotSender(
+                app_key=APP_KEY,
+                app_secret=APP_SECRET,
+                api_base="https://api.dingtalk.com",
+                client=http_client,
+            )
+            media = await sender.download_media(download_code="PIC_CODE", robot_code=ROBOT_CODE)
+            assert media.mime == "image/png"
+            assert media.name == "ding.png"
+            chunks = [chunk async for chunk in media.chunks]
+            assert b"".join(chunks) == b"ding-bytes"
+            await sender.aclose()
+
+    asyncio.run(scenario())
+
+    assert [request.url.path for request in requests] == [
+        "/v1.0/oauth2/accessToken",
+        "/v1.0/robot/messageFiles/download",
+        "/dl/abc",
+    ]
+    download_call = requests[1]
+    assert download_call.method == "POST"
+    assert download_call.headers["x-acs-dingtalk-access-token"] == "ding-token"
+    assert json.loads(download_call.content) == {
+        "downloadCode": "PIC_CODE",
+        "robotCode": ROBOT_CODE,
+    }
+    assert requests[2].method == "GET"
+    assert requests[2].url.params["sign"] == "1"
+
+
+def test_dingtalk_sender_requires_download_url() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1.0/oauth2/accessToken":
+            return httpx.Response(200, json={"accessToken": "t", "expireIn": 7200})
+        return httpx.Response(200, json={})
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            sender = DingTalkBotSender(app_key=APP_KEY, app_secret=APP_SECRET, client=http_client)
+            with pytest.raises(RuntimeError) as excinfo:
+                await sender.download_media(download_code="X", robot_code=ROBOT_CODE)
+            assert "downloadUrl" in str(excinfo.value)
+            await sender.aclose()
 
     asyncio.run(scenario())

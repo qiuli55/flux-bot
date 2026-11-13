@@ -28,17 +28,27 @@ from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 import httpx
 
 from flux.core.channels.feishu_crypto import FeishuCryptoError, decrypt_payload, verify_signature
+from flux.core.channels.inbound_media import (
+    DownloadedMedia,
+    Transcriber,
+    media_from_response,
+    pick_media_name,
+    safe_error,
+    save_media,
+    transcribe_audio,
+)
 from flux.core.event.bus import Events
 from flux.core.task_engine.approvals import (
     APPROVAL_ALLOW,
     outbound_approval_options,
     raise_approval,
 )
-from flux.errors import AIOSError, NotFoundError
+from flux.errors import AIOSError, NotFoundError, ValidationError
 from flux.logging import get_logger
 
 if TYPE_CHECKING:
@@ -74,6 +84,23 @@ class FeishuCallbackResult:
 
     status_code: int
     payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _InboundMessage:
+    """解析后的入站消息：文本或一条待下载的媒体。"""
+
+    message_id: str
+    chat_id: str
+    kind: str  # text / image / file / audio
+    text: str = ""
+    resource_key: str = ""
+    file_name: str = ""
+    recognition: str = ""
+
+
+#: 媒体类型的中文名，用于缺凭据时给用户一句能看懂的解释。
+_KIND_LABELS = {"image": "图片", "file": "文件", "audio": "语音"}
 
 
 class FeishuBotSender:
@@ -116,6 +143,30 @@ class FeishuBotSender:
         )
         _raise_for_feishu(response, "发送飞书消息")
 
+    async def download_media(
+        self,
+        *,
+        message_id: str,
+        file_key: str,
+        resource_type: str = "file",
+    ) -> DownloadedMedia:
+        """按官方「获取消息中的资源文件」接口下载图片 / 文件 / 语音。
+
+        官方 type 只接受 image / file；语音必须用 type=file（type=audio 会 400）。
+        """
+        token = await self._tenant_token()
+        path = (
+            f"/open-apis/im/v1/messages/{quote(message_id, safe='')}"
+            f"/resources/{quote(file_key, safe='')}"
+        )
+        response = await self._send_stream(
+            "GET",
+            f"{self._api_base}{path}",
+            params={"type": resource_type},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        return await media_from_response(response, label="下载飞书媒体")
+
     async def aclose(self) -> None:
         if self._client is not None and self._owns_client:
             await self._client.aclose()
@@ -143,12 +194,21 @@ class FeishuBotSender:
             return token
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        return await self._ensure_client().request(method, f"{self._api_base}{path}", **kwargs)
+
+    async def _send_stream(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        """媒体下载不整包读进内存：拿到流式响应后交给 save_upload 边读边落盘。"""
+        client = self._ensure_client()
+        request = client.build_request(method, url, **kwargs)
+        return await client.send(request, stream=True, follow_redirects=True)
+
+    def _ensure_client(self) -> httpx.AsyncClient:
         client = self._client
         if client is None:
             client = httpx.AsyncClient(timeout=self._timeout)
             self._client = client
             self._owns_client = True
-        return await client.request(method, f"{self._api_base}{path}", **kwargs)
+        return client
 
 
 def _payload(response: httpx.Response, label: str) -> dict[str, Any]:
@@ -183,9 +243,11 @@ class FeishuBotChannel:
         api_base: str = "https://open.feishu.cn",
         bot_id: str | None = None,
         sender: Any | None = None,
+        transcriber: Transcriber | None = None,
         turn_wait_seconds: float = 900.0,
     ) -> None:
         self._container = container
+        self._transcriber = transcriber
         self._verification_token = (verification_token or "").strip() or None
         self._encrypt_key = (encrypt_key or "").strip() or None
         self._bot_id = _parse_uuid(bot_id)
@@ -282,7 +344,8 @@ class FeishuBotChannel:
         parsed = _parse_message(payload)
         if isinstance(parsed, FeishuCallbackResult):
             return parsed
-        message_id, chat_id, text = parsed
+        message_id = parsed.message_id
+        chat_id = parsed.chat_id
 
         try:
             bot = await self._container.bots.get(bot_id)
@@ -290,9 +353,43 @@ class FeishuBotChannel:
             logger.warning("飞书回调指向的 Bot 不存在 bot=%s", bot_id)
             return FeishuCallbackResult(404, {"error": "FLUX_FEISHU_BOT_ID 指向的 Bot 不存在"})
 
+        if parsed.kind == "text":
+            files: list[Any] = []
+            content = parsed.text
+        else:
+            # 重推：turn 已存在就直接确认，绝不再次下载媒体。
+            existing = await self._existing_turn(bot, message_id)
+            if existing is not None:
+                logger.info(
+                    "feishu.inbound.replay bot=%s message=%s turn=%s",
+                    bot_id,
+                    message_id,
+                    existing.id,
+                )
+                return FeishuCallbackResult(200, {"created": False, "turn_id": str(existing.id)})
+            try:
+                files, content = await self._load_media(parsed)
+            except ValidationError as exc:
+                # 超限 / 空文件是永久问题：确认掉，别让平台无限重推。
+                logger.warning(
+                    "飞书入站媒体被拒绝 message=%s kind=%s reason=%s",
+                    message_id,
+                    parsed.kind,
+                    exc.message,
+                )
+                return FeishuCallbackResult(200, {"ignored": True, "reason": exc.message})
+            except Exception as exc:  # noqa: BLE001 - 下载异常不能拖垮进程
+                logger.warning(
+                    "飞书入站媒体下载失败 message=%s kind=%s error=%s",
+                    message_id,
+                    parsed.kind,
+                    safe_error(exc),
+                )
+                return FeishuCallbackResult(502, {"error": "飞书媒体下载失败，请稍后重试"})
+
         try:
             turn, created = await self._container.bot_conversation.create_turn(
-                bot, content=text, client_turn_id=message_id
+                bot, content=content, files=files, client_turn_id=message_id
             )
         except AIOSError as exc:
             logger.warning(
@@ -439,6 +536,53 @@ class FeishuBotChannel:
             body=body,
             signature=_header(headers, "X-Lark-Signature"),
         )
+
+    async def _existing_turn(self, bot: Any, client_turn_id: str) -> Any | None:
+        finder = getattr(self._container.bot_conversation, "find_turn", None)
+        if finder is None:
+            return None
+        return await finder(bot, client_turn_id)
+
+    async def _load_media(self, parsed: _InboundMessage) -> tuple[list[Any], str]:
+        """下载一条图片/文件/语音并落盘；没有应用凭据时给中文说明而不是静默忽略。"""
+        label = _KIND_LABELS[parsed.kind]
+        sender = self._sender
+        if sender is None or not hasattr(sender, "download_media"):
+            logger.warning(
+                "飞书入站媒体缺少应用凭据 message=%s kind=%s", parsed.message_id, parsed.kind
+            )
+            return [], f"收到{label}，但未配置飞书应用凭据，无法下载附件。"
+
+        resource_type = "image" if parsed.kind == "image" else "file"
+        media = await sender.download_media(
+            message_id=parsed.message_id,
+            file_key=parsed.resource_key,
+            resource_type=resource_type,
+        )
+        stem = {"image": "image", "file": "file", "audio": "voice"}[parsed.kind]
+        name = pick_media_name(
+            preferred=parsed.file_name,
+            downloaded=media.name,
+            mime=media.mime,
+            stem=stem,
+            ext=".opus" if parsed.kind == "audio" else "",
+        )
+        uploaded = await save_media(
+            self._container.settings,
+            DownloadedMedia(name=name, mime=media.mime, chunks=media.chunks),
+        )
+        if parsed.kind == "audio":
+            content = parsed.recognition or await transcribe_audio(self._transcriber, uploaded)
+        else:
+            content = ""
+        logger.info(
+            "飞书入站媒体已落盘 message=%s kind=%s upload=%s bytes=%s",
+            parsed.message_id,
+            parsed.kind,
+            uploaded.id,
+            uploaded.size,
+        )
+        return [uploaded], content
 
     def _verify_token(self, token: object) -> FeishuCallbackResult | None:
         if self._verification_token is None:
@@ -617,16 +761,15 @@ def _excerpt(text: str) -> str:
     return text[:_DETAIL_TEXT_CHARS] + "…"
 
 
-def _parse_message(
-    payload: dict[str, Any],
-) -> tuple[str, str, str] | FeishuCallbackResult:
+def _parse_message(payload: dict[str, Any]) -> _InboundMessage | FeishuCallbackResult:
     event = payload.get("event")
     event = event if isinstance(event, dict) else {}
     message = event.get("message")
     message = message if isinstance(message, dict) else {}
 
-    message_type = str(message.get("message_type") or "")
-    if message_type != "text":
+    message_type = str(message.get("message_type") or "").strip().lower()
+    # 其余类型（表情、位置、链接、视频等）保持 200 忽略，与既有行为一致。
+    if message_type not in {"text", "image", "file", "audio"}:
         return FeishuCallbackResult(
             200, {"ignored": True, "reason": f"不支持的消息类型：{message_type or 'unknown'}"}
         )
@@ -636,20 +779,63 @@ def _parse_message(
     if not message_id or not chat_id:
         return FeishuCallbackResult(400, {"error": "回调缺少 message_id / chat_id"})
 
-    text = _text_content(message.get("content"))
-    if not text:
-        return FeishuCallbackResult(200, {"ignored": True, "reason": "空文本消息"})
-    return message_id, chat_id, text
+    content = _content_dict(message.get("content"))
+    if message_type == "text":
+        text = _text_content(content)
+        if not text:
+            return FeishuCallbackResult(200, {"ignored": True, "reason": "空文本消息"})
+        return _InboundMessage(message_id=message_id, chat_id=chat_id, kind="text", text=text)
+
+    if message_type == "image":
+        image_key = str(content.get("image_key") or "").strip()
+        if not image_key:
+            return FeishuCallbackResult(200, {"ignored": True, "reason": "图片消息缺少 image_key"})
+        return _InboundMessage(
+            message_id=message_id,
+            chat_id=chat_id,
+            kind="image",
+            resource_key=image_key,
+        )
+
+    file_key = str(content.get("file_key") or "").strip()
+    if not file_key:
+        return FeishuCallbackResult(200, {"ignored": True, "reason": "媒体消息缺少 file_key"})
+    file_name = str(content.get("file_name") or "").strip()
+    if message_type == "file":
+        return _InboundMessage(
+            message_id=message_id,
+            chat_id=chat_id,
+            kind="file",
+            resource_key=file_key,
+            file_name=file_name,
+        )
+
+    # 飞书音频事件通常没有识别文本；若未来回调里出现 recognition 字段则直接采用。
+    recognition = str(
+        content.get("recognition") or content.get("speech_text") or content.get("text") or ""
+    ).strip()
+    return _InboundMessage(
+        message_id=message_id,
+        chat_id=chat_id,
+        kind="audio",
+        resource_key=file_key,
+        file_name=file_name,
+        recognition=recognition,
+    )
 
 
-def _text_content(raw: object) -> str:
+def _content_dict(raw: object) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
     if not isinstance(raw, str) or not raw.strip():
-        return ""
+        return {}
     try:
         data = json.loads(raw)
     except ValueError:
-        return ""
-    if not isinstance(data, dict):
-        return ""
-    text = data.get("text")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _text_content(content: dict[str, Any]) -> str:
+    text = content.get("text")
     return text.strip() if isinstance(text, str) else ""

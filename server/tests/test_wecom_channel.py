@@ -15,6 +15,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -25,6 +26,11 @@ from fastapi.testclient import TestClient
 from flux.bot_node.main import create_app as create_bot_app
 from flux.config import Settings
 from flux.container import Container
+from flux.core.channels.inbound_media import (
+    VOICE_ASR_FAILED_TEXT,
+    VOICE_NO_ASR_TEXT,
+    DownloadedMedia,
+)
 from flux.core.channels.wecom_bot import (
     WECOM_OUTBOUND_KIND,
     WeComBotChannel,
@@ -70,35 +76,79 @@ class _FakeBots:
 class _FakeConversation:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
-        self.seen: set[str] = set()
+        self.find_calls: list[str | None] = []
+        self.by_client_id: dict[str, Any] = {}
         self.turns: list[Any] = []
 
     async def create_turn(
-        self, bot: Any, *, content: str, client_turn_id: str | None = None
+        self,
+        bot: Any,
+        *,
+        content: str,
+        files: list[Any] | None = None,
+        client_turn_id: str | None = None,
     ) -> tuple[Any, bool]:
-        self.calls.append({"bot_id": bot.id, "content": content, "client_turn_id": client_turn_id})
-        if client_turn_id is not None and client_turn_id in self.seen:
-            return self.turns[0], False
-        if client_turn_id is not None:
-            self.seen.add(client_turn_id)
+        self.calls.append(
+            {
+                "bot_id": bot.id,
+                "content": content,
+                "files": list(files or ()),
+                "client_turn_id": client_turn_id,
+            }
+        )
+        if client_turn_id is not None and client_turn_id in self.by_client_id:
+            return self.by_client_id[client_turn_id], False
         turn = SimpleNamespace(id=uuid.uuid4(), task_id=uuid.uuid4())
         self.turns.append(turn)
+        if client_turn_id is not None:
+            self.by_client_id[client_turn_id] = turn
         return turn, True
+
+    async def find_turn(self, bot: Any, client_turn_id: str | None) -> Any | None:
+        self.find_calls.append(client_turn_id)
+        if client_turn_id is None:
+            return None
+        return self.by_client_id.get(client_turn_id)
 
     async def wait_for_turn(self, bot_id: uuid.UUID, turn_id: uuid.UUID, *, wait_seconds: float):
         return SimpleNamespace(id=turn_id, status="failed", reply_message_id=None)
 
 
+async def _chunks(*parts: bytes):
+    for part in parts:
+        yield part
+
+
 class _FakeSender:
-    def __init__(self, *, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        error: Exception | None = None,
+        payload: bytes = b"media-bytes",
+        mime: str = "application/octet-stream",
+        name: str = "",
+        parts: list[bytes] | None = None,
+    ) -> None:
         self.messages: list[tuple[dict[str, Any], str]] = []
         self.error = error
         self.closed = False
+        self.payload = payload
+        self.mime = mime
+        self.name = name
+        self.parts = parts
+        self.downloads: list[str] = []
 
     async def send_text(self, dest: dict[str, Any], text: str) -> None:
         self.messages.append((dest, text))
         if self.error is not None:
             raise self.error
+
+    async def download_media(self, media_id: str) -> DownloadedMedia:
+        self.downloads.append(media_id)
+        if self.error is not None:
+            raise self.error
+        parts = self.parts if self.parts is not None else [self.payload]
+        return DownloadedMedia(name=self.name, mime=self.mime, chunks=_chunks(*parts))
 
     async def aclose(self) -> None:
         self.closed = True
@@ -141,6 +191,28 @@ def _text_message_xml(
     )
 
 
+def _media_message_xml(
+    *,
+    msg_type: str,
+    msg_id: str = MESSAGE_ID,
+    from_user: str = USER_ID,
+    media_id: str = "MEDIA_ID_1",
+    extra: str = "",
+) -> str:
+    return (
+        "<xml>"
+        f"<ToUserName><![CDATA[{CORP_ID}]]></ToUserName>"
+        f"<FromUserName><![CDATA[{from_user}]]></FromUserName>"
+        "<CreateTime>1700000000</CreateTime>"
+        f"<MsgType><![CDATA[{msg_type}]]></MsgType>"
+        f"<MediaId><![CDATA[{media_id}]]></MediaId>"
+        f"{extra}"
+        f"<MsgId>{msg_id}</MsgId>"
+        f"<AgentID>{AGENT_ID}</AgentID>"
+        "</xml>"
+    )
+
+
 def _encrypted_body(
     inner_xml: str,
     *,
@@ -173,11 +245,17 @@ def _signed_query(
     }
 
 
-def _unit_channel(**kwargs: Any) -> WeComBotChannel:
+def _unit_channel(
+    *,
+    settings: Settings | None = None,
+    sender: Any | None = None,
+    **kwargs: Any,
+) -> WeComBotChannel:
     bot = SimpleNamespace(id=uuid.uuid4(), name="企微小助", status="active")
     container = SimpleNamespace(
         bots=_FakeBots(bot),
         bot_conversation=_FakeConversation(),
+        settings=settings,
     )
     kwargs.setdefault("bot_id", str(bot.id))
     return WeComBotChannel(
@@ -185,6 +263,7 @@ def _unit_channel(**kwargs: Any) -> WeComBotChannel:
         corp_id=CORP_ID,
         token=TOKEN,
         encoding_aes_key=ENCODING_AES_KEY,
+        sender=sender,
         **kwargs,
     )
 
@@ -388,17 +467,19 @@ async def test_post_decrypts_text_message_and_is_idempotent() -> None:
     await channel.aclose()
 
 
-async def test_post_rejects_bad_signature_and_ignores_non_text() -> None:
+async def test_post_rejects_bad_signature_and_ignores_unsupported_types() -> None:
     channel = _unit_channel()
     encrypted, raw = _encrypted_body(_text_message_xml())
     bad = dict(_signed_query(encrypted), msg_signature="0" * 40)
     rejected = await channel.handle_post(raw, bad)
     assert rejected.status_code == 403
 
-    image_encrypted, image_raw = _encrypted_body(_text_message_xml(msg_type="image"))
-    ignored = await channel.handle_post(image_raw, _signed_query(image_encrypted))
-    assert ignored.status_code == 200
-    assert ignored.body == "success"
+    # 视频 / 位置 / 链接 / 事件都不支持；图片/语音/文件已支持，不再忽略。
+    for msg_type in ("video", "location", "link", "event"):
+        body_encrypted, body_raw = _encrypted_body(_media_message_xml(msg_type=msg_type))
+        ignored = await channel.handle_post(body_raw, _signed_query(body_encrypted))
+        assert ignored.status_code == 200, msg_type
+        assert ignored.body == "success"
 
     conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
     assert conversation.calls == []
@@ -425,6 +506,193 @@ async def test_post_without_bot_id_is_fail_closed() -> None:
     result = await channel.handle_post(raw, _signed_query(encrypted))
     assert result.status_code == 400
     assert "FLUX_WECOM_BOT_ID" in result.body
+    await channel.aclose()
+
+
+# --- 入站媒体 ---
+
+
+async def _post_media(
+    channel: WeComBotChannel,
+    *,
+    msg_type: str,
+    msg_id: str = MESSAGE_ID,
+    media_id: str = "MEDIA_ID_1",
+    extra: str = "",
+):
+    xml = _media_message_xml(msg_type=msg_type, msg_id=msg_id, media_id=media_id, extra=extra)
+    encrypted, raw = _encrypted_body(xml)
+    return await channel.handle_post(raw, _signed_query(encrypted))
+
+
+async def test_inbound_image_downloads_and_creates_turn(settings: Settings) -> None:
+    sender = _FakeSender(payload=b"jpeg-bytes", mime="image/jpeg", name="wx-photo.jpg")
+    channel = _unit_channel(settings=settings, sender=sender)
+
+    result = await _post_media(channel, msg_type="image", media_id="MEDIA_IMG")
+    assert result.status_code == 200
+    assert result.body == "success"
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    call = conversation.calls[0]
+    assert call["content"] == ""
+    uploaded = call["files"][0]
+    assert uploaded.name == "wx-photo.jpg"
+    assert uploaded.mime == "image/jpeg"
+    assert uploaded.size == len(b"jpeg-bytes")
+    assert Path(uploaded.path).is_file()
+    assert Path(uploaded.path).resolve().is_relative_to(Path(settings.uploads_dir).resolve())
+    assert sender.downloads == ["MEDIA_IMG"]
+    await channel.aclose()
+
+
+async def test_inbound_file_keeps_platform_filename(settings: Settings) -> None:
+    sender = _FakeSender(payload=b"file-body", mime="application/octet-stream")
+    channel = _unit_channel(settings=settings, sender=sender)
+
+    result = await _post_media(
+        channel,
+        msg_type="file",
+        media_id="MEDIA_FILE",
+        extra="<FileName><![CDATA[报销单.xlsx]]></FileName>",
+    )
+    assert result.status_code == 200
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    uploaded = conversation.calls[0]["files"][0]
+    assert uploaded.name == "报销单.xlsx"
+    assert uploaded.size == len(b"file-body")
+    await channel.aclose()
+
+
+async def test_inbound_voice_without_asr_keeps_audio_and_explains(settings: Settings) -> None:
+    sender = _FakeSender(payload=b"amr", mime="audio/amr")
+    channel = _unit_channel(settings=settings, sender=sender)
+
+    result = await _post_media(
+        channel,
+        msg_type="voice",
+        media_id="MEDIA_VOICE",
+        extra="<Format><![CDATA[amr]]></Format>",
+    )
+    assert result.status_code == 200
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    call = conversation.calls[0]
+    assert call["content"] == VOICE_NO_ASR_TEXT
+    assert call["files"][0].mime == "audio/amr"
+    assert sender.downloads == ["MEDIA_VOICE"]
+    await channel.aclose()
+
+
+async def test_inbound_voice_uses_platform_recognition(settings: Settings) -> None:
+    sender = _FakeSender(payload=b"amr", mime="audio/amr")
+    channel = _unit_channel(settings=settings, sender=sender)
+
+    await _post_media(
+        channel,
+        msg_type="voice",
+        extra=(
+            "<Format><![CDATA[amr]]></Format>"
+            "<Recognition><![CDATA[帮我订明天下午的会议室]]></Recognition>"
+        ),
+    )
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    assert conversation.calls[0]["content"] == "帮我订明天下午的会议室"
+    assert len(conversation.calls[0]["files"]) == 1
+    await channel.aclose()
+
+
+async def test_inbound_voice_uses_injected_transcriber(settings: Settings) -> None:
+    class _Transcriber:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, str]] = []
+
+        async def transcribe(self, *, path: str, name: str, mime: str) -> str:
+            self.calls.append({"path": path, "name": name, "mime": mime})
+            return "企微转写结果"
+
+    transcriber = _Transcriber()
+    sender = _FakeSender(payload=b"speex", mime="audio/speex")
+    channel = _unit_channel(settings=settings, sender=sender, transcriber=transcriber)
+
+    await _post_media(channel, msg_type="voice", extra="<Format><![CDATA[speex]]></Format>")
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    uploaded = conversation.calls[0]["files"][0]
+    assert conversation.calls[0]["content"] == "企微转写结果"
+    assert transcriber.calls == [
+        {"path": uploaded.path, "name": uploaded.name, "mime": uploaded.mime}
+    ]
+    await channel.aclose()
+
+
+async def test_inbound_voice_transcriber_failure_is_explained(settings: Settings) -> None:
+    class _BrokenTranscriber:
+        async def transcribe(self, *, path: str, name: str, mime: str) -> str:
+            raise RuntimeError("asr failed access_token=leak")
+
+    sender = _FakeSender(payload=b"amr", mime="audio/amr")
+    channel = _unit_channel(settings=settings, sender=sender, transcriber=_BrokenTranscriber())
+
+    result = await _post_media(channel, msg_type="voice", extra="<Format><![CDATA[amr]]></Format>")
+    assert result.status_code == 200
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    assert conversation.calls[0]["content"] == VOICE_ASR_FAILED_TEXT
+    assert len(conversation.calls[0]["files"]) == 1
+    await channel.aclose()
+
+
+async def test_inbound_media_replay_does_not_download_twice(settings: Settings) -> None:
+    sender = _FakeSender(payload=b"img", mime="image/png", name="a.png")
+    channel = _unit_channel(settings=settings, sender=sender)
+
+    first = await _post_media(channel, msg_type="image", msg_id="MSG_REPLAY")
+    second = await _post_media(channel, msg_type="image", msg_id="MSG_REPLAY")
+    assert first.status_code == 200 and second.status_code == 200
+    assert first.body == second.body == "success"
+    assert sender.downloads == ["MEDIA_ID_1"]
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    assert len(conversation.calls) == 1
+    assert conversation.find_calls == ["MSG_REPLAY", "MSG_REPLAY"]
+    await channel.aclose()
+
+
+async def test_inbound_media_over_50mb_is_acknowledged_without_upload(
+    settings: Settings,
+) -> None:
+    megabyte = b"x" * (1024 * 1024)
+    sender = _FakeSender(mime="application/octet-stream", parts=[megabyte] * 51)
+    channel = _unit_channel(settings=settings, sender=sender)
+
+    result = await _post_media(channel, msg_type="file")
+    assert result.status_code == 200
+    assert result.body == "success"
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    assert conversation.calls == []
+    assert list(Path(settings.uploads_dir).glob("*")) == []
+    await channel.aclose()
+
+
+async def test_inbound_media_without_credentials_explains_in_chinese(
+    settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("DEBUG")
+    channel = _unit_channel(settings=settings)  # 没有 corp_secret → 无发送端
+
+    result = await _post_media(channel, msg_type="image")
+    assert result.status_code == 200
+    assert result.body == "success"
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    call = conversation.calls[0]
+    assert "未配置企业微信应用凭据" in call["content"]
+    assert call["files"] == []
+    assert "corpsecret" not in caplog.text.lower()
     await channel.aclose()
 
 
@@ -797,3 +1065,71 @@ async def test_logs_do_not_contain_secrets_or_message_body(
     assert ENCODING_AES_KEY not in logged
     assert SECRET not in logged
     assert body_text not in logged
+
+
+def test_wecom_sender_downloads_media_via_official_api() -> None:
+    """官方 media/get：access_token 与 media_id 都在查询串，成功时是二进制流。"""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/cgi-bin/gettoken":
+            return httpx.Response(
+                200,
+                json={"errcode": 0, "access_token": "wecom-media-token", "expires_in": 7200},
+            )
+        return httpx.Response(
+            200,
+            content=b"media-body",
+            headers={
+                "content-type": "image/jpeg",
+                "content-disposition": 'attachment; filename="wx.jpg"',
+            },
+        )
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            sender = WeComBotSender(
+                corp_id=CORP_ID,
+                secret=SECRET,
+                agent_id=AGENT_ID,
+                client=http_client,
+            )
+            media = await sender.download_media("MEDIA_ID_9")
+            assert media.mime == "image/jpeg"
+            assert media.name == "wx.jpg"
+            chunks = [chunk async for chunk in media.chunks]
+            assert b"".join(chunks) == b"media-body"
+            await sender.aclose()
+
+    asyncio.run(scenario())
+
+    assert [request.url.path for request in requests] == ["/cgi-bin/gettoken", "/cgi-bin/media/get"]
+    media_call = requests[-1]
+    assert media_call.method == "GET"
+    assert media_call.url.params["access_token"] == "wecom-media-token"
+    assert media_call.url.params["media_id"] == "MEDIA_ID_9"
+
+
+def test_wecom_sender_rejects_json_error_body() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/cgi-bin/gettoken":
+            return httpx.Response(200, json={"errcode": 0, "access_token": "t", "expires_in": 7200})
+        return httpx.Response(
+            200,
+            json={"errcode": 40007, "errmsg": "invalid media_id"},
+            headers={"content-type": "application/json"},
+        )
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            sender = WeComBotSender(
+                corp_id=CORP_ID, secret=SECRET, agent_id=AGENT_ID, client=http_client
+            )
+            with pytest.raises(RuntimeError) as excinfo:
+                await sender.download_media("bad")
+            assert "invalid media_id" in str(excinfo.value)
+            assert SECRET not in str(excinfo.value)
+            await sender.aclose()
+
+    asyncio.run(scenario())

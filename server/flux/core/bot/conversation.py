@@ -164,7 +164,9 @@ class BotConversationService:
         code=budget_exhausted（与 Bot 手动开工的既有口径一致）。
         """
         text = (content or "").strip()
-        if not text:
+        files = list(files or ())
+        # 与 /tasks/{id}/messages 同口径：只发附件不写正文也是合法的一轮。
+        if not text and not files:
             raise ValidationError("消息内容不能为空", details={"field": "content"})
 
         existing = await self._turns.find_by_client_id(bot.id, client_turn_id)
@@ -200,10 +202,14 @@ class BotConversationService:
                     turn_id=turn.id,
                     bot_id=bot.id,
                     content=text,
-                    files=tuple(files or ()),
+                    files=tuple(files),
                 )
             )
         return turn, created
+
+    async def find_turn(self, bot: Bot, client_turn_id: str | None) -> BotTurn | None:
+        """按幂等键查已有轮次；频道在下载媒体前用它避免重推时重复下载。"""
+        return await self._turns.find_by_client_id(bot.id, client_turn_id)
 
     async def get_turn(self, bot_id: uuid.UUID, turn_id: uuid.UUID) -> BotTurn:
         return await self._turns.get(bot_id, turn_id)
@@ -660,13 +666,16 @@ class BotConversationService:
             return
 
         meta = {"turn_id": str(turn.id)}
+        files = list(pending.files)
+        # 只有附件没有正文时，用户消息与记忆检索都用附件说明，避免落一条空消息。
+        prompt_content = pending.content or attachments_brief(files)
         self._active_turns[pending.bot_id] = turn.id
         try:
             await self._turns.set_running(turn.id)
             await self._notify(turn.id)
 
             memory = await container.bot_memories.render_block(
-                bot, group_id=None, query=pending.content, limit=_MEMORY_LIMIT
+                bot, group_id=None, query=prompt_content, limit=_MEMORY_LIMIT
             )
             # 共享用户记忆叠加在 Bot 自己的记忆之上：两者并存，互不替代。
             # 共享层失败只降级为「只有 Bot 记忆」，不能挡住这一轮对话。
@@ -677,8 +686,8 @@ class BotConversationService:
             description = (bot.description or "").strip() or bot.name
             user_message = await self.begin_user_turn(
                 task,
-                content=pending.content,
-                files=list(pending.files),
+                content=prompt_content,
+                files=files,
                 stream_meta=meta,
             )
             await self._turns.set_user_message(turn.id, user_message.id)
@@ -687,7 +696,7 @@ class BotConversationService:
                 task,
                 user_message=user_message,
                 content=pending.content,
-                files=list(pending.files),
+                files=files,
                 description=description,
                 context="\n".join(context_parts) or None,
                 subtask_bot=bot,
