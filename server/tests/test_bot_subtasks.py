@@ -270,6 +270,20 @@ async def _wait_task(
     )
 
 
+async def _wait_run_status(
+    container: Container, run_id: str, status: str, *, timeout: float = 15.0
+) -> Any:
+    """等内核 Run 落到期望状态：取消收尾是异步的，可能先经过 `cancelling`。"""
+    deadline = time.monotonic() + timeout
+    run: Any = None
+    while time.monotonic() < deadline:
+        run = await container.run_repo.get(run_id)
+        if run is not None and run.status == status:
+            return run
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"内核 Run {run_id} 未在 {timeout}s 内到达 {status}：{run}")
+
+
 async def _wait_run_started(
     container: Container, task_id: uuid.UUID, *, timeout: float = 10.0
 ) -> Any:
@@ -307,10 +321,72 @@ def _subtask_messages(conversation: dict) -> list[dict]:
     return [message for message in conversation["messages"] if message["kind"] == "subtask"]
 
 
+def _wait_subtask_messages(
+    client: TestClient,
+    bot_id: str,
+    subtask_id: str,
+    status: str,
+    *,
+    timeout: float = 5.0,
+) -> list[dict]:
+    """等父对话里该子任务的最后一条状态消息到达期望状态。
+
+    `BotSubtaskService._finish` 先落终态与结果、再由 `_publish_parent` 追加父对话消息，
+    所以 `_wait_subtask` 返回时消息可能还差最后一小段；这里补一个有界轮询。
+    """
+    deadline = time.monotonic() + timeout
+    messages: list[dict] = []
+    while time.monotonic() < deadline:
+        messages = _subtask_messages(_conversation(client, bot_id))
+        own = [message for message in messages if message["payload"]["subtask_id"] == subtask_id]
+        if own and own[-1]["payload"]["status"] == status:
+            return messages
+        time.sleep(0.02)
+    raise AssertionError(
+        f"子任务 {subtask_id} 的父对话消息未在 {timeout}s 内变成 {status}：{messages}"
+    )
+
+
+def _wait_bus_event(container: Container, name: str, *, timeout: float = 5.0) -> None:
+    """等总线事件落地：流事件与总线事件都在父对话消息之后才发，先读会撞窗口。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if any(event_name == name for event_name, _payload in container.bus.history):
+            return
+        time.sleep(0.02)
+    event_names = [event_name for event_name, _payload in container.bus.history]
+    raise AssertionError(f"总线事件 {name} 未在 {timeout}s 内出现：{event_names}")
+
+
 def _runs(client: TestClient, task_id: str) -> list[dict]:
     response = client.get(f"{PREFIX}/tasks/{task_id}/runs")
     assert response.status_code == 200, response.text
     return response.json()["data"]
+
+
+def _wait_kernel_run_status(
+    client: TestClient,
+    task_id: str,
+    status: str,
+    *,
+    run_id: str | None = None,
+    timeout: float = 15.0,
+) -> list[dict]:
+    """等内核 Run 落到期望状态再断言。
+
+    取消/失败的收尾不是同步完成的：取消 API 返回时 Run 可能还停在 `cancelling`，
+    看护器清理完进程树才落 `cancelled`（极端情况下靠心跳纠正卡住的中间态）。
+    这里补一个有界轮询，避免读到过渡态就断言。
+    """
+    deadline = time.monotonic() + timeout
+    runs: list[dict] = []
+    while time.monotonic() < deadline:
+        runs = _runs(client, task_id)
+        target = runs if run_id is None else [run for run in runs if run["run_id"] == run_id]
+        if target and all(run["status"] == status for run in target):
+            return runs
+        time.sleep(0.02)
+    raise AssertionError(f"内核 Run 未在 {timeout}s 内到达 {status}：{runs}")
 
 
 @contextmanager
@@ -390,7 +466,8 @@ def test_subtask_completes_on_kernel_and_posts_result(settings: Settings, tmp_pa
         # 结果正文来自内核 Run 的最终回复（fake CLI 固定回 "done"）
         assert done["result"]["reply"] == "done"
         assert done["result"]["run_id"] == done["run_id"]
-        assert [run["status"] for run in _runs(client, subtask["id"])] == ["completed"]
+        runs = _wait_kernel_run_status(client, subtask["id"], "completed")
+        assert [run["status"] for run in runs] == ["completed"]
         # 内核收到的就是这条指令（prompt 固定是 argv 的最后一段）
         argv = read_cli_argv(log_path)
         assert argv and "整理本周周报" in argv[-1][-1]
@@ -406,7 +483,7 @@ def test_subtask_completes_on_kernel_and_posts_result(settings: Settings, tmp_pa
 
         conversation = _conversation(client, bot["id"])
         assert conversation["chat_task_id"] == subtask["parent_task_id"]
-        messages = _subtask_messages(conversation)
+        messages = _wait_subtask_messages(client, bot["id"], subtask["id"], "completed")
         assert [message["payload"]["status"] for message in messages] == ["running", "completed"]
         assert all(message["payload"]["subtask_id"] == subtask["id"] for message in messages)
         assert all(message["payload"]["title"] == "周报" for message in messages)
@@ -416,6 +493,7 @@ def test_subtask_completes_on_kernel_and_posts_result(settings: Settings, tmp_pa
 
         # 事件总线与父对话流事件都要能看到起止
         container = _container(client)
+        _wait_bus_event(container, Events.SUBTASK_COMPLETED)
         event_names = [name for name, _payload in container.bus.history]
         assert Events.SUBTASK_STARTED in event_names
         assert Events.SUBTASK_COMPLETED in event_names
@@ -463,7 +541,7 @@ def test_chat_turn_can_run_while_subtask_is_still_running(
         sentinel.touch()
         completed = _wait_subtask(client, bot["id"], subtask_id)
         assert completed["status"] == "completed"
-        messages = _subtask_messages(_conversation(client, bot["id"]))
+        messages = _wait_subtask_messages(client, bot["id"], subtask_id, "completed")
         assert [message["payload"]["status"] for message in messages] == ["running", "completed"]
 
 
@@ -482,13 +560,16 @@ def test_failed_kernel_run_posts_failure(settings: Settings, tmp_path: Path) -> 
         assert failed["status"] == "failed"
         # 失败原因来自内核 Run 的终态（非 0 退出码），不写 traceback
         assert "退出码" in failed["result"]["error"]
-        assert [run["status"] for run in _runs(client, subtask_id)] == ["failed"]
-        messages = _subtask_messages(_conversation(client, bot["id"]))
+        runs = _wait_kernel_run_status(client, subtask_id, "failed")
+        assert [run["status"] for run in runs] == ["failed"]
+        messages = _wait_subtask_messages(client, bot["id"], subtask_id, "failed")
         assert messages[-1]["payload"]["status"] == "failed"
         assert "退出码" in messages[-1]["content"]
         assert "Traceback" not in messages[-1]["content"]
         assert "Traceback" not in str(messages[-1]["payload"])
-        event_names = [name for name, _payload in _container(client).bus.history]
+        container = _container(client)
+        _wait_bus_event(container, Events.SUBTASK_FAILED)
+        event_names = [name for name, _payload in container.bus.history]
         assert Events.SUBTASK_FAILED in event_names
 
 
@@ -514,7 +595,7 @@ def test_start_failure_marks_subtask_failed(settings: Settings, tmp_path: Path) 
 
         assert failed["status"] == "failed"
         assert failed["result"]["error"] == "内核不可用"
-        messages = _subtask_messages(_conversation(client, bot["id"]))
+        messages = _wait_subtask_messages(client, bot["id"], subtask_id, "failed")
         assert messages[-1]["payload"]["status"] == "failed"
         assert "内核不可用" in messages[-1]["content"]
         logs = _log_text(records)
@@ -536,7 +617,7 @@ def test_subtask_timeout_fails_and_stops_kernel_run(settings: Settings, tmp_path
 
         assert timed_out["status"] == "failed"
         assert "执行超过" in timed_out["result"]["error"]
-        messages = _subtask_messages(_conversation(client, bot["id"]))
+        messages = _wait_subtask_messages(client, bot["id"], subtask_id, "failed")
         assert messages[-1]["payload"]["status"] == "failed"
         assert "执行超过" in messages[-1]["content"]
 
@@ -554,11 +635,12 @@ def test_created_running_completed_transitions_are_logged(
         with _capture_subtask_logs() as records:
             subtask_id = _create_subtask(client, bot["id"]).json()["data"]["id"]
             _wait_subtask(client, bot["id"], subtask_id)
-
-        for marker in ("已创建", "开始", "完成"):
-            assert _wait_log(records, marker, bot["id"], subtask_id), (
-                f"{marker} 日志缺少 bot/subtask id：{_log_text(records)}"
-            )
+            # 完成日志在终态与父对话消息之后才写：必须留在抓取上下文里等它落地，
+            # 否则 handler 已被移除，_wait_log 只能看到进入终态前的那几条。
+            for marker in ("已创建", "开始", "完成"):
+                assert _wait_log(records, marker, bot["id"], subtask_id), (
+                    f"{marker} 日志缺少 bot/subtask id：{_log_text(records)}"
+                )
 
 
 def test_failed_and_cancelled_transitions_are_logged(settings: Settings, tmp_path: Path) -> None:
@@ -609,11 +691,11 @@ def test_cancel_inflight_subtask_cancels_kernel_run(settings: Settings, tmp_path
         assert cancelled.json()["data"]["status"] == "cancelled"
 
         # 内核 Run 必须一起停：留一个还在改文件的 Agent 与「已取消」是矛盾的。
-        runs = _runs(client, subtask_id)
+        runs = _wait_kernel_run_status(client, subtask_id, "cancelled", run_id=run_id)
         assert [run["run_id"] for run in runs] == [run_id]
         assert runs[0]["status"] == "cancelled"
 
-        messages = _subtask_messages(_conversation(client, bot["id"]))
+        messages = _wait_subtask_messages(client, bot["id"], subtask_id, "cancelled")
         assert messages[-1]["payload"]["status"] == "cancelled"
         assert "已取消" in messages[-1]["content"]
 
@@ -855,8 +937,7 @@ def test_shutdown_cancels_inflight_subtask(settings: Settings, tmp_path: Path) -
 
             saved = await container.task_repo.get(subtask.id)
             assert saved.status == "cancelled"
-            run = await container.run_repo.get(run_id)
-            assert run is not None and run.status == "cancelled"
+            await _wait_run_status(container, run_id, "cancelled")
             # 停机收尾也必须留一条带 bot/subtask id 的 cancelled 日志
             assert any(
                 "cancelled" in message and str(bot.id) in message and str(subtask.id) in message
