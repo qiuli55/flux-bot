@@ -117,6 +117,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        # 事件总线先起：Redis 后端在此订阅跨进程频道；连接失败只降级并告警。
+        await container.bus.start()
         # 鉴权是公网暴露前的最后一道闸：没有令牌时必须让运维一眼看到当前生效模式。
         if not (app_settings.auth_token or "").strip():
             if app_settings.allow_no_auth:

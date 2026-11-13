@@ -48,7 +48,7 @@ from flux.core.context.store import ContentStore
 from flux.core.context.trust import VerificationLedger
 from flux.core.desktop.service import DesktopService
 from flux.core.devices.service import DeviceService
-from flux.core.event.bus import EventBus, Events
+from flux.core.event.bus import EventBus, Events, build_event_bus
 from flux.core.git_integration.client import GitClient
 from flux.core.git_integration.service import GitService
 from flux.core.github.service import GitHubConnectorService
@@ -131,6 +131,8 @@ from flux.enums import ModelProvider
 @dataclass
 class Container:
     settings: Settings = field(default_factory=get_settings)
+    #: 事件总线：__post_init__ 按 settings 装配。默认进程内实现，只有
+    #: event_bus_backend=redis 时才换成 Redis pub/sub。
     bus: EventBus = field(default_factory=EventBus)
     policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     engine: AsyncEngine = field(init=False)
@@ -257,6 +259,9 @@ class Container:
     knowledge_worker: KnowledgeWorker = field(init=False)
 
     def __post_init__(self) -> None:
+        # 事件总线：按设置装配（默认进程内；仅显式 event_bus_backend=redis 时才用 Redis）。
+        # 客户端在 container.bus.start() 时才建连（Redis 不可达时降级，不影响启动）。
+        self.bus = build_event_bus(self.settings)
         self.engine = create_engine(self.settings.database_url)
         self.session_factory = create_session_factory(self.engine)  # type: ignore[attr-defined]
         self.devices = DeviceService(self.session_factory, self.settings)  # type: ignore[attr-defined]
@@ -745,6 +750,9 @@ class Container:
             return ModelProvider.LOCAL
 
     async def dispose(self, *, close_terminal_sessions: bool = True) -> None:
+        # 事件总线先停：取消并等待 Redis 监听任务，避免它在服务/数据库收尾后还在派发。
+        # 进程内实现是空操作；停掉后仍可本地 publish（不再跨进程广播）。
+        await self.bus.aclose()
         # 正式飞书频道先收摊：取消仍在等 turn 的后台任务并关发送端连接池，
         # 避免 Bot 对话 worker 停掉时它们又去挂新的出站审批。
         await self.feishu_bot.aclose()
