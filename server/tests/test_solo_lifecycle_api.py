@@ -476,6 +476,9 @@ def test_continue_works_after_the_conversation_was_cancelled(
     with _solo(settings, tmp_path) as (client, log_path):
         task = _create(client)
         _start(client, task["id"])
+        # 等第一轮真起来再取消：进程可能在 exec 之前就被杀掉，那样 argv 不会落盘，
+        # 后面的「第二轮也起来了」就少了一条可数的记录。
+        _wait_runs(log_path, 1)
         cancelled = client.post(f"{PREFIX}/tasks/{task['id']}/cancel", json={})
         assert cancelled.status_code == 200, cancelled.text
         assert cancelled.json()["data"]["status"] == "cancelled"
