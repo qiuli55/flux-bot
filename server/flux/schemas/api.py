@@ -556,6 +556,9 @@ class ConnectorInstallRequest(BaseModel):
     - oauth 类连接器：本接口只做校验并提示改用对应登录流程（GitHub 为设备码登录）。
     - email：`api_key` 是邮箱密码 / 应用专用密码，`settings` 承载 IMAP/SMTP
       主机、端口与 SSL 开关；密码也可以放在 `settings.password`（两者须一致）。
+      `settings.from_address`（可选，发件邮箱地址）与 `settings.from_name`
+      （可选显示名）决定 From 头；配置 SMTP 且 username 不是邮箱地址时必须提供
+      `from_address`，否则安装返回 422。
     - calendar：`settings` 承载 mode / url / username / password / timeout；
       公开 ICS 订阅允许空密码。
     """
@@ -564,8 +567,8 @@ class ConnectorInstallRequest(BaseModel):
     api_key: str | None = Field(default=None, max_length=4096)
     #: 不传时使用 catalog 定义里的默认 scopes。
     scopes: list[str] | None = Field(default=None, max_length=64)
-    #: 连接器专属配置（email 的 imap_host / smtp_host / port / ssl；
-    #: 日历的 mode / url / username / password / timeout）。
+    #: 连接器专属配置（email 的 imap_host / smtp_host / port / ssl /
+    #: from_address / from_name；日历的 mode / url / username / password / timeout）。
     #: 与密码一起封装进加密凭据，绝不单独明文落库，接口响应与日志也不会回显。
     settings: dict[str, Any] | None = Field(default=None)
 

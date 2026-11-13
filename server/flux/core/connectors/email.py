@@ -7,6 +7,9 @@ IMAP/SMTP 的连接参数与邮箱密码组成一份 JSON 凭据文档，用密�
 
 所有阻塞的网络调用都通过 `asyncio.to_thread` 执行，并设置 15 秒超时，
 避免请求或测试悬挂。
+
+发出的邮件始终带 RFC 5322 的 Date 头；From 头优先使用安装时的
+`settings.from_address` / `from_name`，未配置且用户名是邮箱地址时退回用户名。
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ import json
 import smtplib
 import ssl
 from email.message import EmailMessage
-from email.utils import make_msgid
+from email.utils import formataddr, formatdate, make_msgid
 from typing import Any
 
 from sqlalchemy import select
@@ -46,6 +49,8 @@ MAX_BODY_BYTES = 256 * 1024
 MAX_RECIPIENTS = 50
 MAX_SUBJECT_CHARS = 998
 MAX_MAILBOX_CHARS = 255
+MAX_ADDRESS_CHARS = 320
+MAX_SENDER_NAME_CHARS = 200
 
 DEFAULT_IMAP_PORT = 993
 DEFAULT_SMTP_PORT = 587
@@ -60,6 +65,10 @@ def prepare_credentials(api_key: str | None, settings: dict[str, Any] | None) ->
 
     密码可以放在 `api_key`，也可以放在 `settings.password`；两者同时给出时
     必须完全一致（否则 422），避免客户端以为改了密码却没生效。
+
+    发件人地址来自 `settings.from_address`（可选）与 `settings.from_name`
+    （可选显示名）。配置了 SMTP 且登录用户名不是邮箱地址时必须提供
+    `from_address`，否则安装直接 422，而不是在发信时伪造一个会退信的地址。
     """
     raw = dict(settings or {})
     api_secret = api_key or ""
@@ -90,6 +99,22 @@ def prepare_credentials(api_key: str | None, settings: dict[str, Any] | None) ->
         raise ValidationError(
             "至少需要配置 imap_host（收信）或 smtp_host（发信）",
             details={"field": "imap_host", "connector": CONNECTOR_ID},
+        )
+
+    # 发件人地址：From 头必须是合法邮箱地址。登录用户名不一定是邮箱（例如 "bot"），
+    # 所以在配置了 SMTP 时显式要求 settings.from_address；只有用户名本身像邮箱时才
+    # 允许省略，避免在用户不知情的情况下伪造一个会退信的地址。
+    from_address = _clean_text(raw.get("from_address"), "from_address", max_chars=MAX_ADDRESS_CHARS)
+    if from_address and not _valid_address(from_address):
+        raise ValidationError(
+            "from_address 必须是合法的邮箱地址",
+            details={"field": "from_address", "connector": CONNECTOR_ID},
+        )
+    from_name = _clean_text(raw.get("from_name"), "from_name", max_chars=MAX_SENDER_NAME_CHARS)
+    if smtp_host and not from_address and not _valid_address(username):
+        raise ValidationError(
+            "登录用户名不是邮箱地址，请在 settings.from_address 中提供发件邮箱地址",
+            details={"field": "from_address", "connector": CONNECTOR_ID},
         )
 
     smtp_ssl = _parse_bool(raw.get("smtp_ssl"), False, "smtp_ssl")
@@ -124,6 +149,8 @@ def prepare_credentials(api_key: str | None, settings: dict[str, Any] | None) ->
         "smtp_starttls": smtp_starttls,
         "username": username,
         "password": password,
+        "from_address": from_address,
+        "from_name": from_name,
     }
 
 
@@ -151,6 +178,15 @@ def decode_credentials(key_vault: KeyVaultService, ciphertext: bytes) -> dict[st
             "email 连接器凭据缺少用户名或密码，请重新安装",
             details={"connector": CONNECTOR_ID},
         )
+    # 旧版本安装的凭据文档没有 from_address / from_name，缺省为空串，
+    # 发信时再按 _sender_address 的兼容规则解析。
+    from_address = _credential_str(document, "from_address")
+    from_name = _credential_str(document, "from_name")
+    if from_address and not _valid_address(from_address):
+        raise ConfigurationError(
+            "email 连接器凭据中的发件人地址已损坏，请重新安装",
+            details={"connector": CONNECTOR_ID},
+        )
     return {
         "imap_host": _credential_str(document, "imap_host"),
         "imap_port": _credential_port(document, "imap_port", DEFAULT_IMAP_PORT),
@@ -161,6 +197,8 @@ def decode_credentials(key_vault: KeyVaultService, ciphertext: bytes) -> dict[st
         "smtp_starttls": _credential_bool(document, "smtp_starttls", True),
         "username": username,
         "password": password,
+        "from_address": from_address,
+        "from_name": from_name,
     }
 
 
@@ -348,12 +386,24 @@ class EmailConnectorService:
                 details={"field": "body"},
             )
 
+        sender_address, sender_name, sender_source = _sender_address(credentials)
+        if sender_source == "derived":
+            # 升级前安装的旧凭据可能只有非邮箱用户名；不阻断发信，但要留下告警。
+            logger.warning(
+                "email.send account=%s from_address_fallback=username_at_smtp_host",
+                account_key,
+            )
+
         message = EmailMessage()
-        message["From"] = credentials["username"]
+        message["From"] = (
+            formataddr((sender_name, sender_address)) if sender_name else sender_address
+        )
         message["To"] = ", ".join(recipients_to)
         if recipients_cc:
             message["Cc"] = ", ".join(recipients_cc)
         message["Subject"] = clean_subject
+        # RFC 5322 要求 Date 头；缺失会被部分服务器或反垃圾策略惩罚。
+        message["Date"] = formatdate(localtime=False, usegmt=True)
         message["Message-ID"] = make_msgid()
         if clean_type == "text/html":
             message.set_content(clean_body, subtype="html")
@@ -373,11 +423,12 @@ class EmailConnectorService:
         recipient_count = len(recipients_to) + len(recipients_cc)
         # 日志只记 message-id / 收件人数 / 主题长度，绝不记正文或密码
         logger.info(
-            "email.send account=%s recipients=%d subject_len=%d message_id=%s",
+            "email.send account=%s recipients=%d subject_len=%d message_id=%s sender=%s",
             account_key,
             recipient_count,
             len(clean_subject),
             message_id,
+            sender_source,
         )
         return {
             "sent": True,
@@ -746,6 +797,25 @@ def _valid_address(value: str) -> bool:
         return False
     local, _, domain = value.partition("@")
     return bool(local and domain and "@" not in domain and "." in domain)
+
+
+def _sender_address(credentials: dict[str, Any]) -> tuple[str, str, str]:
+    """解析 From 头，返回 (地址, 显示名, 来源)。
+
+    显式的 `from_address` 优先；否则只有看起来像邮箱的用户名才直接使用。
+    升级前安装的旧凭据两者都可能不满足，此时不阻断发信，退化为
+    `username@smtp_host`，由调用方记录告警（新安装已在安装阶段拒绝该组合）。
+    """
+    from_address = str(credentials.get("from_address") or "").strip()
+    from_name = str(credentials.get("from_name") or "").strip()
+    if from_address:
+        return from_address, from_name, "from_address"
+    username = str(credentials.get("username") or "").strip()
+    if _valid_address(username):
+        return username, from_name, "username"
+    host = str(credentials.get("smtp_host") or "").strip()
+    derived = f"{username}@{host}" if host else username
+    return derived, from_name, "derived"
 
 
 def _parse_bool(value: Any, default: bool, field: str) -> bool:

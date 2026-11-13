@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import imaplib
+import json
 import logging
 import smtplib
 from email.message import EmailMessage
+from email.utils import parseaddr, parsedate_to_datetime
 from typing import Any
 
 import pytest
@@ -311,6 +313,7 @@ def test_install_accepts_password_only_in_settings(settings: Settings, db_schema
         ({"imap_host": "imap example test"}, (), PASSWORD, "imap_host"),
         ({"imap_port": 70000}, (), PASSWORD, "imap_port"),
         ({"smtp_ssl": True, "smtp_starttls": True}, (), PASSWORD, "smtp_starttls"),
+        ({"from_address": "not-an-address"}, (), PASSWORD, "from_address"),
         ({}, ("username",), PASSWORD, "username"),
         ({}, (), None, "password"),
         ({"password": PASSWORD}, (), "different-password", "password"),
@@ -571,6 +574,158 @@ def test_send_message_success_and_logs_do_not_leak(
     assert BODY_MARKER not in log_text
     assert "Weekly report" not in log_text
     assert "email.send" in log_text
+
+
+def test_send_message_sets_parseable_rfc5322_date_header(
+    settings: Settings,
+    db_schema: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSMTP()
+    _patch_smtp(monkeypatch, fake)
+
+    with _client(settings, db_schema) as client:
+        assert _install(client).status_code == 200
+        response = client.post(
+            f"{PREFIX}/connectors/email/send",
+            json={"to": "bob@example.test", "subject": "hi", "body": "x"},
+            headers=_headers(),
+        )
+
+    assert response.status_code == 200, response.text
+    sent = fake.sent[0]
+    assert sent["Date"]
+    parsed = parsedate_to_datetime(str(sent["Date"]))
+    assert parsed is not None
+    # formatdate(localtime=False, usegmt=True) 固定使用 UTC（+0000）。
+    assert parsed.utcoffset() is not None
+    assert parsed.utcoffset().total_seconds() == 0
+
+
+def test_send_uses_configured_from_address_and_name(
+    settings: Settings,
+    db_schema: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSMTP()
+    _patch_smtp(monkeypatch, fake)
+
+    with _client(settings, db_schema) as client:
+        installed = _install(
+            client,
+            settings_overrides={
+                "from_address": "reports@example.test",
+                "from_name": "Flux Reports",
+            },
+        )
+        assert installed.status_code == 200, installed.text
+        response = client.post(
+            f"{PREFIX}/connectors/email/send",
+            json={"to": "bob@example.test", "subject": "hi", "body": "x"},
+            headers=_headers(),
+        )
+
+    assert response.status_code == 200, response.text
+    assert parseaddr(str(fake.sent[0]["From"])) == ("Flux Reports", "reports@example.test")
+
+
+def test_install_requires_from_address_for_non_email_username(
+    settings: Settings,
+    db_schema: None,
+) -> None:
+    """username 不是邮箱且未给 from_address 时，安装阶段直接拒绝（422）。"""
+    with _client(settings, db_schema) as client:
+        response = _install(client, settings_overrides={"username": "bot"})
+
+    assert response.status_code == 422, response.text
+    body = response.json()
+    assert body["code"] == "validation_error"
+    assert body["data"]["field"] == "from_address"
+
+
+def test_install_accepts_non_email_username_with_from_address(
+    settings: Settings,
+    db_schema: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSMTP()
+    _patch_smtp(monkeypatch, fake)
+
+    with _client(settings, db_schema) as client:
+        installed = _install(
+            client,
+            settings_overrides={"username": "bot", "from_address": "bot@example.test"},
+        )
+        assert installed.status_code == 200, installed.text
+        response = client.post(
+            f"{PREFIX}/connectors/email/send",
+            json={"to": "bob@example.test", "subject": "hi", "body": "x"},
+            headers=_headers(),
+        )
+
+    assert response.status_code == 200, response.text
+    assert parseaddr(str(fake.sent[0]["From"])) == ("", "bot@example.test")
+
+
+def test_send_legacy_non_email_username_derives_from_smtp_host(
+    settings: Settings,
+    db_schema: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """升级前安装的旧凭据没有 from_address：退化为 username@smtp_host 并告警。"""
+    fake = FakeSMTP()
+    _patch_smtp(monkeypatch, fake)
+    capture = _CaptureHandler()
+    logger = logging.getLogger("flux.core.connectors.email")
+    previous_level = logger.level
+
+    with _client(settings, db_schema) as client:
+        container = client.app.state.container
+        legacy_document = {
+            "imap_host": "",
+            "imap_port": 0,
+            "imap_ssl": True,
+            "smtp_host": "smtp.example.test",
+            "smtp_port": 587,
+            "smtp_ssl": False,
+            "smtp_starttls": True,
+            "username": "bot",
+            "password": PASSWORD,
+        }
+
+        async def _seed_legacy_installation() -> None:
+            async with container.session_factory() as session:
+                session.add(
+                    ConnectorInstallation(
+                        account_key=ACCOUNT_A,
+                        connector_id="email",
+                        auth_type="api_key",
+                        scopes="mail.send",
+                        credential_ciphertext=container.key_vault.seal_text(
+                            json.dumps(legacy_document)
+                        ),
+                    )
+                )
+                await session.commit()
+
+        asyncio.run(_seed_legacy_installation())
+
+        logger.addHandler(capture)
+        logger.setLevel(logging.WARNING)
+        try:
+            response = client.post(
+                f"{PREFIX}/connectors/email/send",
+                json={"to": "bob@example.test", "subject": "hi", "body": "x"},
+                headers=_headers(),
+            )
+        finally:
+            logger.removeHandler(capture)
+            logger.setLevel(previous_level)
+
+    assert response.status_code == 200, response.text
+    assert parseaddr(str(fake.sent[0]["From"])) == ("", "bot@smtp.example.test")
+    assert "from_address_fallback" in "\n".join(capture.messages)
+    assert PASSWORD not in "\n".join(capture.messages)
 
 
 def test_send_rejects_bad_recipients(settings: Settings, db_schema: None) -> None:
