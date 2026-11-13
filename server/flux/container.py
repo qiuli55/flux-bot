@@ -17,6 +17,7 @@ from flux.cloud.memory_sync import CloudMemorySync
 from flux.config import Settings, get_settings
 from flux.connectors.base import ConnectorRegistry
 from flux.core.agent_runtime.adapters import build_default_adapters
+from flux.core.agent_runtime.browser_status import BrowserStatusProbe
 from flux.core.agent_runtime.codex_account import CodexAccountService
 from flux.core.agent_runtime.installation import InstallationRepository, InstallationService
 from flux.core.agent_runtime.manager import AgentManager
@@ -35,6 +36,7 @@ from flux.core.bot.webhook_triggers import WebhookTriggerService
 from flux.core.capability_import.repository import ImportedCapabilityRepository
 from flux.core.capability_import.scanners import AgentScanner
 from flux.core.capability_import.service import CapabilityImportService
+from flux.core.channels.activity import ChannelActivityRegistry
 from flux.core.channels.dingtalk_bot import DingTalkBotChannel
 from flux.core.channels.feishu_bot import FeishuBotChannel
 from flux.core.channels.outbound_drafts import OutboundDraftService
@@ -225,6 +227,10 @@ class Container:
     outbound_drafts: OutboundDraftService = field(init=False)
     #: 出站审批卡的串行闸门：三个频道共享，保证同一对话同一时刻只挂一张卡
     outbound_approval_lock: asyncio.Lock = field(init=False)
+    #: 频道入站活动（最近接收 / 近期错误）：进程内登记，重启清空
+    channel_activity: ChannelActivityRegistry = field(init=False)
+    #: 浏览器 MCP 探活（2 秒超时 + 30 秒缓存）：进程内单例，避免状态轮询打爆 sidecar
+    browser_probe: BrowserStatusProbe = field(init=False)
     #: 正式飞书频道：加密回调入站建 turn，出站回复必须经审批卡放行
     feishu_bot: FeishuBotChannel = field(init=False)
     #: 正式钉钉频道：HTTP 事件订阅入站建 turn，出站回复同样必须经审批卡放行
@@ -561,6 +567,9 @@ class Container:
         # 出站审批卡串行闸门：飞书 / 企业微信 / 钉钉共用一把锁，避免同一对话
         # 同时挂出多张卡（`pending_decision()` 只认最后一张）。
         self.outbound_approval_lock = asyncio.Lock()
+        # 入站活动与浏览器探活都是进程内状态：不落库、重启清空，只服务状态接口。
+        self.channel_activity = ChannelActivityRegistry()
+        self.browser_probe = BrowserStatusProbe()
         # Bot 后台子任务：独立于对话轮次跑的 tasks 行，结果以 kind=subtask 消息回到父对话。
         # 它不碰 last_task_id / chat_task_id，也不参与开工忙闲锁。
         self.bot_subtasks = BotSubtaskService(self)

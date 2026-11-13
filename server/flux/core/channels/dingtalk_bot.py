@@ -343,11 +343,17 @@ class DingTalkBotChannel:
                 message_id,
                 exc.code,
             )
+            activity = getattr(self._container, "channel_activity", None)
+            if activity is not None:
+                activity.record_error("dingtalk", exc.code, exc.message)
             return DingTalkCallbackResult(
                 exc.http_status,
                 {"error": exc.message, "code": exc.code},
             )
 
+        activity = getattr(self._container, "channel_activity", None)
+        if activity is not None:
+            activity.record_receive("dingtalk")
         if created:
             self._schedule_tracking(
                 bot=bot,
