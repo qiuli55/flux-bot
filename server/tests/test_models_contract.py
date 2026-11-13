@@ -183,7 +183,9 @@ def test_schema_can_be_created_on_sqlite(tmp_path) -> None:
 def test_indexes_cover_spec_query_columns() -> None:
     """§11.4：project_id、task status、agent status、created_at 需要有索引。"""
     expectations = {
-        "tasks": ["project_id", "status"],
+        # parent_task_id：Bot 后台子任务指回父对话任务，按父对话查/清理时需要索引
+        # （迁移 b7d2e4f9c1a3 建了 ix_tasks_parent_task_id）。
+        "tasks": ["project_id", "status", "parent_task_id"],
         "agents": ["status", "role"],
         "virtual_changes": ["project_id", "status"],
         "projects": ["organization_id"],
@@ -192,6 +194,19 @@ def test_indexes_cover_spec_query_columns() -> None:
         table = Base.metadata.tables[table_name]
         for column in columns:
             assert table.c[column].index, f"{table_name}.{column} 应有索引"
+
+
+def test_tasks_table_covers_subtask_parent_column() -> None:
+    """Bot 后台子任务：tasks.parent_task_id 指回父对话任务（迁移 b7d2e4f9c1a3）。
+
+    普通任务为 NULL；父任务被清理时只置空关联（SET NULL），不级联删除子任务记录。
+    """
+    table = Base.metadata.tables["tasks"]
+    column = table.c["parent_task_id"]
+    assert column.nullable
+    assert column.index
+    assert {fk.target_fullname for fk in column.foreign_keys} == {"tasks.id"}
+    assert {fk.ondelete for fk in column.foreign_keys} == {"SET NULL"}
 
 
 def test_migrated_schema_matches_metadata(tmp_path) -> None:

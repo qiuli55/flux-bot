@@ -479,7 +479,7 @@ def test_external_points_count_flux_idle_intervals(client: TestClient) -> None:
 
 def test_run_settle_triggers_billing_snapshot() -> None:
     """Run 收尾要补一次官方额度快照，给外部消耗差分切出区间边界。"""
-    from flux.core.task_engine.dsh_bridge import TaskRunBridge
+    from flux.core.task_engine.run_bridge import TaskRunBridge
 
     class FakeBilling:
         def __init__(self) -> None:

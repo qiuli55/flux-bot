@@ -1,15 +1,17 @@
-"""测试替身。"""
+"""测试替身与公共夹具。"""
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from threading import Event
+import asyncio
+import json
+import os
+import sys
+from pathlib import Path
 from typing import Any
 
-from deepseek_harness import Notification, RunResult
-
 from flux.connectors.base import Connector, ConnectorManifest
-from flux.enums import Capability
+from flux.core.agent_runtime.adapters.base import CliAgentProbe
+from flux.enums import AgentInstallStatus, Capability
 from flux.errors import PermissionDeniedError
 
 
@@ -52,96 +54,100 @@ class FakeTerminalConnector(Connector):
         self.closed = True
 
 
-#: FakeDshHarness.run 的行为：收到 (harness, instruction, session_id, on_notification)。
-DshBehavior = Callable[
-    ["FakeDshHarness", str, "str | None", "Callable[[Notification], None] | None"],
-    RunResult,
-]
+# --- CLI Agent 假可执行文件 ---
 
 
-def default_dsh_behavior(
-    harness: FakeDshHarness,
-    instruction: str,
-    session_id: str | None,
-    on_notification: Callable[[Notification], None] | None,
-) -> RunResult:
-    """默认行为：回一条助手文本 + 一次 turn/end，模拟正常完成。"""
-    sid = session_id or "session"
-    message = {
-        "type": "assistant/message",
-        "data": {"message": {"content": [{"type": "text", "text": f"echo: {instruction}"}]}},
+def write_cli_script(path: Path, body: str) -> str:
+    """造一个两平台都能被直接启动的假 CLI。
+
+    POSIX 靠 shebang + 可执行位；Windows 上无扩展名脚本不是有效可执行文件
+    （CreateProcess 报 WinError 193），因此写一份 `.py` 脚本 + 一份 `.cmd` 包装，返回
+    `.cmd` 路径——被测的 adapter 会经 `platforms.executable_argv` 用 `cmd.exe /c` 启动它。
+    """
+    if os.name == "nt":
+        script = path.with_suffix(".py")
+        script.write_text(body, encoding="utf-8", newline="\n")
+        wrapper = path.with_suffix(".cmd")
+        # 假 CLI 的 JSON 事件里有中文：Windows 的 Python 子进程默认按 locale（cp1252）
+        # 解码 argv/stdin，PYTHONUTF8=1 让它与真实 CLI（原生 UTF-8）行为一致。
+        wrapper.write_text(
+            f'@echo off\r\nset PYTHONUTF8=1\r\n"{sys.executable}" "{script}" %*\r\n',
+            encoding="utf-8",
+            newline="",
+        )
+        return str(wrapper)
+    path.write_text(body, encoding="utf-8")
+    path.chmod(0o755)
+    return str(path)
+
+
+def mark_runtime_ready(container: Any, name: str) -> None:
+    """把 installation 直接置为 READY（不真实探测本机 CLI，保持用例确定性）。"""
+
+    async def _upsert() -> None:
+        await container.installations._repository.upsert(  # noqa: SLF001 - 测试直接落库
+            CliAgentProbe(name=name, adapter=name, status=AgentInstallStatus.READY),
+            status=AgentInstallStatus.READY,
+        )
+
+    asyncio.run(_upsert())
+
+
+_FAKE_CLAUDE_TEMPLATE = """#!/usr/bin/env python3
+import json, os, sys, time
+
+_LOG = %(log)r
+_SENTINEL = %(sentinel)r
+_HOLD = %(hold)r
+_SESSION = "sess-" + str(os.getpid())
+
+# 每次启动都把 argv 原样落一行：用例据此断言「Agent 收到了什么」
+with open(_LOG, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(sys.argv[1:], ensure_ascii=False) + "\\n")
+
+
+def emit(payload):
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+emit({"type": "system", "subtype": "init", "session_id": _SESSION})
+if _HOLD:
+    # 一直不结束，模拟「执行中的 Agent」；夹具收尾时 touch sentinel 放行
+    while not os.path.exists(_SENTINEL):
+        time.sleep(0.05)
+    sys.exit(0)
+emit({"type": "stream_event", "event": {"type": "content_block_delta",
+      "delta": {"type": "text_delta", "text": "done"}}})
+emit({"type": "result", "subtype": "success", "session_id": _SESSION,
+      "result": "done", "is_error": False})
+"""
+
+
+def write_fake_claude(
+    binary: Path,
+    *,
+    log_path: Path,
+    sentinel: Path,
+    hold: bool = False,
+) -> str:
+    """写一个假 `claude`：记录 argv，吐 init / text_delta / result 三类事件。
+
+    `hold=True` 时进程停在 init 之后不退出，用来测试取消与「执行中」的状态流转。
+    """
+    body = _FAKE_CLAUDE_TEMPLATE % {
+        "log": str(log_path),
+        "sentinel": str(sentinel),
+        "hold": hold,
     }
-    end = {"type": "turn/end", "data": {"reason": {"kind": "completed"}}}
-    if on_notification is not None:
-        for event in (message, end):
-            on_notification(
-                Notification(method="session.event", payload={"sessionId": sid, "event": event})
-            )
-    return RunResult(
-        session_id=sid,
-        final_response=f"echo: {instruction}",
-        finish_reason="completed",
-        events=[message, end],
-        notifications=[],
-    )
+    return write_cli_script(binary, body)
 
 
-class FakeDshHarnessClient:
-    """FakeDshHarness 的 client 面：只实现 notify（interrupt 走它）。"""
-
-    def __init__(self, harness: FakeDshHarness) -> None:
-        self._harness = harness
-
-    def notify(self, method: str, payload: dict[str, Any]) -> None:
-        self._harness.notifications.append((method, payload))
-        if method == "session/cancel":
-            # 让阻塞中的 run() 收到 cancel 后返回，等价于 runtime 会话转 idle。
-            self._harness.cancel_event.set()
-
-
-class FakeDshHarness:
-    """DeepSeekHarness 测试替身：不启动真实 runtime 子进程，行为由 behavior 决定。"""
-
-    def __init__(self, behavior: DshBehavior, **kwargs: Any) -> None:
-        self.behavior = behavior
-        self.kwargs = kwargs
-        self.closed = False
-        self.started = False
-        self.notifications: list[tuple[str, dict[str, Any]]] = []
-        #: 每次 run() 收到的输入原文（批次①起用于断言 Bootstrap 注入与原文保真）
-        self.prompts: list[str] = []
-        #: 每次 run() 收到的 session id：同一任务续跑时必须是不同的值
-        self.session_ids: list[str] = []
-        self.cancel_event = Event()
-        self.client = FakeDshHarnessClient(self)
-
-    def start(self) -> None:
-        """真实 harness 的初始化入口（runtime 就绪）；默认成功，需要时可被覆盖。"""
-        self.started = True
-
-    def run(
-        self,
-        input: str,
-        *,
-        session_id: str | None = None,
-        on_notification: Callable[[Notification], None] | None = None,
-    ) -> RunResult:
-        self.prompts.append(input)
-        self.session_ids.append(session_id or "")
-        return self.behavior(self, input, session_id, on_notification)
-
-    def close(self) -> None:
-        self.closed = True
-
-
-class FakeDshHarnessFactory:
-    """按 behavior 产出 FakeDshHarness 的工厂（DeepSeekHarness 的构造替身）。"""
-
-    def __init__(self, behavior: DshBehavior | None = None) -> None:
-        self.behavior = behavior or default_dsh_behavior
-        self.created: list[FakeDshHarness] = []
-
-    def __call__(self, **kwargs: Any) -> FakeDshHarness:
-        harness = FakeDshHarness(self.behavior, **kwargs)
-        self.created.append(harness)
-        return harness
+def read_cli_argv(log_path: Path) -> list[list[str]]:
+    """读回假 CLI 记录的所有 argv（每次进程启动一行 JSON）。"""
+    if not log_path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]

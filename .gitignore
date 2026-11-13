@@ -1,4 +1,4 @@
-# 运行期数据：Bot 定义、任务记录、记忆、DSH 会话
+# 运行期数据：Bot 定义、任务记录、记忆、Claude Code 会话
 data/
 *.db
 *.db-journal

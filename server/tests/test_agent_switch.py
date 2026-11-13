@@ -14,7 +14,7 @@ from flux.models.agent_installation import AgentInstallation
 PREFIX = "/api/v1"
 
 
-def _create_agent(client: TestClient, name: str, runtime: str = "dsh") -> str:
+def _create_agent(client: TestClient, name: str, runtime: str = "claude-code") -> str:
     response = client.post(
         f"{PREFIX}/agents", json={"name": name, "role": "developer", "runtime": runtime}
     )
@@ -66,6 +66,7 @@ def _ready_installation(client: TestClient, name: str) -> None:
 
 def test_switch_while_running_is_queued(client: TestClient) -> None:
     """执行中切换只排队：当前 Agent、本轮进度都不动，响应标 effective_from=next_run。"""
+    _ready_installation(client, "claude-code")
     agent_a = _create_agent(client, "builder")
     agent_b = _create_agent(client, "reviewer")
     task = _create_task(client, agent_a)
@@ -89,6 +90,7 @@ def test_switch_while_running_is_queued(client: TestClient) -> None:
 
 def test_queued_switch_applies_after_run_finishes(client: TestClient) -> None:
     """Run 收尾后应用排队：换人、清模型覆盖、落交接卡、发 agent_switched 事件。"""
+    _ready_installation(client, "claude-code")
     agent_a = _create_agent(client, "builder")
     agent_b = _create_agent(client, "reviewer")
     task = _create_task(client, agent_a)
@@ -120,6 +122,7 @@ def test_queued_switch_applies_after_run_finishes(client: TestClient) -> None:
 
 def test_queued_switch_waits_for_user_decision(client: TestClient) -> None:
     """任务在等人决策时还没真正结束，排队保留、不提前换人。"""
+    _ready_installation(client, "claude-code")
     agent_a = _create_agent(client, "builder")
     agent_b = _create_agent(client, "reviewer")
     task = _create_task(client, agent_a)

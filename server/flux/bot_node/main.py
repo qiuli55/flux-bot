@@ -16,7 +16,6 @@ from fastapi import Depends, FastAPI
 
 from flux.api.auth import require_rest_auth
 from flux.api.errors import register_exception_handlers
-from flux.api.internal_tap import router as llm_tap_router
 from flux.api.v1 import (
     agents,
     bots,
@@ -28,7 +27,6 @@ from flux.api.v1 import (
     deliveries,
     desktop,
     devices,
-    dsh,
     groups,
     health,
     hooks,
@@ -41,7 +39,6 @@ from flux.api.v1 import (
 )
 from flux.config import Settings, get_settings
 from flux.container import Container
-from flux.core.agent_runtime.llm_stream_tap import llm_stream_tap
 from flux.core.mcp.server import router as mcp_router
 from flux.logging import configure_logging, get_logger
 from flux.version import VERSION
@@ -62,7 +59,6 @@ _BOT_ROUTERS = (
     memory,
     models,
     keys,
-    dsh,
     capabilities,
     uploads,
     user_memory,
@@ -76,17 +72,17 @@ _BOT_PUBLIC_ROUTERS = (hooks,)
 def resolve_bot_settings(settings: Settings) -> Settings:
     """Bot 节点的生效配置：MCP 端点默认跟随监听端口，鉴权默认 fail-closed。
 
-    `Settings.dsh_mcp_url` 的默认值属于原始 Flux 主应用（8000），Bot 节点监听
-    8600；若直接把默认值注入 DSH，模型请求与流式旁路都会打到无人监听的端口。
-    只有显式配置的 FLUX_DSH_MCP_URL（含 .env / 构造参数）才覆盖推导结果。
+    `Settings.mcp_url` 的默认值属于原始 Flux 主应用（8000），Bot 节点监听
+    8600；若直接把默认值注入 Claude Code 的 MCP 配置，工具调用会打到无人监听的
+    端口。只有显式配置的 FLUX_MCP_URL（含 .env / 构造参数）才覆盖推导结果。
 
     `allow_no_auth` 未显式配置时在 Bot 节点收敛为 False：未设置 FLUX_AUTH_TOKEN
     时只放行同机回环直连，避免把可执行命令的 REST 面直接暴露给整个网络。
     Flux 主应用不走这里，继续保留 None（旧行为）。
     """
     updates: dict[str, object] = {}
-    if "dsh_mcp_url" not in settings.model_fields_set:
-        updates["dsh_mcp_url"] = f"http://127.0.0.1:{settings.bot_port}/mcp"
+    if "mcp_url" not in settings.model_fields_set:
+        updates["mcp_url"] = f"http://127.0.0.1:{settings.bot_port}/mcp"
     if "allow_no_auth" not in settings.model_fields_set:
         updates["allow_no_auth"] = False
     return settings.model_copy(update=updates) if updates else settings
@@ -130,16 +126,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "其他来源一律 401。请在 .env 设置 FLUX_AUTH_TOKEN；"
                     "若部署在完全可信的内网，可显式设置 FLUX_ALLOW_NO_AUTH=true。"
                 )
-        # MCP 端点与 Bot 监听端口不一致时，DSH 的模型请求与流式旁路会打到死端口。
+        # MCP 端点与 Bot 监听端口不一致时，Agent 的工具调用会打到死端口。
         # 这里只告警不阻断：测试/单机排查可能有意让二者不同。
-        mcp_port = _url_port(app_settings.dsh_mcp_url)
+        mcp_port = _url_port(app_settings.mcp_url)
         if mcp_port is not None and mcp_port != app_settings.bot_port:
             logger.warning(
-                "DSH MCP URL 端口 %s 与 Bot 监听端口 FLUX_BOT_PORT=%s 不一致"
-                "（FLUX_DSH_MCP_URL=%s）；请确认二者指向同一实例",
+                "MCP URL 端口 %s 与 Bot 监听端口 FLUX_BOT_PORT=%s 不一致"
+                "（FLUX_MCP_URL=%s）；请确认二者指向同一实例",
                 mcp_port,
                 app_settings.bot_port,
-                app_settings.dsh_mcp_url,
+                app_settings.mcp_url,
             )
         # Bot 开工要认 agent 档案与令牌，启动时先重建内存注册表。
         await container.agents.load_from_db()
@@ -148,11 +144,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await container.bot_conversation.recover_interrupted()
         # 上一轮进程被杀时中断的工作区 Apply 需要按磁盘事实恢复，否则 Bot 的改动会卡在 applying。
         await container.workspace.recover_interrupted_applies()
-        if app_settings.dsh_enabled:
-            # 收摊孤儿 Run，再拉起心跳/对账循环：Bot 的定时任务全靠它推进。
-            await container.dsh.supervisor.startup_recovery()
-            await container.task_runs.reconcile_orphan_tasks()
-            container.dsh.supervisor.ensure_background()
+        # 收摊孤儿 Run，再拉起心跳/对账循环：Bot 的定时任务全靠它推进。
+        await container.run_supervisor.startup_recovery()
+        await container.task_runs.reconcile_orphan_tasks()
+        container.run_supervisor.ensure_background()
         # Bot 调度：轮询 bots.next_run_at，到期且空闲就开新任务。关掉后仍可手动触发。
         if app_settings.bot_scheduler_enabled:
             await container.bots.start()
@@ -160,7 +155,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # 调度循环先停：定时开工要写 tasks / bots，必须在 dispose 之前收尾。
         await container.bots.stop()
         await container.dispose()
-        await llm_stream_tap.aclose()
 
     app = FastAPI(
         title="Flux Bot",
@@ -189,8 +183,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(channels_wecom.router, prefix=app_settings.api_v1_prefix)
     # MCP 能力面：给 agent 用的协议端点，与 REST 同进程同生命周期。
     app.include_router(mcp_router)
-    # 内置 Agent 的 token 流式旁路：只给本机 DSH 子进程用。
-    app.include_router(llm_tap_router)
     return app
 
 

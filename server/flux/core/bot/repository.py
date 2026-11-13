@@ -14,6 +14,7 @@ from sqlalchemy import delete, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from flux.enums import TaskOrigin
 from flux.errors import BadRequestError, NotFoundError
 from flux.logging import get_logger
 from flux.models.bot import Bot
@@ -130,6 +131,8 @@ class BotRepository:
 
         对话任务是同一 Bot 名下的普通 tasks 行，但它由 Bot 对话队列串行处理，
         不代表「开工中的一轮」；结算与定时调度必须把它排除，否则聊天会永远占着忙。
+        后台子任务同理：它们独立于开工链路运行，用户还能继续聊天、定时/事件/手动开工
+        也不该被一条长活锁住，因此只看 origin 不是 subtask 的任务。
         """
         async with self._session_factory() as session:
             chat_task_id = select(Bot.chat_task_id).where(Bot.id == bot_id).scalar_subquery()
@@ -138,6 +141,7 @@ class BotRepository:
                 .where(
                     Task.bot_id == bot_id,
                     Task.status.in_(_ACTIVE_TASK_STATUSES),
+                    Task.origin != TaskOrigin.SUBTASK.value,
                     or_(chat_task_id.is_(None), Task.id != chat_task_id),
                 )
                 .limit(1)

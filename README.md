@@ -15,7 +15,11 @@ docker-compose.yml  NAS / 单机部署
 ```
 
 对外只暴露 Bot 相关接口：`/api/v1/bots`、`/groups`、`/tasks`、`/deliveries`、`/memory`、
-`/models`、`/keys`、`/dsh`。Flux 的对话、设计工作室、IDE、终端、助理等路由不在这里。
+`/models`、`/keys`。Flux 的对话、设计工作室、IDE、终端、助理等路由不在这里。
+
+Bot 的 Agent 底座统一是 Claude Code（新老 Bot 一致）。镜像里已装好 Node 与
+`@anthropic-ai/claude-code`；要用第三方订阅套餐时，先在 OpenClaw 登录，再把网关地址填到
+`FLUX_ANTHROPIC_BASE_URL`。
 
 ## 部署（Docker）
 
@@ -141,11 +145,11 @@ payload 包含 `bot_id`、`profile`、`principal`（设备会话另有 `device_i
 
 ```
 data/flux.db              Bot 定义、例程、任务、记忆
-data/dsh-home/            执行内核的会话与配置
+data/runtime-home/        Claude Code 的会话、隔离配置与鉴权
 data/home/.flux/          密钥库主密钥、账号云会话、计费/记忆偏好等本机状态
 data/uploads/             用户上传的附件
 data/deliveries/          AI 下发给用户的文件
-data/dsh-ws/              DSH 工作目录
+data/runtime-ws/          执行内核的临时工作目录
 data/workspace/           Bot 读写文件的工作区
 ```
 

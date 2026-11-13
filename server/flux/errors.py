@@ -90,7 +90,7 @@ class ProviderNotConfiguredError(AIOSError):
 
 
 class ConfigurationError(AIOSError):
-    """能力未启用或未配置（例如 DSH Agent Runtime 未开启）。集成方案 §18 Phase 1。"""
+    """能力未启用或未配置（例如 Agent Runtime 未就绪）。集成方案 §18 Phase 1。"""
 
     code = "configuration_error"
     http_status = 503
