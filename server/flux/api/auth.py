@@ -8,7 +8,9 @@ MCP 面本来就有 Agent 令牌，REST 面此前完全没有身份校验（只�
 
 0. 带的是**账号云**（B 机 `flux.qiuli55.top`，独立私有仓库）签发的 access token
    （`typ=access`），且与云共享的 HS256 密钥本地验签通过 → 放行。这就是 Flux 本体的
-   登录闭环：令牌由唯一的账号权威签发，本机只验签、不每次回源；
+   登录闭环：令牌由唯一的账号权威签发，本机只验签、不每次回源；令牌里的 `sub`
+   会作为 `principal["cloud_user_id"]`（始终是字符串）带进本次请求，供设备归属等
+   按人隔离的逻辑使用；
 1. 请求带 `Authorization: Bearer <token>` 且与 `FLUX_AUTH_TOKEN` **常量时间**比对通过 → 放行；
 2. 设备令牌（`fbd_` 前缀）：查库校验 sha256、撤销与过期状态；命中后把设备身份放到
    `request.state.principal`。为降低每请求打库压力，带 30 秒进程内缓存；撤销会立即
@@ -83,13 +85,73 @@ def is_trusted_local(request: Request) -> bool:
     return not _has_forwarded_headers(request)
 
 
-def is_cloud_access_token(settings: Settings, token: str | None) -> bool:
-    """账号云签发的 access token？本地验签，不每次回源。"""
+def _normalize_user_id(value: object) -> str | None:
+    """云用户 id 一律按字符串处理；None / 空串视为未提供。
+
+    JWT 的 `sub` 在云端是数字，但本仓库内部（principal、设备表）统一用字符串，
+    避免 `1` / `"1"` 两种写法在按人过滤时各算各的。
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def parse_cloud_access_token(settings: Settings, token: str | None) -> dict[str, Any] | None:
+    """校验账号云 access token 并返回 payload（本地验签，不每次回源）。
+
+    必须是 `typ=access` 且带非空 `sub`——`sub` 就是"这是谁"，是后续按用户隔离的
+    唯一身份来源。校验失败一律返回 None，不区分原因。
+    """
     secret = (settings.cloud_secret_key or "").strip()
     if not secret or not token:
-        return False
+        return None
     payload = verify_hs256(token, secret)
-    return payload is not None and payload.get("typ") == _CLOUD_ACCESS_TYP
+    if payload is None or payload.get("typ") != _CLOUD_ACCESS_TYP:
+        return None
+    subject = _normalize_user_id(payload.get("sub"))
+    if subject is None:
+        return None
+    # 统一成字符串，principal / 设备表不需要再判断原始类型。
+    payload["sub"] = subject
+    return payload
+
+
+def is_cloud_access_token(settings: Settings, token: str | None) -> bool:
+    """账号云签发的 access token？本地验签，不每次回源。"""
+    return parse_cloud_access_token(settings, token) is not None
+
+
+def current_cloud_user_id(
+    principal: dict[str, Any] | None,
+    settings: Settings,
+) -> str | None:
+    """本次请求代表的"人"：先看 principal，再回退到配置的主用户 id。
+
+    回退顺序：
+    1. principal 自带的 `cloud_user_id`（云 JWT 的 sub，或设备行上的归属）；
+    2. `FLUX_OWNER_CLOUD_USER_ID`——主用户 / 本机 CLI / 管理员令牌的旧行为兜底；
+    3. 都没有则 None（调用方应拒绝按人管理的操作）。
+
+    admin / local principal 本身不造一个假的 cloud_user_id；只有需要"这是谁"的
+    调用点才通过本函数拿到主用户兜底。
+    """
+    if principal:
+        value = _normalize_user_id(principal.get("cloud_user_id"))
+        if value:
+            return value
+    return _normalize_user_id(settings.owner_cloud_user_id)
+
+
+async def get_current_cloud_user_id(request: Request) -> str | None:
+    """FastAPI 依赖：取当前请求的云用户 id（供后续按人隔离的功能 Depends）。
+
+    必须在 `require_rest_auth` 之后使用（全局路由依赖已经保证）；本阶段不在
+    memory / vault / connectors 里接线，但依赖本身已可被后续阶段直接复用。
+    """
+    container = get_container(request)
+    principal = getattr(request.state, "principal", None) or {}
+    return current_cloud_user_id(principal, container.settings)
 
 
 def _is_public_rest_path(request: Request, settings: Settings) -> bool:
@@ -121,8 +183,9 @@ async def require_rest_auth(
         else request.cookies.get("flux_auth_token")
     )
     # 第 0 条：账号云登录态。放在最前，让"登录后可用的接口"不依赖 FLUX_AUTH_TOKEN 是否配置。
-    if is_cloud_access_token(settings, provided):
-        _set_principal(request, "cloud")
+    cloud_payload = parse_cloud_access_token(settings, provided)
+    if cloud_payload is not None:
+        _set_principal(request, "cloud", cloud_user_id=cloud_payload["sub"])
         return
 
     expected = (settings.auth_token or "").strip()
@@ -136,7 +199,17 @@ async def require_rest_auth(
         device = await container.devices.resolve_token(provided)
         if device is None:
             raise AuthenticationError("缺少或无效的访问令牌")
-        _set_principal(request, "device", device_id=str(device.id), device_name=device.name)
+        # 老设备 / 老配对码的 cloud_user_id 可能是 NULL：按配置的主用户兜底。
+        device_owner = _normalize_user_id(device.cloud_user_id) or _normalize_user_id(
+            settings.owner_cloud_user_id
+        )
+        _set_principal(
+            request,
+            "device",
+            device_id=str(device.id),
+            device_name=device.name,
+            cloud_user_id=device_owner,
+        )
         return
 
     if not expected:

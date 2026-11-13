@@ -20,7 +20,7 @@ import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from flux.config import Settings
@@ -60,6 +60,14 @@ def _aware(value: datetime | None) -> datetime | None:
 
 def hash_device_token(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _normalize_user_id(value: object) -> str | None:
+    """云用户 id 统一字符串；None / 空白视为未提供。"""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 class PairingRateLimiter:
@@ -111,8 +119,12 @@ class DeviceService:
     def _generate_code(self) -> str:
         return "".join(secrets.choice(PAIRING_ALPHABET) for _ in range(PAIRING_CODE_LENGTH))
 
-    async def issue_pairing_code(self) -> tuple[str, datetime]:
-        """生成一次性配对码，返回 (明文, 过期时间)。明文不落库。"""
+    async def issue_pairing_code(self, *, cloud_user_id: str | None = None) -> tuple[str, datetime]:
+        """生成一次性配对码，返回 (明文, 过期时间)。明文不落库。
+
+        `cloud_user_id` 由 API / CLI 层解析（云 JWT 的 sub，或主用户兜底）；
+        兑换出的设备会继承它，从而把"这台手机属于谁"钉在配对码上。
+        """
         code = self._generate_code()
         now = _utcnow()
         expires_at = now + timedelta(seconds=max(1, int(self._settings.pairing_code_ttl_seconds)))
@@ -121,10 +133,15 @@ class DeviceService:
                 id=uuid.uuid4(),
                 code_hash=hash_device_token(code),
                 expires_at=expires_at,
+                cloud_user_id=_normalize_user_id(cloud_user_id),
             )
             session.add(row)
             await session.commit()
-        logger.info("device.pairing_code.issue expires_at=%s", expires_at.isoformat())
+        logger.info(
+            "device.pairing_code.issue expires_at=%s cloud_user_id=%s",
+            expires_at.isoformat(),
+            _normalize_user_id(cloud_user_id),
+        )
         return code, expires_at
 
     async def pair(self, *, code: str, device_name: str, client_ip: str) -> tuple[Device, str]:
@@ -170,20 +187,24 @@ class DeviceService:
 
             raw = f"{DEVICE_TOKEN_PREFIX}{secrets.token_urlsafe(DEVICE_TOKEN_SECRET_BYTES)}"
             expires_at = self._device_expiry(now)
+            # 设备归属继承配对码；老码 NULL 时按主用户兜底（仍无则保持 NULL）。
             device = Device(
                 id=uuid.uuid4(),
                 name=(device_name or "").strip()[:128],
                 token_hash=hash_device_token(raw),
                 token_prefix=raw[:8],
                 expires_at=expires_at,
+                cloud_user_id=_normalize_user_id(row.cloud_user_id)
+                or _normalize_user_id(self._settings.owner_cloud_user_id),
             )
             session.add(device)
             await session.commit()
             await session.refresh(device)
         logger.info(
-            "device.pair success device=%s prefix=%s expires_at=%s",
+            "device.pair success device=%s prefix=%s cloud_user_id=%s expires_at=%s",
             device.id,
             device.token_prefix,
+            device.cloud_user_id,
             device.expires_at.isoformat() if device.expires_at else None,
         )
         return device, raw
@@ -242,9 +263,21 @@ class DeviceService:
 
     # --- 管理面 ---
 
-    async def list(self) -> list[Device]:
+    async def list(self, *, cloud_user_id: str) -> list[Device]:
+        """只列当前用户名下的设备；NULL 归属仅对配置的主用户可见。"""
+        owner = _normalize_user_id(cloud_user_id)
+        if owner is None:
+            return []
+        statement = select(Device).where(self._owned_clause(owner))
         async with self._session_factory() as session:
-            return list(await session.scalars(select(Device).order_by(Device.created_at.asc())))
+            return list(await session.scalars(statement.order_by(Device.created_at.asc())))
+
+    def _owned_clause(self, cloud_user_id: str):
+        """当前用户可见的设备范围：自己的 + （仅主用户）历史 NULL 归属的。"""
+        conditions = [Device.cloud_user_id == cloud_user_id]
+        if cloud_user_id == _normalize_user_id(self._settings.owner_cloud_user_id):
+            conditions.append(Device.cloud_user_id.is_(None))
+        return or_(*conditions)
 
     async def get(self, device_id: str | uuid.UUID) -> Device:
         key = self._as_uuid(device_id)
@@ -256,8 +289,18 @@ class DeviceService:
                 )
             return device
 
-    async def revoke(self, device_id: str | uuid.UUID) -> Device:
-        """撤销设备并立即清除本进程缓存。"""
+    async def revoke(
+        self,
+        device_id: str | uuid.UUID,
+        *,
+        cloud_user_id: str | None = None,
+    ) -> Device:
+        """撤销设备并立即清除本进程缓存。
+
+        `cloud_user_id` 非空时做归属校验：别人的设备一律按"不存在"处理（404），
+        避免泄露设备 id 是否存在。设备自助登出（`/devices/me/revoke`）传 None，
+        因为它的 device_id 已由令牌限定为调用者自己。
+        """
         key = self._as_uuid(device_id)
         async with self._session_factory() as session:
             device = await session.get(Device, key)
@@ -265,6 +308,18 @@ class DeviceService:
                 raise NotFoundError(
                     f"设备 {device_id} 不存在", details={"device_id": str(device_id)}
                 )
+            if cloud_user_id is not None:
+                owner = _normalize_user_id(cloud_user_id)
+                legacy_ok = (
+                    _normalize_user_id(device.cloud_user_id) is None
+                    and owner is not None
+                    and owner == _normalize_user_id(self._settings.owner_cloud_user_id)
+                )
+                if _normalize_user_id(device.cloud_user_id) != owner and not legacy_ok:
+                    # 与"设备不存在"同一个错误，避免跨用户探测设备 id。
+                    raise NotFoundError(
+                        f"设备 {device_id} 不存在", details={"device_id": str(device_id)}
+                    )
             if device.revoked_at is None:
                 device.revoked_at = _utcnow()
             await session.commit()
