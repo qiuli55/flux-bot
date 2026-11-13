@@ -33,6 +33,11 @@ from flux.models.task import Task, TaskMessage
 
 logger = get_logger(__name__)
 
+#: 已经结束、不允许再被收尾流程改写的任务状态
+_TERMINAL_TASK_STATUSES = frozenset(
+    {TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value}
+)
+
 
 @dataclass(frozen=True)
 class MessageDraft:
@@ -85,6 +90,7 @@ class TaskRepository:
         avatar_color: str = "violet",
         bot_id: uuid.UUID | None = None,
         workspace: str | None = None,
+        parent_task_id: uuid.UUID | None = None,
     ) -> Task:
         """写入一条 pending 任务。project_id 指向不存在的项目时抛 NotFoundError。
 
@@ -93,6 +99,7 @@ class TaskRepository:
 
         `model` / `api_key_id` 是任务级模型选择；`api_key_id=None` 表示原生模型。
         `bot_id` 标记这条任务由哪个常驻 Bot 发起；`workspace` 是本轮执行目录的快照。
+        `parent_task_id` 只有后台子任务会传：指向它在 Bot 里的父对话任务。
         """
         async with self._session_factory() as session:
             if project_id is not None:
@@ -117,6 +124,7 @@ class TaskRepository:
                 avatar_shape=avatar_shape,
                 avatar_color=avatar_color,
                 bot_id=bot_id,
+                parent_task_id=parent_task_id,
                 workspace=(workspace or "").strip() or None,
             )
             session.add(task)
@@ -147,6 +155,9 @@ class TaskRepository:
 
         `bot_id` 只看某个 Bot 的开工记录；`exclude_bot_tasks` 用于首页对话列表，
         把常驻 Bot 的每一轮开工挡在「对话」之外。
+
+        后台子任务（origin=subtask）默认不出现在任何任务/对话列表里：它们属于父对话的
+        执行细节，有独立接口（/bots/{id}/subtasks）。显式传 origin=subtask 时才返回。
         """
         statement = select(Task).order_by(Task.created_at.desc(), Task.id.desc()).limit(limit)
         if project_id is not None:
@@ -155,6 +166,8 @@ class TaskRepository:
             statement = statement.where(Task.status == status.value)
         if origin is not None:
             statement = statement.where(Task.origin == origin.value)
+        else:
+            statement = statement.where(Task.origin != TaskOrigin.SUBTASK.value)
         if bot_id is not None:
             statement = statement.where(Task.bot_id == bot_id)
         if exclude_bot_tasks:
@@ -178,6 +191,7 @@ class TaskRepository:
         排序按「最后一条消息时间优先、没有消息时用创建时间」。
 
         默认排除常驻 Bot 的开工任务：它们有独立入口，混进对话列表会淹没人工对话。
+        后台子任务同样默认隐藏；显式 origin=subtask 时才参与列表。
         """
         stats = (
             select(
@@ -207,6 +221,8 @@ class TaskRepository:
             statement = statement.where(Task.status == status.value)
         if origin is not None:
             statement = statement.where(Task.origin == origin.value)
+        else:
+            statement = statement.where(Task.origin != TaskOrigin.SUBTASK.value)
         if keyword:
             statement = statement.where(Task.description.ilike(f"%{keyword.strip()}%"))
         if not include_bot_tasks:
@@ -230,6 +246,50 @@ class TaskRepository:
             if task is None:
                 raise NotFoundError(f"任务 {task_id} 不存在", details={"task_id": str(task_id)})
             task.status = status.value
+            await self._commit(session)
+            return task
+
+    async def start_if_pending(self, task_id: uuid.UUID) -> Task | None:
+        """pending → running；已经不 pending 时返回 None（不覆盖别处写入的终态）。
+
+        后台子任务的启动与取消会并发：用户可能在后台协程真正开跑前就点了取消。
+        判断与写入必须在同一个事务里，否则 running 会把刚写好的 cancelled 顶回去，
+        任务永远停在 running。
+        """
+        async with self._session_factory() as session:
+            task = await self._require(session, task_id)
+            if task.status != TaskStatus.PENDING.value:
+                return None
+            task.status = TaskStatus.RUNNING.value
+            await self._commit(session)
+            return task
+
+    async def finish_if_active(
+        self,
+        task_id: uuid.UUID,
+        status: TaskStatus,
+        result: dict[str, Any] | None = None,
+    ) -> Task | None:
+        """把仍在执行的任务收成终态；已经终态时返回 None（不覆盖别人的收尾）。
+
+        后台子任务的成功、失败、取消可能同时到达（模型刚返回时用户点了取消）。
+        终态判断与写入必须在同一个事务里完成，否则两条路径会互相覆盖。
+        """
+        async with self._session_factory() as session:
+            task = await self._require(session, task_id)
+            if task.status in _TERMINAL_TASK_STATUSES:
+                return None
+            task.status = status.value
+            if result is not None:
+                task.result = result
+            await self._commit(session)
+            return task
+
+    async def set_result(self, task_id: uuid.UUID, result: dict[str, Any]) -> Task:
+        """只补写结果、不改状态（内核 Run 的桥接已先一步落终态时用）。"""
+        async with self._session_factory() as session:
+            task = await self._require(session, task_id)
+            task.result = result
             await self._commit(session)
             return task
 

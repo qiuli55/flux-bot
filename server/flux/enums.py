@@ -48,6 +48,9 @@ class TaskOrigin(StrEnum):
 
     CHAT = "chat"
     ASSISTANT = "assistant"
+    #: Bot 对话里派出的后台子任务：有独立的 tasks 行与生命周期，但既不是用户对话，
+    #: 也不占 Bot 的「开工忙闲」锁；只通过父对话里的 kind=subtask 消息对外可见。
+    SUBTASK = "subtask"
 
 
 class BotStatus(StrEnum):

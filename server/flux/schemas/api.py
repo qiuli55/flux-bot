@@ -217,6 +217,17 @@ class BotTurnCreateRequest(BaseModel):
     client_turn_id: str | None = Field(default=None, max_length=128)
 
 
+class BotSubtaskCreateRequest(BaseModel):
+    """给 Bot 派一条后台子任务。
+
+    子任务独立于对话轮次运行：接口立即返回子任务任务体，用户随后仍可继续聊天；
+    开始/完成/失败/取消都会以 kind=subtask 的消息追加到父对话。
+    """
+
+    instruction: str = Field(min_length=1, max_length=8000)
+    title: str | None = Field(default=None, max_length=200)
+
+
 class TaskMessageCreateRequest(BaseModel):
     """发一条任务消息（任务执行中心的对话输入）。
 

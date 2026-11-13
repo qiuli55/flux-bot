@@ -348,6 +348,9 @@ class Settings(BaseSettings):
     bot_scheduler_enabled: bool = True
     # 轮询间隔（秒）：cron 的最小粒度是分钟，30 秒足够且不会压垮 SQLite。
     bot_scheduler_interval_seconds: float = 30.0
+    # 后台子任务等待内核 Run 收尾的总时限（秒）：超时即终止 Run 并按失败回写父对话；
+    # 0 或负数表示不设上限（仍受 Run 自身的 idle / hard 超时约束）。
+    bot_subtask_timeout_seconds: float = 3600.0
     # 外部例程触发（Webhook）的 HMAC 密钥。留空 = fail-closed，拒绝所有入站请求。
     # 通用入口校验 X-Flux-Signature；GitHub 入口校验 X-Hub-Signature-256。
     routine_webhook_secret: str | None = None

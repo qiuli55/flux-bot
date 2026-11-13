@@ -29,6 +29,7 @@ from flux.core.agent_runtime.trace_repository import RunTraceRepository
 from flux.core.billing.service import BillingService
 from flux.core.bot.conversation import BotConversationService
 from flux.core.bot.service import BotService
+from flux.core.bot.subtasks import BotSubtaskService
 from flux.core.bot.webhook_triggers import WebhookTriggerService
 from flux.core.capability_import.repository import ImportedCapabilityRepository
 from flux.core.capability_import.scanners import AgentScanner
@@ -491,6 +492,9 @@ class Container:
         self.webhook_triggers = WebhookTriggerService(self)
         # Bot 对话：一轮落一条 bot_turns，后台按 Bot 串行调用同一个助手逻辑。
         self.bot_conversation = BotConversationService(self)
+        # Bot 后台子任务：独立于对话轮次跑的 tasks 行，结果以 kind=subtask 消息回到父对话。
+        # 它不碰 last_task_id / chat_task_id，也不参与开工忙闲锁。
+        self.bot_subtasks = BotSubtaskService(self)
         # 正式飞书频道：入站回调建 turn；出站草稿走审批卡，用户点「允许」后才发送。
         # 监听器只处理 kind=feishu_outbound 的审批结果，与既有审批闸门共存。
         self.feishu_bot = FeishuBotChannel(
@@ -691,6 +695,8 @@ class Container:
         await self.feishu_bot.aclose()
         # Bot 对话 worker 先停：它要写 bot_turns / task_messages，不能跑在 dispose 之后。
         await self.bot_conversation.shutdown()
+        # 后台子任务同样会写 task_messages / tasks；取消并等待，避免退出时挂住。
+        await self.bot_subtasks.shutdown()
         # 退出时先停看护循环并清理仍在跑的 Agent 进程树，再释放连接（P2-15 §2.5）
         await self.human_pty.shutdown()
         await self.terminal.shutdown(close_sessions=close_terminal_sessions)
