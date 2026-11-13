@@ -1,0 +1,70 @@
+# 可选 overlay：给 Flux 加一个 Playwright MCP 浏览器 sidecar。
+#
+# 用法（必须同时叠加基础编排，否则 flux-bot 的镜像、卷与环境变量都会丢）：
+#   docker compose -f docker-compose.yml -f docker-compose.browser.yml up -d
+#
+# 设计取舍：browser 网络刻意 **不设 internal: true**。浏览器本来就要出站访问互联网，
+# 一旦把网络设成 internal，sidecar 连不上任何站点，浏览器能力等于没有。需要收紧
+# 出站时请由运维在宿主机 / 网关上做 egress 过滤（见 docs/browser-agent.md）。
+#
+# 2026-11-12 快照：npm @playwright/mcp 0.0.85（2026-11-09 发布）；官方镜像
+# mcr.microsoft.com/playwright/mcp 存在 tag v0.0.85。下面的 sha256 是该 tag 的
+# 多架构索引 digest，用 digest 钉死可避免 tag 被重新指向后悄悄换掉运行内容。
+# 来源：npm registry、mcr.microsoft.com tag list、github.com/microsoft/playwright-mcp。
+
+services:
+  flux-bot:
+    networks:
+      # 保留默认网络：8600 的宿主机端口发布不受影响
+      - default
+      # 与浏览器 sidecar 的专用网络，只有这两个容器加入
+      - browser
+    environment:
+      # 一行的 JSON 对象，形状同 Claude Code 的 mcpServers；只允许 http / sse 远程 server。
+      # 解析与校验见 server/flux/core/agent_runtime/extra_mcp.py。
+      FLUX_CLAUDE_EXTRA_MCP_SERVERS: '{"browser":{"type":"http","url":"http://playwright-mcp:8931/mcp"}}'
+
+  playwright-mcp:
+    image: mcr.microsoft.com/playwright/mcp:v0.0.85@sha256:cc70a6922ff856f3aba0fe97d0d94220dc9a7f367f6d332facc6d81d9a91e60e
+    # 官方镜像默认入口不是长驻 HTTP 服务，这里按官方 README 的示例显式覆盖。
+    entrypoint: ["node"]
+    command:
+      - "/app/cli.js"
+      - "--headless"
+      - "--browser"
+      - "chromium"
+      - "--no-sandbox"
+      # profile 只放内存：容器重建即清空，不残留登录态。
+      - "--isolated"
+      - "--port"
+      - "8931"
+      - "--host"
+      - "0.0.0.0"
+      # Host 头白名单：默认只接受 localhost / 回环与 --host 的值，容器间按服务名
+      # 访问时必须把服务名列进来，否则请求会被拒绝。
+      - "--allowed-hosts"
+      - "playwright-mcp"
+      - "--output-dir"
+      - "/data/output"
+    # 不发布端口：只有 browser 网络里的 flux-bot 能连到 8931。
+    expose:
+      - "8931"
+    init: true
+    # Chromium 渲染 / 下载大页面需要足够的共享内存，默认 64MB 容易崩。
+    shm_size: "1gb"
+    restart: unless-stopped
+    volumes:
+      # 截图与下载产物落到命名卷。profile 因 --isolated 放在内存里；
+      # 若改用 --user-data-dir 持久化 profile，需要再给它单独挂一个卷。
+      - playwright-output:/data/output
+    networks:
+      - browser
+
+networks:
+  browser:
+    # 专用桥接网络：只有 flux-bot 与 playwright-mcp 加入，且不向宿主机发布端口。
+    # 不设 internal: true，因为浏览器必须能访问互联网。
+    driver: bridge
+
+volumes:
+  playwright-output:

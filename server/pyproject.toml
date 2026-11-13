@@ -14,8 +14,6 @@ dependencies = [
     "redis>=8.1",
     # 模型供应商适配器手写 httpx 调用上游 HTTP API（不用官方 SDK），属运行时依赖
     "httpx>=0.28",
-    # 官方 Python SDK，自带 runtime 可执行，不需要系统 Node（集成方案 §10）
-    "deepseek-harness-sdk==0.1.5rc1",
     # Agent Manifest 使用 YAML 声明（主规格 §6.2）
     "PyYAML>=6.0",
     # 上下文原文库的存储层压缩（FLUX_CONTEXT_MECHANISM §3.5）：文本 3–8×、日志 10×+，

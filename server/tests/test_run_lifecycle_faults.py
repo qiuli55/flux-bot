@@ -54,10 +54,9 @@ def _settings(tmp_path: Path, **overrides: object) -> Settings:
         anthropic_api_key=None,
         deepseek_api_key=None,
         default_provider="local",
-        dsh_enabled=True,
-        dsh_home=str(tmp_path / "dsh-home"),
-        dsh_workspace=str(tmp_path / "dsh-ws"),
-        dsh_mcp_enabled=False,
+        runtime_home=str(tmp_path / "runtime-home"),
+        runtime_workspace=str(tmp_path / "runtime-ws"),
+        mcp_enabled=False,
     )
     return base.model_copy(update=overrides) if overrides else base
 
@@ -80,7 +79,7 @@ async def test_cancel_escalates_for_stubborn_process_tree(tmp_path: Path) -> Non
 
     这是设计 §3.4 的硬要求：正常 Stop 不奏效时必须能升级，且不允许"UI 已停止而进程还在"。
     """
-    settings = _settings(tmp_path, dsh_cancel_grace_seconds=0.3)
+    settings = _settings(tmp_path, run_cancel_grace_seconds=0.3)
     repo, engine = await _repo(settings)
     bus = EventBus()
     sup = RunSupervisor(settings=settings, repository=repo, bus=bus)

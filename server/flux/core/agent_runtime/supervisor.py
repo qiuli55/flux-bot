@@ -1,6 +1,6 @@
 """Run 生命周期看护（修复方案 §2：P2-15）。
 
-DSH Run 过去只有"起一次、等它自己结束"：Provider 无响应就一直 running，用户取消后
+Agent Run 以前只有"起一次、等它自己结束"：Provider 无响应就一直 running，用户取消后
 子进程还活着，Flux 重启后状态也没人对账。本模块把这些收进一个统一看护器：
 
 ```text
@@ -51,7 +51,7 @@ from flux.enums import DshRunStatus
 from flux.logging import get_logger
 from flux.models.agent_run import AgentRun
 
-if TYPE_CHECKING:  # 仅类型标注：直接导入 runtimes 包会触发 dsh_runtime ↔ supervisor 循环
+if TYPE_CHECKING:  # 仅类型标注：直接导入 runtimes 包会触发 cli ↔ supervisor 循环
     from flux.core.agent_runtime.runtimes.base import RuntimeLimits
 
 logger = get_logger(__name__)
@@ -74,7 +74,7 @@ _OUTPUT_PERSIST_INTERVAL = 1.0
 
 
 class _NoopRunRepository:
-    """未装配数据库时的空实现：单测直接构造 FluxDshClient 也不该被迫建表。
+    """未装配数据库时的空实现：单测直接构造 RunSupervisor 也不该被迫建表。
 
     生产路径（Container）永远装配真实仓储；空实现只让纯内存用例少一层依赖。
     """
@@ -128,9 +128,9 @@ class _Monitor:
     terminal: bool = False
     #: 上一次把"有进展"写进库的单调时刻（事件可能成百上千，落库要节流）
     last_output_persist_mono: float = 0.0
-    #: 运行时的优雅中断回调（DSH 的 session/cancel）；未登记前为 None
+    #: 运行时的优雅中断回调（Claude 的 SIGINT / 各 CLI 的 cancel）；未登记前为 None
     interrupt: Callable[[], None] | None = None
-    #: 本 Run 的执行时限（runtime 能力表 + Settings 覆盖）；None = 用全局 dsh_* 配置
+    #: 本 Run 的执行时限（runtime 能力表 + Settings 覆盖）；None = 用全局 run_* 配置
     limits: RuntimeLimits | None = None
     #: 已生成正文的提供者（runtime 侧实时增量）：超时/取消时据此保留产出
     partial_output: Callable[[], str] | None = None
@@ -171,7 +171,7 @@ class RunSupervisor:
 
     @property
     def repository(self) -> AgentRunRepository | _NoopRunRepository:
-        """仓储只读视图：FluxDshClient 读库刷新 API 快照时用。"""
+        """仓储只读视图：Runtime 读库刷新 API 快照时用。"""
         return self._repo
 
     async def create_run(
@@ -188,7 +188,7 @@ class RunSupervisor:
         """登记一次 Run：建库行（PENDING）+ 建内存监视器，并发布 started 事件。
 
         `limits` 是 runtime 声明的执行时限（见 runtimes/base.py）；None = 沿用全局
-        `dsh_*` 配置，行为与改造前完全一致（DSH 及未来未登记时限的 runtime 不受影响）。
+        `run_*` 配置（未登记时限的 runtime 同样适用）。
         """
         now_mono = self._clock()
         self._monitors[run_id] = _Monitor(
@@ -264,7 +264,7 @@ class RunSupervisor:
     def register_partial_output(self, run_id: str, provider: Callable[[], str]) -> None:
         """登记"已生成正文"的读取器：超时/取消时把产出带进终态，而不是整轮作废。
 
-        任何 runtime 都能用（DSH 走事件累积、CLI 走增量缓冲）；不登记则维持原行为
+        任何 runtime 都能用（事件累积或增量缓冲）；不登记则维持原行为
         （超时/取消不保留正文）。读取器必须无副作用、同步、可重复调用。
         """
         monitor = self._monitors.get(run_id)
@@ -394,7 +394,7 @@ class RunSupervisor:
         if monitor is None and row is None:
             from flux.errors import NotFoundError
 
-            raise NotFoundError(f"DSH Run {run_id} 不存在", details={"run_id": run_id})
+            raise NotFoundError(f"Run {run_id} 不存在", details={"run_id": run_id})
         if monitor is not None and monitor.terminal:
             return monitor.status
         if monitor is None and row is not None and is_terminal(row.status):
@@ -416,7 +416,7 @@ class RunSupervisor:
         await self._repo.request_cancel(run_id)
         await self._repo.set_status(run_id, DshRunStatus.CANCELLING)
 
-        # 先请运行时自己收尾（DSH 会转 idle、子进程随之退出），再动刀。
+        # 先请运行时自己收尾（各 CLI runtime 的中断回调），再动刀。
         if monitor is not None:
             if monitor.interrupt is not None:
                 self._safe_call(monitor.interrupt, run_id)
@@ -439,7 +439,7 @@ class RunSupervisor:
         """一拍心跳：刷新 last_heartbeat_at，并检查三类超时。"""
         now = self._clock()
         stuck_after = (
-            max(self._settings.dsh_cancel_grace_seconds, 0.0) + _KILL_CONFIRM_SECONDS + 3.0
+            max(self._settings.run_cancel_grace_seconds, 0.0) + _KILL_CONFIRM_SECONDS + 3.0
         )
         for monitor in list(self._monitors.values()):
             if monitor.terminal:
@@ -473,7 +473,7 @@ class RunSupervisor:
         monitor.terminal = True
         monitor.last_state_mono = self._clock()
         logger.warning(
-            "dsh.run 超时 run=%s kind=%s partial_chars=%d", monitor.run_id, kind, len(partial)
+            "run 超时 run=%s kind=%s partial_chars=%d", monitor.run_id, kind, len(partial)
         )
         if monitor.interrupt is not None:
             self._safe_call(monitor.interrupt, monitor.run_id)
@@ -494,13 +494,13 @@ class RunSupervisor:
         hard = (
             limits.hard_timeout_seconds
             if limits is not None
-            else self._settings.dsh_hard_timeout_seconds
+            else self._settings.run_hard_timeout_seconds
         )
-        startup = self._settings.dsh_startup_timeout_seconds
+        startup = self._settings.run_startup_timeout_seconds
         idle = (
             limits.idle_timeout_seconds
             if limits is not None
-            else self._settings.dsh_idle_timeout_seconds
+            else self._settings.run_idle_timeout_seconds
         )
         if hard > 0 and monitor.started_mono is not None and now - monitor.started_mono > hard:
             return "hard"
@@ -566,7 +566,7 @@ class RunSupervisor:
             if final is DshRunStatus.INTERRUPTED
             else "对账发现 Agent 进程已消失，但状态仍是非终态"
         )
-        logger.warning("dsh.run 对账修正 run=%s %s → %s", row.id, status, final)
+        logger.warning("run 对账修正 run=%s %s → %s", row.id, status, final)
         await self._record_terminal(row.id, final, error=error, publish=True)
 
     async def startup_recovery(self) -> list[str]:
@@ -582,7 +582,7 @@ class RunSupervisor:
             await self._reconcile_row(row)
             recovered.append(row.id)
         if recovered:
-            logger.warning("dsh.run 启动恢复处理了 %d 条遗留 Run：%s", len(recovered), recovered)
+            logger.warning("run 启动恢复处理了 %d 条遗留 Run：%s", len(recovered), recovered)
         return recovered
 
     # --- 后台任务 ---
@@ -591,12 +591,12 @@ class RunSupervisor:
         """惰性启动心跳与对账循环（幂等）。"""
         if self._heartbeat_task is None or self._heartbeat_task.done():
             self._heartbeat_task = asyncio.create_task(
-                self._loop(self._settings.dsh_heartbeat_interval_seconds, self.heartbeat_once),
+                self._loop(self._settings.run_heartbeat_interval_seconds, self.heartbeat_once),
                 name="run-supervisor-heartbeat",
             )
         if self._reconcile_task is None or self._reconcile_task.done():
             self._reconcile_task = asyncio.create_task(
-                self._loop(self._settings.dsh_reconcile_interval_seconds, self.reconcile_once),
+                self._loop(self._settings.run_reconcile_interval_seconds, self.reconcile_once),
                 name="run-supervisor-reconcile",
             )
 
@@ -668,7 +668,7 @@ class RunSupervisor:
     async def _finish_cancel_failure(self, run_id: str, monitor: _Monitor | None) -> DshRunStatus:
         """清理不掉就明确失败：绝不把"还有进程活着"记成 cancelled。"""
         message = "取消失败：Agent 进程树未能清理干净（SIGTERM/SIGKILL 后仍存在）"
-        logger.error("dsh.run %s run=%s", message, run_id)
+        logger.error("run %s run=%s", message, run_id)
         if monitor is not None:
             monitor.status = DshRunStatus.FAILED
             monitor.terminal = True
@@ -683,7 +683,7 @@ class RunSupervisor:
 
     async def _recover_stuck_cancelling(self, monitor: _Monitor) -> None:
         """纠正卡住的 CANCELLING：再清一次进程树，成功落 CANCELLED，失败落 FAILED。"""
-        logger.warning("dsh.run 检测到卡住的 CANCELLING，自行收尾 run=%s", monitor.run_id)
+        logger.warning("run 检测到卡住的 CANCELLING，自行收尾 run=%s", monitor.run_id)
         row = await self._repo.get(monitor.run_id)
         monitor.terminal = True
         if await self._ensure_process_gone(monitor, row):
@@ -695,7 +695,7 @@ class RunSupervisor:
 
     async def _wait_for_registration(self, monitor: _Monitor) -> None:
         """取消来得比进程登记还早：等一小会儿，登记时 register_interrupt 会补发通知。"""
-        deadline = self._clock() + max(self._settings.dsh_cancel_grace_seconds, 0.0)
+        deadline = self._clock() + max(self._settings.run_cancel_grace_seconds, 0.0)
         while self._clock() < deadline:
             if monitor.registered.is_set() or monitor.terminal:
                 return
@@ -749,7 +749,7 @@ class RunSupervisor:
         # 对不属于自己的组发 CTRL_BREAK 会波及共享控制台（把运行 Flux 的终端一起打断），
         # 因此优雅信号只在 POSIX 生效，Windows 交由 kill_group 的 taskkill 收尾。
         signal_group_graceful(pgid)
-        grace = max(self._settings.dsh_cancel_grace_seconds, 0.0)
+        grace = max(self._settings.run_cancel_grace_seconds, 0.0)
         if await self._wait_gone(pgid, grace):
             return True
         kill_group(pgid)
@@ -759,7 +759,7 @@ class RunSupervisor:
         if not is_alive(pid):
             return True
         signal_process_graceful(pid)
-        grace = max(self._settings.dsh_cancel_grace_seconds, 0.0)
+        grace = max(self._settings.run_cancel_grace_seconds, 0.0)
         deadline = self._clock() + grace
         while self._clock() < deadline:
             if not is_alive(pid):
@@ -848,10 +848,10 @@ def _timeout_reason(
     limits: RuntimeLimits | None = None,
 ) -> str:
     hard_limit = (
-        limits.hard_timeout_seconds if limits is not None else settings.dsh_hard_timeout_seconds
+        limits.hard_timeout_seconds if limits is not None else settings.run_hard_timeout_seconds
     )
     idle_limit = (
-        limits.idle_timeout_seconds if limits is not None else settings.dsh_idle_timeout_seconds
+        limits.idle_timeout_seconds if limits is not None else settings.run_idle_timeout_seconds
     )
     if kind == "hard":
         return f"运行超时（hard）：超过绝对上限 {hard_limit:g} 秒"
@@ -859,7 +859,7 @@ def _timeout_reason(
         elapsed = clock() - monitor.created_mono
         return (
             f"启动超时（startup）：{elapsed:.0f} 秒内未完成 Agent 启动"
-            f"（上限 {settings.dsh_startup_timeout_seconds:g} 秒）"
+            f"（上限 {settings.run_startup_timeout_seconds:g} 秒）"
         )
     idle_for = clock() - max(
         monitor.last_output_mono, monitor.last_mcp_mono, monitor.last_state_mono

@@ -22,20 +22,19 @@ P2 的验收标准：
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
-from deepseek_harness import Notification, RunResult
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 from flux.config import Settings
 from flux.container import Container
-from flux.core.agent_runtime.dsh_client import FluxDshClient
 from flux.core.model_gateway.base import ChatMessage, ChatResult, ModelProviderBase, TokenUsage
 from flux.core.model_gateway.router import ModelRouter
 from flux.core.supervisor.assess import SupervisorAssessor
@@ -46,7 +45,7 @@ from flux.enums import AcceptMode, ModelProvider, SupervisorDecision, TicketStag
 from flux.main import create_app
 from flux.models.supervisor import SupervisorPolicy, SupervisorTicket, SupervisorTrigger
 from tests.conftest import create_agent
-from tests.fakes import DshBehavior, FakeDshHarness, FakeDshHarnessFactory, default_dsh_behavior
+from tests.fakes import mark_runtime_ready, read_cli_argv, write_fake_claude
 
 
 def _event(**overrides) -> dict:
@@ -548,58 +547,44 @@ def test_derive_stage_prioritises_platform_facts(
 # --- P2：全链路（规划 → 派发 → 真实 Run → 对账）---
 
 
-def _hold_behavior(
-    harness: FakeDshHarness,
-    instruction: str,
-    session_id: str | None,
-    on_notification: Callable[[Notification], None] | None,
-) -> RunResult:
-    """替身行为：Run 一直不结束，模拟"执行中的 Agent"（夹具收尾时放行）。"""
-    harness.cancel_event.wait(timeout=10)
-    return RunResult(
-        session_id=session_id or "session",
-        final_response="",
-        finish_reason="cancelled",
-        events=[],
-        notifications=[],
-    )
-
-
 @contextmanager
 def _supervised(
     settings: Settings,
     tmp_path: Path,
     *,
-    behavior: DshBehavior = default_dsh_behavior,
-) -> Iterator[tuple[TestClient, FakeDshHarnessFactory, Container]]:
-    """带 fake DSH 的 app：派发时起的是替身 Run，不碰真实 runtime。"""
+    hold: bool = False,
+) -> Iterator[tuple[TestClient, Path, Container]]:
+    """带 fake Claude CLI 的 app：派发时起的是替身进程，不碰真实 Agent。"""
     root = tmp_path / "project"
     root.mkdir(exist_ok=True)
+    log_path = tmp_path / "cli-argv.log"
+    sentinel = tmp_path / "release"
+    binary = write_fake_claude(tmp_path / "claude", log_path=log_path, sentinel=sentinel, hold=hold)
     enabled = settings.model_copy(
         update={
-            "dsh_enabled": True,
-            "dsh_home": str(tmp_path / "dsh-home"),
-            "dsh_workspace": str(tmp_path / "dsh-ws"),
+            "runtime_home": str(tmp_path / "runtime-home"),
+            "runtime_workspace": str(tmp_path / "runtime-ws"),
             "workspace_root": str(root),
+            "mcp_enabled": True,
+            "mcp_url": "http://127.0.0.1:8000/mcp",
         }
     )
     app = create_app(enabled)
-    factory = FakeDshHarnessFactory(behavior)
-    with TestClient(app) as client:
-        container = app.state.container
-        container.dsh = FluxDshClient(
-            enabled,
-            bus=container.bus,
-            harness_factory=factory,
-            token_service=container.agent_tokens,
-        )
-        # dispatcher 在容器初始化时就拿到了 dsh 引用：换掉后必须同步，否则 stop 打到旧对象
-        container.supervisor_dispatcher._dsh = container.dsh
-        try:
-            yield client, factory, container
-        finally:
-            for harness in factory.created:
-                harness.cancel_event.set()
+    previous = os.environ.get("FLUX_CLAUDE_CLI_BINARY")
+    os.environ["FLUX_CLAUDE_CLI_BINARY"] = binary
+    try:
+        with TestClient(app) as client:
+            container = app.state.container
+            mark_runtime_ready(container, "claude-code")
+            try:
+                yield client, log_path, container
+            finally:
+                sentinel.touch()
+    finally:
+        if previous is None:
+            os.environ.pop("FLUX_CLAUDE_CLI_BINARY", None)
+        else:
+            os.environ["FLUX_CLAUDE_CLI_BINARY"] = previous
 
 
 def _ingest(
@@ -647,7 +632,7 @@ def test_plan_dispatch_runs_and_reconciles(
     settings: Settings, tmp_path: Path, db_schema: None
 ) -> None:
     # EchoProvider 输出非 JSON：规划层诚实降级成单工单，但工单仍然可执行
-    with _supervised(settings, tmp_path) as (client, factory, _container):
+    with _supervised(settings, tmp_path) as (client, log_path, _container):
         create_agent(client, name="dev-1", role="developer")
         trigger = _ingest(client)
 
@@ -673,8 +658,9 @@ def test_plan_dispatch_runs_and_reconciles(
         assert task["status"] == "completed"
 
         # 派发确实起了 Run：替身收到的是工单原文
-        assert len(factory.created) == 1
-        assert "把登录页拆成三个组件" in factory.created[0].prompts[0]
+        runs = read_cli_argv(log_path)
+        assert len(runs) == 1
+        assert "把登录页拆成三个组件" in runs[0][-1]
 
         # 重复对账不刷重复报告
         again = _ticket(client, ticket["id"])
@@ -688,7 +674,7 @@ def test_plan_dispatch_runs_and_reconciles(
 def test_planning_same_trigger_twice_keeps_one_tree(
     settings: Settings, tmp_path: Path, db_schema: None
 ) -> None:
-    with _supervised(settings, tmp_path) as (client, _factory, _container):
+    with _supervised(settings, tmp_path) as (client, _log_path, _container):
         trigger = _ingest(client)
 
         first = client.post(f"{PREFIX}/observations/{trigger['id']}/plan").json()["data"]
@@ -702,7 +688,7 @@ def test_dispatch_without_matching_agent_records_blocked(
     settings: Settings, tmp_path: Path, db_schema: None
 ) -> None:
     # 没有任何 Agent 档案：绝不跨角色顶替，也不偷偷挑一个执行者
-    with _supervised(settings, tmp_path) as (client, factory, _container):
+    with _supervised(settings, tmp_path) as (client, log_path, _container):
         trigger = _ingest(client)
         planned = client.post(
             f"{PREFIX}/observations/{trigger['id']}/plan", params={"dispatch": "true"}
@@ -711,7 +697,7 @@ def test_dispatch_without_matching_agent_records_blocked(
         outcome = planned["data"]["dispatch"][0]
         assert outcome["dispatched"] is False
         assert "没有可执行角色" in outcome["reason"]
-        assert factory.created == []
+        assert read_cli_argv(log_path) == []
 
         detail = _ticket(client, planned["data"]["tickets"][0]["id"])
         assert detail["stage"] == "waiting"
@@ -721,7 +707,7 @@ def test_dispatch_without_matching_agent_records_blocked(
 def test_dependency_blocks_dispatch_until_done(
     settings: Settings, tmp_path: Path, db_schema: None
 ) -> None:
-    with _supervised(settings, tmp_path) as (client, _factory, container):
+    with _supervised(settings, tmp_path) as (client, _log_path, container):
         create_agent(client, name="dev-1", role="developer")
         container.supervisor_orchestrator._planner = _planner(
             _StubProvider(
@@ -756,7 +742,7 @@ def test_dependency_blocks_dispatch_until_done(
 def test_stop_cancels_run_and_records_reason(
     settings: Settings, tmp_path: Path, db_schema: None
 ) -> None:
-    with _supervised(settings, tmp_path, behavior=_hold_behavior) as (client, _factory, _c):
+    with _supervised(settings, tmp_path, hold=True) as (client, _log_path, _c):
         create_agent(client, name="dev-1", role="developer")
         trigger = _ingest(client)
         planned = client.post(
@@ -778,7 +764,7 @@ def test_stop_cancels_run_and_records_reason(
 def test_retry_after_stop_starts_a_new_round(
     settings: Settings, tmp_path: Path, db_schema: None
 ) -> None:
-    with _supervised(settings, tmp_path, behavior=_hold_behavior) as (client, _factory, _c):
+    with _supervised(settings, tmp_path, hold=True) as (client, _log_path, _c):
         create_agent(client, name="dev-1", role="developer")
         trigger = _ingest(client)
         ticket = client.post(
@@ -800,7 +786,7 @@ def test_retry_after_stop_starts_a_new_round(
 def test_auto_mode_dispatches_only_after_accept(
     settings: Settings, tmp_path: Path, db_schema: None
 ) -> None:
-    with _supervised(settings, tmp_path) as (client, _factory, container):
+    with _supervised(settings, tmp_path) as (client, _log_path, container):
         create_agent(client, name="dev-1", role="developer")
         # 判断层换成明确 accept：AUTO 自动派活只看这个结论
         container.supervisor_worker._assessor = _assessor(
