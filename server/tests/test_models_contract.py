@@ -140,6 +140,16 @@ SPEC_TABLES = {
     # 与 bot_memories（每 Bot 记忆）和 memories（三层记忆）分开存储。
     "user_profile_entries",
     "user_journal_entries",
+    # 用户保险库（迁移 d7a1f4c9b2e6）：站点登录 / 支付卡 / 联系人。
+    # 密码、完整卡号、CVV 均以 SecretBox 信封密文落库；接口只回掩码。
+    "vault_logins",
+    "vault_cards",
+    "vault_contacts",
+    # 技能包库（迁移 a7c1e9d4b2f6）：可 CRUD 的技能正文 + 每 Bot 启用/排序分配。
+    "skill_packages",
+    "bot_skills",
+    # 统一出站草稿（迁移 e2c9b7a4d1f3）：各频道待审批出站正文的持久化真相源。
+    "outbound_drafts",
     # 手机设备配对（迁移 f9d2e4a7b1c8）：devices 存长期设备令牌哈希，
     # pairing_codes 存一次性配对码哈希；两者都不落明文。
     "devices",
@@ -185,7 +195,9 @@ def test_schema_can_be_created_on_sqlite(tmp_path) -> None:
 def test_indexes_cover_spec_query_columns() -> None:
     """§11.4：project_id、task status、agent status、created_at 需要有索引。"""
     expectations = {
-        "tasks": ["project_id", "status"],
+        # parent_task_id：Bot 后台子任务指回父对话任务，按父对话查/清理时需要索引
+        # （迁移 b7d2e4f9c1a3 建了 ix_tasks_parent_task_id）。
+        "tasks": ["project_id", "status", "parent_task_id"],
         "agents": ["status", "role"],
         "virtual_changes": ["project_id", "status"],
         "projects": ["organization_id"],
@@ -194,6 +206,19 @@ def test_indexes_cover_spec_query_columns() -> None:
         table = Base.metadata.tables[table_name]
         for column in columns:
             assert table.c[column].index, f"{table_name}.{column} 应有索引"
+
+
+def test_tasks_table_covers_subtask_parent_column() -> None:
+    """Bot 后台子任务：tasks.parent_task_id 指回父对话任务（迁移 b7d2e4f9c1a3）。
+
+    普通任务为 NULL；父任务被清理时只置空关联（SET NULL），不级联删除子任务记录。
+    """
+    table = Base.metadata.tables["tasks"]
+    column = table.c["parent_task_id"]
+    assert column.nullable
+    assert column.index
+    assert {fk.target_fullname for fk in column.foreign_keys} == {"tasks.id"}
+    assert {fk.ondelete for fk in column.foreign_keys} == {"SET NULL"}
 
 
 def test_migrated_schema_matches_metadata(tmp_path) -> None:

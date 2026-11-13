@@ -3,22 +3,24 @@
 验证三条边界：
 - codex 的 config.toml 只写 env_key 变量名，密钥不落盘；
 - opencode 的含密钥配置只经 OPENCODE_CONFIG_CONTENT 传给子进程；
-- dsh 把 base_url / api_key / model 真正交给 harness。
+- claude-code 的密钥与网关地址只进子进程环境，MCP 配置文件里不出现明文。
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
-import time
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 
 from flux.config import Settings
-from flux.core.agent_runtime.dsh_client import TERMINAL_STATUSES, FluxDshClient
-from flux.core.agent_runtime.runtimes.base import RUNTIME_CODEX, RUNTIME_OPENCODE, ModelChannel
+from flux.core.agent_runtime.runtimes.base import (
+    RUNTIME_CLAUDE,
+    RUNTIME_CODEX,
+    RUNTIME_OPENCODE,
+    ModelChannel,
+)
 from flux.core.agent_runtime.runtimes.cli import (
     CliRuntime,
     _codex_config,
@@ -26,7 +28,6 @@ from flux.core.agent_runtime.runtimes.cli import (
     _opencode_model_id,
 )
 from flux.errors import ConfigurationError
-from tests.fakes import FakeDshHarnessFactory
 
 SECRET = "sk-flux-secret-123456"
 
@@ -40,10 +41,9 @@ def _settings(tmp_path: Path) -> Settings:
         anthropic_api_key=None,
         deepseek_api_key=None,
         default_provider="local",
-        dsh_enabled=True,
-        dsh_home=str(tmp_path / "dsh-home"),
-        dsh_workspace=str(tmp_path / "dsh-ws"),
-        dsh_mcp_enabled=False,
+        runtime_home=str(tmp_path / "runtime-home"),
+        runtime_workspace=str(tmp_path / "runtime-ws"),
+        mcp_enabled=False,
     )
 
 
@@ -134,27 +134,38 @@ def test_opencode_model_id_prefixes_the_key_provider() -> None:
     assert _opencode_model_id("", channel) == ""
 
 
-async def _wait_terminal(client: FluxDshClient, run_id: str, timeout: float = 3.0) -> object:
-    deadline = time.monotonic() + timeout
-    run = client.get_run(run_id)
-    while run.status not in TERMINAL_STATUSES and time.monotonic() < deadline:
-        await asyncio.sleep(0.01)
-    return run
+def test_claude_config_keeps_key_out_of_the_mcp_file(tmp_path: Path) -> None:
+    """密钥通道的 api_key / base_url 只进子进程环境；MCP 配置只有一次性令牌。"""
+    channel = _channel(provider="anthropic", base_url="https://openclaw.local/anthropic")
+    runtime = SimpleNamespace(
+        runtime_id=RUNTIME_CLAUDE,
+        _settings=_settings(tmp_path),
+        _secure=lambda path: True,
+        _inject_claude_credentials=lambda config_dir: None,
+    )
+    # claude-code 的配置写入是实例方法：把真实实现绑到替身上，避免复制一份逻辑
+    runtime._write_claude_config = MethodType(  # type: ignore[attr-defined]
+        CliRuntime._write_claude_config,  # noqa: SLF001
+        runtime,
+    )
+    env = CliRuntime._write_runtime_config(
+        runtime,
+        tmp_path,
+        "tok",
+        "r1",
+        model="claude-sonnet-5-5",
+        channel=channel,
+        mode="unattended",
+    )
 
+    mcp = json.loads((tmp_path / "mcp.json").read_text(encoding="utf-8"))
+    assert mcp["mcpServers"]["flux"]["headers"]["Authorization"] == "Bearer tok"
+    assert SECRET not in (tmp_path / "mcp.json").read_text(encoding="utf-8")
 
-async def test_dsh_harness_receives_key_channel(tmp_path: Path) -> None:
-    factory = FakeDshHarnessFactory()
-    client = FluxDshClient(_settings(tmp_path), harness_factory=factory)
-
-    run = await client.start_run("hi", model="deepseek-v4-pro", channel=_channel())
-    await _wait_terminal(client, run.run_id)
-
-    kwargs = factory.created[0].kwargs
-    assert kwargs["provider"] == "deepseek-official"
-    assert kwargs["model"] == "deepseek-v4-pro"
-    assert kwargs["base_url"] == "https://api.deepseek.com"
-    assert kwargs["api_key"] == SECRET
-    # 对外快照只暴露 key id，不暴露明文
-    snapshot = run.to_dict()
-    assert snapshot["model_key_id"] == _channel().key_id
-    assert SECRET not in json.dumps(snapshot, ensure_ascii=False)
+    # 非官方网关：官方文档口径是 Bearer（ANTHROPIC_AUTH_TOKEN），不能下发 X-Api-Key 变量
+    assert env["ANTHROPIC_AUTH_TOKEN"] == SECRET
+    assert "ANTHROPIC_API_KEY" not in env
+    assert env["ANTHROPIC_BASE_URL"] == "https://openclaw.local/anthropic"
+    assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path)
+    # 容器内 root + bypassPermissions 必须显式声明沙箱环境，否则 CLI 拒绝启动
+    assert env["IS_SANDBOX"] == "1"

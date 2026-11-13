@@ -29,9 +29,9 @@ from flux.core.agent_runtime.adapters.base import CliAgentProbe
 from flux.core.agent_runtime.manager import AgentSpec
 from flux.core.agent_runtime.runtimes.base import (
     DEFAULT_RUNTIME,
+    RUNTIME_CLAUDE,
     RUNTIME_CODEX,
     RUNTIME_OPENCODE,
-    RuntimeProcess,
 )
 from flux.core.agent_runtime.runtimes.cli import (
     CliRuntime,
@@ -44,7 +44,6 @@ from flux.core.agent_runtime.runtimes.cli import (
     _RunUsage,
     _upstream_failure,
 )
-from flux.core.agent_runtime.runtimes.dsh_runtime import DshRuntime
 from flux.enums import AgentInstallStatus, AgentRole
 from flux.errors import ConfigurationError, ValidationError
 from flux.main import create_app
@@ -455,12 +454,11 @@ def _cli_settings(settings: Settings, tmp_path: Path) -> Settings:
     root.mkdir(exist_ok=True)
     return settings.model_copy(
         update={
-            "dsh_enabled": True,
-            "dsh_home": str(tmp_path / "dsh-home"),
-            "dsh_workspace": str(tmp_path / "dsh-ws"),
+            "runtime_home": str(tmp_path / "runtime-home"),
+            "runtime_workspace": str(tmp_path / "runtime-ws"),
             "workspace_root": str(root),
-            "dsh_mcp_enabled": True,
-            "dsh_mcp_url": "http://127.0.0.1:8000/mcp",
+            "mcp_enabled": True,
+            "mcp_url": "http://127.0.0.1:8000/mcp",
         }
     )
 
@@ -576,11 +574,11 @@ def test_cli_run_completes_and_emits_unified_events(
         assert "tool_call" in types and "tool_result" in types and "message" in types
 
         # run 目录保留（供排障），配置已收权
-        run_dir = Path(container.settings.dsh_home) / "runs" / run_id
+        run_dir = Path(container.settings.runtime_home) / "runs" / run_id
         assert run_dir.is_dir()
         # codex 的 CODEX_HOME 按任务固定，才能跨轮 thread/resume；
         # 登录态与 config 仍每轮重写，隔离性不变。
-        task_home = Path(container.settings.dsh_home) / "runs" / f"task-{task_id}"
+        task_home = Path(container.settings.runtime_home) / "runs" / f"task-{task_id}"
         config = task_home / "codex-home" / "config.toml"
         assert config.is_file()
         # 收敛到仅属主可访问：POSIX 直接用 st_mode；Windows 的 stat 不反映 chmod，
@@ -961,9 +959,9 @@ def test_cli_prepare_sets_pwd_to_workspace(tmp_path: Path) -> None:
 
     settings = Settings(
         workspace_root=str(tmp_path),
-        dsh_workspace=str(tmp_path / "ws"),
-        dsh_home=str(tmp_path / "home"),
-        dsh_mcp_enabled=False,
+        runtime_workspace=str(tmp_path / "ws"),
+        runtime_home=str(tmp_path / "home"),
+        mcp_enabled=False,
     )
     runtime = CliRuntime(
         runtime_id=RUNTIME_OPENCODE,
@@ -1061,7 +1059,9 @@ def test_cli_run_keeps_stderr_out_of_reply(
         assert "tool_call" in types and "message" in types and "final" in types
 
         # 噪声留在日志里，不丢证据：codex 走常驻进程，stderr 落在任务级配置目录
-        stderr_log = Path(container.settings.dsh_home) / "runs" / f"task-{task_id}" / "stderr.log"
+        stderr_log = (
+            Path(container.settings.runtime_home) / "runs" / f"task-{task_id}" / "stderr.log"
+        )
         assert stderr_log.is_file()
         assert "noisy log line" in stderr_log.read_text(encoding="utf-8")
 
@@ -1101,7 +1101,7 @@ def test_cli_run_cancel_kills_process_group(
         # 明确等到进程进入 RUNNING（pid/pgid 已登记）再取消
         snapshot = None
         for _ in range(300):
-            snapshot = container.dsh.supervisor.monitor_snapshot(run_id)
+            snapshot = container.run_supervisor.monitor_snapshot(run_id)
             if snapshot and snapshot["pgid"]:
                 break
             time.sleep(0.02)
@@ -1142,7 +1142,7 @@ def test_agent_runtime_value_is_validated(settings: Settings, db_schema: None) -
     asyncio.run(_attempt())
 
 
-def test_default_agent_runtime_is_dsh(settings: Settings, db_schema: None) -> None:
+def test_default_agent_runtime_is_claude_code(settings: Settings, db_schema: None) -> None:
     container = create_app(settings).state.container
 
     async def _create() -> str:
@@ -1150,6 +1150,7 @@ def test_default_agent_runtime_is_dsh(settings: Settings, db_schema: None) -> No
         return handle.spec.runtime
 
     assert asyncio.run(_create()) == DEFAULT_RUNTIME
+    assert DEFAULT_RUNTIME == RUNTIME_CLAUDE
 
 
 def test_opencode_auth_probe_parses_config_not_only_auth_list(
@@ -1188,56 +1189,6 @@ def test_opencode_auth_probe_does_not_call_empty_auth_missing(
         probe_runner=lambda *_a, **_k: (0, "0 credentials"),
     )
     assert adapter.check_auth() == "unknown"
-
-
-def test_dsh_runtime_wraps_client_behaviour(tmp_path: Path) -> None:
-    """DshRuntime 薄包装：start 直接转调 start_run 并回传同一份快照（迁移零回归）。"""
-
-    class _FakeRun:
-        run_id = "r1"
-
-        def to_dict(self) -> dict:
-            return {"run_id": "r1", "status": "pending"}
-
-    class _FakeClient:
-        def __init__(self) -> None:
-            self.calls: list[dict] = []
-
-        async def start_run(self, instruction, **kwargs):
-            self.calls.append({"instruction": instruction, **kwargs})
-            return _FakeRun()
-
-    async def _exercise() -> tuple[RuntimeProcess, _FakeClient]:
-        client = _FakeClient()
-        runtime = DshRuntime(client, workspace=str(tmp_path))
-        task = type("T", (), {"id": "t1"})()
-        launch = await runtime.prepare(task=task, agent=None, run_id="r1", instruction="hi")
-        return await runtime.start(launch), client
-
-    proc, client = asyncio.run(_exercise())
-    assert proc.snapshot == {"run_id": "r1", "status": "pending"}
-    assert client.calls[0]["run_id"] == "r1" and client.calls[0]["task_id"] == "t1"
-
-
-def test_dsh_runtime_uses_a_unique_session_per_run(tmp_path: Path) -> None:
-    """同一任务续跑：每轮 Run 必须换一个 session id。
-
-    DSH 运行库的 session id 是全局唯一的，第二节沿用同一个 id 会直接报
-    "session already exists"，续聊的第二轮就起不来（真机复现过）。
-    """
-
-    async def _prepare(run_id: str) -> str:
-        runtime = DshRuntime(client=None, workspace=str(tmp_path))
-        task = type("T", (), {"id": "t1"})()
-        launch = await runtime.prepare(task=task, agent=None, run_id=run_id, instruction="hi")
-        return launch.session_id
-
-    async def _exercise() -> tuple[str, str]:
-        return await _prepare("r1"), await _prepare("r2")
-
-    first, second = asyncio.run(_exercise())
-    assert first != second
-    assert first.endswith("-r1") and second.endswith("-r2")
 
 
 def test_upstream_failure_matches_main_model_only() -> None:

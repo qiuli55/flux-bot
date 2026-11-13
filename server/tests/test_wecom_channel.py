@@ -1,0 +1,679 @@
+"""正式企业微信（WeCom）频道契约测试（加密回调入站 + 审批保护出站）。
+
+全部离线：密文用同一套 AES-CBC 打包规则在测试里现加密，模型调用与发送接口都
+替换成记录型替身；发送端另用 httpx.MockTransport 校验官方接口拼装。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import json
+import logging
+import time
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
+from types import SimpleNamespace
+from typing import Any
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+from flux.bot_node.main import create_app as create_bot_app
+from flux.config import Settings
+from flux.container import Container
+from flux.core.channels.wecom_bot import (
+    WECOM_OUTBOUND_KIND,
+    WeComBotChannel,
+    WeComBotSender,
+)
+from flux.core.channels.wecom_crypto import (
+    WeComCryptoError,
+    compute_signature,
+    decrypt_message,
+    encrypt_message,
+    verify_signature,
+)
+from flux.core.task_engine.assistant import AssistantTurn
+from flux.main import create_app
+
+TOKEN = "wecom-token-for-tests"
+CORP_ID = "ww_test_corp"
+AGENT_ID = "1000002"
+SECRET = "wecom-secret-for-tests"
+#: 企业微信 EncodingAESKey：43 个字符，补 '=' 后 base64 解码为 32 字节。
+ENCODING_AES_KEY = base64.b64encode(hashlib.sha256(b"wecom-test-key").digest()).decode().rstrip("=")
+USER_ID = "zhangsan"
+MESSAGE_ID = "7200000000000001"
+WEBHOOK = "/api/v1/channels/wecom"
+PREFIX = "/api/v1"
+TIMESTAMP = "1700000000"
+NONCE = "nonce-for-wecom-tests"
+
+
+# --- 替身 ---
+
+
+class _FakeBots:
+    def __init__(self, bot: Any) -> None:
+        self.bot = bot
+        self.calls: list[uuid.UUID] = []
+
+    async def get(self, bot_id: uuid.UUID) -> Any:
+        self.calls.append(bot_id)
+        return self.bot
+
+
+class _FakeConversation:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.seen: set[str] = set()
+        self.turns: list[Any] = []
+
+    async def create_turn(
+        self, bot: Any, *, content: str, client_turn_id: str | None = None
+    ) -> tuple[Any, bool]:
+        self.calls.append({"bot_id": bot.id, "content": content, "client_turn_id": client_turn_id})
+        if client_turn_id is not None and client_turn_id in self.seen:
+            return self.turns[0], False
+        if client_turn_id is not None:
+            self.seen.add(client_turn_id)
+        turn = SimpleNamespace(id=uuid.uuid4(), task_id=uuid.uuid4())
+        self.turns.append(turn)
+        return turn, True
+
+    async def wait_for_turn(self, bot_id: uuid.UUID, turn_id: uuid.UUID, *, wait_seconds: float):
+        return SimpleNamespace(id=turn_id, status="failed", reply_message_id=None)
+
+
+class _FakeSender:
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.messages: list[tuple[dict[str, Any], str]] = []
+        self.error = error
+        self.closed = False
+
+    async def send_text(self, dest: dict[str, Any], text: str) -> None:
+        self.messages.append((dest, text))
+        if self.error is not None:
+            raise self.error
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _FakeAssistant:
+    async def respond(self, **kwargs: Any) -> AssistantTurn:
+        on_delta = kwargs.get("on_delta")
+        if on_delta is not None:
+            await on_delta("思考中")
+        return AssistantTurn(
+            reply=f"echo: {kwargs['message']}",
+            provider="fake",
+            model="fake-model",
+            usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+
+
+# --- 工具 ---
+
+
+def _text_message_xml(
+    *,
+    msg_id: str = MESSAGE_ID,
+    content: str = "你好",
+    from_user: str = USER_ID,
+    msg_type: str = "text",
+    corp_id: str = CORP_ID,
+) -> str:
+    return (
+        "<xml>"
+        f"<ToUserName><![CDATA[{corp_id}]]></ToUserName>"
+        f"<FromUserName><![CDATA[{from_user}]]></FromUserName>"
+        "<CreateTime>1700000000</CreateTime>"
+        f"<MsgType><![CDATA[{msg_type}]]></MsgType>"
+        f"<Content><![CDATA[{content}]]></Content>"
+        f"<MsgId>{msg_id}</MsgId>"
+        f"<AgentID>{AGENT_ID}</AgentID>"
+        "</xml>"
+    )
+
+
+def _encrypted_body(
+    inner_xml: str,
+    *,
+    corp_id: str = CORP_ID,
+    encoding_key: str = ENCODING_AES_KEY,
+) -> tuple[str, bytes]:
+    """生成密文与 POST 外层 XML，返回 (encrypt, raw_body)。"""
+    encrypted = encrypt_message(encoding_key, inner_xml, corp_id)
+    raw = (
+        "<xml>"
+        f"<ToUserName><![CDATA[{corp_id}]]></ToUserName>"
+        f"<Encrypt><![CDATA[{encrypted}]]></Encrypt>"
+        f"<AgentID>{AGENT_ID}</AgentID>"
+        "</xml>"
+    ).encode()
+    return encrypted, raw
+
+
+def _signed_query(
+    encrypted: str,
+    *,
+    token: str = TOKEN,
+    timestamp: str = TIMESTAMP,
+    nonce: str = NONCE,
+) -> dict[str, str]:
+    return {
+        "msg_signature": compute_signature(token, timestamp, nonce, encrypted),
+        "timestamp": timestamp,
+        "nonce": nonce,
+    }
+
+
+def _unit_channel(**kwargs: Any) -> WeComBotChannel:
+    bot = SimpleNamespace(id=uuid.uuid4(), name="企微小助", status="active")
+    container = SimpleNamespace(
+        bots=_FakeBots(bot),
+        bot_conversation=_FakeConversation(),
+    )
+    kwargs.setdefault("bot_id", str(bot.id))
+    return WeComBotChannel(
+        container,  # type: ignore[arg-type]
+        corp_id=CORP_ID,
+        token=TOKEN,
+        encoding_aes_key=ENCODING_AES_KEY,
+        **kwargs,
+    )
+
+
+@contextmanager
+def _app(settings: Settings, **updates: object) -> Iterator[tuple[TestClient, Container]]:
+    configured = settings.model_copy(update=updates)
+    app = create_app(configured)
+    with TestClient(app) as client:
+        yield client, app.state.container
+
+
+def _wait_pending_decision(client: TestClient, task_id: str, timeout: float = 8.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        body = client.get(f"{PREFIX}/tasks/{task_id}").json()["data"]
+        pending = body.get("pending_decision")
+        if pending is not None:
+            return pending
+        time.sleep(0.02)
+    raise AssertionError("等待企业微信出站审批超时")
+
+
+@contextmanager
+def _callback_client(settings: Settings) -> Iterator[tuple[TestClient, Container, dict]]:
+    """起 app、建一个 Bot、把频道指向它，并替换掉真实模型与发送端。"""
+    with _app(
+        settings,
+        wecom_corp_id=CORP_ID,
+        wecom_token=TOKEN,
+        wecom_encoding_aes_key=ENCODING_AES_KEY,
+    ) as (client, container):
+        container.assistant = _FakeAssistant()  # type: ignore[assignment]
+        created = client.post(f"{PREFIX}/bots", json={"name": "企微小助", "description": "接企微"})
+        assert created.status_code == 200, created.text
+        bot = created.json()["data"]
+        container.wecom_bot._bot_id = uuid.UUID(bot["id"])  # noqa: SLF001 - 测试注入归属 Bot
+        sender = _FakeSender()
+        container.wecom_bot._sender = sender  # noqa: SLF001 - 测试替身
+        yield client, container, {"bot": bot, "sender": sender}
+
+
+def _post_callback(client: TestClient, *, content: str = "你好", msg_id: str = MESSAGE_ID):
+    encrypted, raw = _encrypted_body(_text_message_xml(msg_id=msg_id, content=content))
+    return client.post(WEBHOOK, params=_signed_query(encrypted), content=raw)
+
+
+# --- 加解密与签名 ---
+
+
+def test_encrypt_decrypt_round_trip() -> None:
+    plaintext = "<xml><Content><![CDATA[你好]]></Content></xml>"
+    encrypted = encrypt_message(ENCODING_AES_KEY, plaintext, CORP_ID)
+    msg, receiveid = decrypt_message(ENCODING_AES_KEY, encrypted)
+    assert msg == plaintext
+    assert receiveid == CORP_ID
+
+    # receiveid 不一致 / 换错密钥 / 非法 base64 都必须失败
+    with pytest.raises(WeComCryptoError):
+        decrypt_message(ENCODING_AES_KEY, encrypted, expected_receiveid="other-corp")
+    other_key = base64.b64encode(hashlib.sha256(b"other-key").digest()).decode().rstrip("=")
+    with pytest.raises(WeComCryptoError):
+        decrypt_message(other_key, encrypted)
+    with pytest.raises(WeComCryptoError):
+        decrypt_message(ENCODING_AES_KEY, "not-base64")
+
+
+def test_signature_matches_official_recipe() -> None:
+    encrypted = "ciphertext"
+    expected = hashlib.sha1(
+        "".join(sorted([TOKEN, TIMESTAMP, NONCE, encrypted])).encode("utf-8")
+    ).hexdigest()
+    assert compute_signature(TOKEN, TIMESTAMP, NONCE, encrypted) == expected
+    assert verify_signature(
+        token=TOKEN,
+        timestamp=TIMESTAMP,
+        nonce=NONCE,
+        encrypted=encrypted,
+        signature=expected,
+    )
+    # 密文变一个字符就验不过；缺任一项 fail-closed
+    assert not verify_signature(
+        token=TOKEN,
+        timestamp=TIMESTAMP,
+        nonce=NONCE,
+        encrypted=encrypted + "x",
+        signature=expected,
+    )
+    assert not verify_signature(
+        token=None,
+        timestamp=TIMESTAMP,
+        nonce=NONCE,
+        encrypted=encrypted,
+        signature=expected,
+    )
+    # 公网传来的签名可能是非 ASCII：必须安全地判 False，而不是抛 TypeError
+    assert not verify_signature(
+        token=TOKEN,
+        timestamp=TIMESTAMP,
+        nonce=NONCE,
+        encrypted=encrypted,
+        signature="伪造签名",
+    )
+
+
+# --- GET VerifyURL ---
+
+
+async def test_get_verify_returns_plaintext_echostr() -> None:
+    channel = _unit_channel()
+    plaintext = "echo-plaintext-abc123"
+    echostr = encrypt_message(ENCODING_AES_KEY, plaintext, CORP_ID)
+    query = _signed_query(echostr) | {"echostr": echostr}
+
+    result = await channel.handle_get(query)
+    assert result.status_code == 200
+    # 必须返回明文，而不是密文或 JSON
+    assert result.body == plaintext
+    await channel.aclose()
+
+
+async def test_get_verify_rejects_bad_signature_and_missing_config() -> None:
+    channel = _unit_channel()
+    echostr = encrypt_message(ENCODING_AES_KEY, "ok", CORP_ID)
+    query = _signed_query(echostr) | {"echostr": echostr}
+
+    bad = dict(query, msg_signature="0" * 40)
+    rejected = await channel.handle_get(bad)
+    assert 400 <= rejected.status_code < 500
+
+    # 未配置 token / EncodingAESKey：一切回调都拒绝
+    unconfigured = WeComBotChannel(None, corp_id=CORP_ID)  # type: ignore[arg-type]
+    missing = await unconfigured.handle_get(query)
+    assert 400 <= missing.status_code < 500
+
+    # 缺 echostr 也拒绝
+    absent = await channel.handle_get(_signed_query(echostr))
+    assert 400 <= absent.status_code < 500
+    await channel.aclose()
+
+
+async def test_get_verify_rejects_corp_mismatch() -> None:
+    channel = _unit_channel()
+    echostr = encrypt_message(ENCODING_AES_KEY, "ok", "ww_other_corp")
+    query = _signed_query(echostr) | {"echostr": echostr}
+    result = await channel.handle_get(query)
+    assert 400 <= result.status_code < 500
+    await channel.aclose()
+
+
+# --- POST 加密 XML ---
+
+
+async def test_post_decrypts_text_message_and_is_idempotent() -> None:
+    channel = _unit_channel()
+    encrypted, raw = _encrypted_body(_text_message_xml())
+    query = _signed_query(encrypted)
+
+    first = await channel.handle_post(raw, query)
+    assert first.status_code == 200, first.body
+    assert first.body == "success"
+
+    replay = await channel.handle_post(raw, query)
+    assert replay.status_code == 200
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    assert len(conversation.calls) == 2
+    assert conversation.calls[0]["content"] == "你好"
+    assert conversation.calls[0]["client_turn_id"] == MESSAGE_ID
+    await channel.aclose()
+
+
+async def test_post_rejects_bad_signature_and_ignores_non_text() -> None:
+    channel = _unit_channel()
+    encrypted, raw = _encrypted_body(_text_message_xml())
+    bad = dict(_signed_query(encrypted), msg_signature="0" * 40)
+    rejected = await channel.handle_post(raw, bad)
+    assert rejected.status_code == 403
+
+    image_encrypted, image_raw = _encrypted_body(_text_message_xml(msg_type="image"))
+    ignored = await channel.handle_post(image_raw, _signed_query(image_encrypted))
+    assert ignored.status_code == 200
+    assert ignored.body == "success"
+
+    conversation = channel._container.bot_conversation  # type: ignore[attr-defined]  # noqa: SLF001
+    assert conversation.calls == []
+    await channel.aclose()
+
+
+async def test_post_rejects_dtd_and_malformed_xml() -> None:
+    channel = _unit_channel()
+    dtd = (
+        b'<?xml version="1.0"?><!DOCTYPE xml [<!ENTITY x "boom">]><xml><Encrypt>&x;</Encrypt></xml>'
+    )
+    rejected = await channel.handle_post(dtd, {})
+    assert 400 <= rejected.status_code < 500
+
+    malformed = await channel.handle_post(b"not xml", {})
+    assert 400 <= malformed.status_code < 500
+    await channel.aclose()
+
+
+async def test_post_without_bot_id_is_fail_closed() -> None:
+    channel = _unit_channel()
+    channel._bot_id = None  # noqa: SLF001 - 模拟漏配
+    encrypted, raw = _encrypted_body(_text_message_xml())
+    result = await channel.handle_post(raw, _signed_query(encrypted))
+    assert result.status_code == 400
+    assert "FLUX_WECOM_BOT_ID" in result.body
+    await channel.aclose()
+
+
+# --- 入站 → 审批草稿 → 允许/拒绝 ---
+
+
+def test_inbound_creates_turn_but_never_sends_automatically(
+    settings: Settings, db_schema: None
+) -> None:
+    with _callback_client(settings) as (client, container, context):
+        response = _post_callback(client)
+        assert response.status_code == 200, response.text
+        assert response.text == "success"
+
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        pending = _wait_pending_decision(client, bot["chat_task_id"])
+        assert pending["kind"] == WECOM_OUTBOUND_KIND
+        assert pending["meta"]["touser"] == USER_ID
+        assert pending["meta"]["message_id"] == MESSAGE_ID
+        assert pending["meta"]["bot_id"] == context["bot"]["id"]
+        assert pending["meta"]["text_hash"]
+        assert [option["label"] for option in pending["options"]] == ["允许", "拒绝"]
+
+        # 回复只以草稿形式存在：审批完成前绝不调用发送接口
+        assert context["sender"].messages == []
+        drafts = client.get(
+            f"{PREFIX}/outbound-drafts",
+            params={"channel": "wecom", "status": "pending"},
+        ).json()["data"]
+        assert len(drafts) == 1
+        assert drafts[0]["id"] == pending["meta"]["draft_id"]
+        assert drafts[0]["body"] == "echo: 你好"
+        assert drafts[0]["dest"] == {"touser": USER_ID, "message_id": MESSAGE_ID}
+        assert drafts[0]["decision_id"] == pending["id"]
+        assert container.wecom_bot is not None
+
+
+def test_allow_sends_once_and_deny_does_not_send(settings: Settings, db_schema: None) -> None:
+    with _callback_client(settings) as (client, _container, context):
+        assert _post_callback(client).status_code == 200
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        pending = _wait_pending_decision(client, bot["chat_task_id"])
+        draft_id = pending["meta"]["draft_id"]
+
+        denied = client.post(
+            f"{PREFIX}/tasks/{bot['chat_task_id']}/decisions/choose",
+            json={"decision_id": pending["id"], "action": "choose", "option": "拒绝"},
+        )
+        assert denied.status_code == 200, denied.text
+        assert context["sender"].messages == []
+        draft = client.get(f"{PREFIX}/outbound-drafts/{draft_id}").json()["data"]
+        assert draft["status"] == "denied"
+        assert draft["body"] == "echo: 你好"
+        assert draft["sent_at"] is None
+
+    # 第二条消息走「允许」：只发送一次
+    with _callback_client(settings) as (client, _container, context):
+        assert _post_callback(client, msg_id="7200000000000002").status_code == 200
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        pending = _wait_pending_decision(client, bot["chat_task_id"])
+        draft_id = pending["meta"]["draft_id"]
+
+        allowed = client.post(
+            f"{PREFIX}/tasks/{bot['chat_task_id']}/decisions/choose",
+            json={"decision_id": pending["id"], "action": "choose", "option": "允许"},
+        )
+        assert allowed.status_code == 200, allowed.text
+        assert context["sender"].messages == [
+            ({"touser": USER_ID, "message_id": "7200000000000002"}, "echo: 你好")
+        ]
+        sent = client.get(f"{PREFIX}/outbound-drafts/{draft_id}").json()["data"]
+        assert sent["status"] == "sent"
+        assert sent["sent_at"] is not None
+        assert sent["decision_id"] == pending["id"]
+
+        # 同一条决策不能再次放行；草稿已是终态，绝不会重复发送
+        again = client.post(
+            f"{PREFIX}/tasks/{bot['chat_task_id']}/decisions/choose",
+            json={"decision_id": pending["id"], "action": "choose", "option": "允许"},
+        )
+        assert again.status_code == 409
+        assert len(context["sender"].messages) == 1
+
+
+def test_allow_sends_via_official_api_then_marks_sent(settings: Settings, db_schema: None) -> None:
+    """允许后走真实发送端：gettoken → message/send，成功才 mark_sent。"""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/cgi-bin/gettoken":
+            return httpx.Response(
+                200,
+                json={"errcode": 0, "access_token": "api-token", "expires_in": 7200},
+            )
+        return httpx.Response(200, json={"errcode": 0, "errmsg": "ok"})
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with _callback_client(settings) as (client, container, context):
+        container.wecom_bot._sender = WeComBotSender(  # noqa: SLF001 - 测试替身
+            corp_id=CORP_ID,
+            secret=SECRET,
+            agent_id=AGENT_ID,
+            client=http_client,
+        )
+        assert _post_callback(client).status_code == 200
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        pending = _wait_pending_decision(client, bot["chat_task_id"])
+
+        allowed = client.post(
+            f"{PREFIX}/tasks/{bot['chat_task_id']}/decisions/choose",
+            json={"decision_id": pending["id"], "action": "choose", "option": "允许"},
+        )
+        assert allowed.status_code == 200, allowed.text
+
+        draft = client.get(f"{PREFIX}/outbound-drafts/{pending['meta']['draft_id']}").json()["data"]
+        assert draft["status"] == "sent"
+
+    # 调用方传入的 client 由测试自己关闭（与 sender 自建连接池的归属区分开）
+    asyncio.run(http_client.aclose())
+    assert [request.url.path for request in requests] == [
+        "/cgi-bin/gettoken",
+        "/cgi-bin/message/send",
+    ]
+    payload = json.loads(requests[-1].content)
+    assert payload["touser"] == USER_ID
+    assert payload["agentid"] == int(AGENT_ID)
+    assert payload["text"]["content"] == "echo: 你好"
+
+
+def test_send_error_marks_failed_and_keeps_body(settings: Settings, db_schema: None) -> None:
+    with _callback_client(settings) as (client, container, context):
+        sender = _FakeSender(error=RuntimeError("企业微信炸了"))
+        container.wecom_bot._sender = sender  # noqa: SLF001 - 测试替身
+        assert _post_callback(client).status_code == 200
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        pending = _wait_pending_decision(client, bot["chat_task_id"])
+        draft_id = pending["meta"]["draft_id"]
+
+        response = client.post(
+            f"{PREFIX}/tasks/{bot['chat_task_id']}/decisions/choose",
+            json={"decision_id": pending["id"], "action": "choose", "option": "允许"},
+        )
+        # 发送失败不能让决策接口 500
+        assert response.status_code == 200, response.text
+        assert len(sender.messages) == 1
+        failed = client.get(f"{PREFIX}/outbound-drafts/{draft_id}").json()["data"]
+        assert failed["status"] == "failed"
+        assert failed["body"] == "echo: 你好"
+        assert failed["error"]
+        assert "echo: 你好" not in failed["error"]
+
+
+# --- 公开路由与发送端 ---
+
+
+def test_public_callback_is_mounted_without_rest_auth(settings: Settings, db_schema: None) -> None:
+    configured = settings.model_copy(
+        update={
+            "auth_token": "rest-token-for-wecom-tests",
+            "wecom_corp_id": CORP_ID,
+            "wecom_token": TOKEN,
+            "wecom_encoding_aes_key": ENCODING_AES_KEY,
+        }
+    )
+    remote = {"client": ("203.0.113.9", 41234)}
+
+    # 主应用：REST 面 401，但频道回调只按自己的验签规则拒绝（不是 401）
+    main_app = create_app(configured)
+    with TestClient(main_app, **remote) as client:
+        assert client.get(f"{PREFIX}/bots").status_code == 401
+        callback = client.get(WEBHOOK)
+        assert callback.status_code != 401
+        assert callback.status_code == 403
+
+    # Bot 节点同样免 REST 鉴权
+    bot_app = create_bot_app(configured)
+    with TestClient(bot_app, **remote) as client:
+        assert client.get(f"{PREFIX}/bots").status_code == 401
+        callback = client.get(WEBHOOK)
+        assert callback.status_code != 401
+        assert callback.status_code == 403
+
+
+def test_wecom_bot_sender_uses_official_send_api() -> None:
+    """不触网校验发送端拼装：gettoken + POST /cgi-bin/message/send。"""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/cgi-bin/gettoken":
+            assert request.url.params["corpid"] == CORP_ID
+            assert request.url.params["corpsecret"] == SECRET
+            return httpx.Response(
+                200,
+                json={
+                    "errcode": 0,
+                    "errmsg": "ok",
+                    "access_token": "wecom-access-token",
+                    "expires_in": 7200,
+                },
+            )
+        return httpx.Response(200, json={"errcode": 0, "errmsg": "ok"})
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            sender = WeComBotSender(
+                corp_id=CORP_ID,
+                secret=SECRET,
+                agent_id=AGENT_ID,
+                client=http_client,
+            )
+            await sender.send_text({"touser": USER_ID}, "确认后的文本")
+            await sender.aclose()
+
+    asyncio.run(scenario())
+
+    assert [request.url.path for request in requests] == [
+        "/cgi-bin/gettoken",
+        "/cgi-bin/message/send",
+    ]
+    send = requests[-1]
+    assert send.method == "POST"
+    assert send.url.params["access_token"] == "wecom-access-token"
+    payload = json.loads(send.content)
+    assert payload == {
+        "touser": USER_ID,
+        "msgtype": "text",
+        "agentid": int(AGENT_ID),
+        "text": {"content": "确认后的文本"},
+    }
+
+
+def test_sender_error_does_not_leak_secret(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/cgi-bin/gettoken":
+            return httpx.Response(
+                200,
+                json={"errcode": 0, "access_token": "t", "expires_in": 7200},
+            )
+        return httpx.Response(200, json={"errcode": 40001, "errmsg": "invalid credential"})
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            sender = WeComBotSender(
+                corp_id=CORP_ID,
+                secret=SECRET,
+                agent_id=AGENT_ID,
+                client=http_client,
+            )
+            with pytest.raises(RuntimeError) as excinfo:
+                await sender.send_text({"touser": USER_ID}, "文本")
+            assert SECRET not in str(excinfo.value)
+            assert "invalid credential" in str(excinfo.value)
+            await sender.aclose()
+
+    asyncio.run(scenario())
+    # httpx 会把请求 URL 打进 INFO 日志；凭据必须已脱敏，但接口路径仍可排查
+    logged = caplog.text
+    assert "/cgi-bin/gettoken" in logged
+    assert SECRET not in logged
+    assert "corpsecret=***" in logged
+
+
+async def test_logs_do_not_contain_secrets_or_message_body(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    channel = _unit_channel()
+    body_text = "绝密消息正文-9f3a"
+
+    echostr = encrypt_message(ENCODING_AES_KEY, "echo-ok", CORP_ID)
+    await channel.handle_get(_signed_query(echostr) | {"echostr": echostr})
+    encrypted, raw = _encrypted_body(_text_message_xml(content=body_text))
+    await channel.handle_post(raw, _signed_query(encrypted))
+    await channel.aclose()
+
+    logged = caplog.text
+    assert ENCODING_AES_KEY not in logged
+    assert SECRET not in logged
+    assert body_text not in logged

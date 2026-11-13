@@ -1,8 +1,7 @@
 """任务与外部 Agent 会话的绑定（跨轮会话复用的持久化锚点）。
 
-opencode / codex 的会话都按 task 复用：下一轮用同一个 external session id 续聊，
-不再每轮新建后销毁。这张表就是「任务 → 外部会话 id」的权威存储；
-DSH 不参与（session id 全局唯一，不能跨 Run 复用）。
+Claude Code / opencode / codex 的会话都按 task 复用：下一轮用同一个 external session id
+续聊，不再每轮新建后销毁。这张表就是「任务 → 外部会话 id」的权威存储。
 """
 
 from __future__ import annotations

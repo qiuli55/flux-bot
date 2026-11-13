@@ -459,9 +459,9 @@ def test_ready_lists_configured_cn_providers(settings: Settings, db_schema: None
 
 
 @pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
-def test_opencode_accepts_cn_provider_keys_but_dsh_and_codex_do_not(case: Case) -> None:
+def test_opencode_accepts_cn_provider_keys_but_claude_and_codex_do_not(case: Case) -> None:
     """四家都只有 chat/completions：opencode 的 openai-compatible 适配器可用，
-    dsh（DeepSeek 专有通道）与 codex（只讲 Responses API）不接收。"""
+    claude-code（只讲 Anthropic 协议）与 codex（只讲 Responses API）不接收。"""
     assert supports_provider("opencode", case.key_provider) is True
-    assert supports_provider("dsh", case.key_provider) is False
+    assert supports_provider("claude-code", case.key_provider) is False
     assert supports_provider("codex", case.key_provider) is False

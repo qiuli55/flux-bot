@@ -1,0 +1,718 @@
+"""正式钉钉频道（HTTP 事件订阅入站 + 受审批保护的出站）。
+
+v1 采用官方 SyncHTTP/HTTP 推送而不是 Stream 长连接：
+
+- 钉钉把事件加密后 POST 到回调地址，查询串带 ``signature`` / ``timestamp`` /
+  ``nonce``，请求体是 ``{"encrypt": "..."}``；
+- 必须先验签再 AES 解密（见 `dingtalk_crypto`），ownerKey 是应用 AppKey；
+- 无论事件是否处理，成功应答都必须是加密后的 ``"success"``，且要在约
+  1500ms 内返回，所以这里只同步建 turn，回复跟踪放后台任务；
+- ``check_url`` 是后台验证回调地址的特殊事件，直接回加密 success。
+
+出站红线与飞书一致：**任何发给外部联系人的文本都不得自动发送**。turn 完成后
+只把待发送正文落进 `outbound_drafts`（pending），并在对话里挂审批卡；只有用户
+选择「允许」后才认领草稿并调用官方机器人消息接口。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+import uuid
+from collections.abc import Mapping
+from contextlib import suppress
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+import httpx
+
+from flux.core.channels.dingtalk_crypto import (
+    DingTalkCryptoError,
+    build_encrypted_response,
+    decrypt_event,
+)
+from flux.core.event.bus import Events
+from flux.core.task_engine.approvals import APPROVAL_ALLOW, raise_approval
+from flux.errors import AIOSError, NotFoundError
+from flux.logging import get_logger
+
+if TYPE_CHECKING:
+    from flux.container import Container
+
+logger = get_logger(__name__)
+
+__all__ = [
+    "BOT_MESSAGE_TOPIC",
+    "CHECK_URL_EVENT",
+    "DINGTALK_OUTBOUND_KIND",
+    "DingTalkBotChannel",
+    "DingTalkBotSender",
+    "DingTalkCallbackResult",
+]
+
+#: 钉钉 Stream/HTTP 机器人消息 topic（HTTP 事件里也可能以 headers.topic 出现）
+BOT_MESSAGE_TOPIC = "/v1.0/im/bot/messages/get"
+#: 官方允许的机器人消息事件类型（不同接入方式命名略有差异）
+MESSAGE_EVENT_TYPES = frozenset({BOT_MESSAGE_TOPIC, "chatbot_message", "robot_message"})
+#: URL 有效性验证事件
+CHECK_URL_EVENT = "check_url"
+#: 出站审批使用的决策 kind（ASCII，便于检索与断言）
+DINGTALK_OUTBOUND_KIND = "dingtalk_outbound"
+#: 平台单条文本上限的安全值
+MAX_TEXT_CHARS = 4000
+#: 审批卡里展示的草稿摘录上限
+_DETAIL_TEXT_CHARS = 1500
+#: 官方 OpenAPI 基址
+DEFAULT_API_BASE = "https://api.dingtalk.com"
+
+
+@dataclass(frozen=True)
+class DingTalkCallbackResult:
+    """回调处理结果：HTTP 状态码 + 返回体（成功时是官方加密 success）。"""
+
+    status_code: int
+    payload: dict[str, Any] = field(default_factory=dict)
+
+
+class DingTalkBotSender:
+    """钉钉机器人出站：企业内部应用 accessToken + 官方机器人消息接口。"""
+
+    def __init__(
+        self,
+        *,
+        app_key: str,
+        app_secret: str,
+        api_base: str = DEFAULT_API_BASE,
+        default_robot_code: str | None = None,
+        timeout_seconds: float = 15.0,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self._app_key = app_key
+        self._app_secret = app_secret
+        self._api_base = (api_base or DEFAULT_API_BASE).rstrip("/") or DEFAULT_API_BASE
+        self._default_robot_code = (default_robot_code or app_key or "").strip()
+        self._timeout = max(1.0, float(timeout_seconds))
+        self._client = client
+        self._owns_client = client is None
+        self._token: str | None = None
+        self._token_expires_at = 0.0
+        self._lock = asyncio.Lock()
+
+    async def send_text(self, dest: Mapping[str, Any], text: str) -> None:
+        """按 dest 选择单聊或群聊接口发送文本，绝不静默丢弃。"""
+        robot_code = str(dest.get("robot_code") or self._default_robot_code).strip()
+        if not robot_code:
+            raise RuntimeError("钉钉发送缺少 robot_code")
+        conversation_id = str(dest.get("conversation_id") or "").strip()
+        staff_id = str(dest.get("staff_id") or "").strip()
+        conversation_type = str(dest.get("conversation_type") or "").strip()
+        content = (text or "")[:MAX_TEXT_CHARS]
+        msg_param = json.dumps({"content": content}, ensure_ascii=False)
+
+        token = await self._access_token()
+        headers = {"x-acs-dingtalk-access-token": token}
+        if conversation_type == "1" or (not conversation_id and staff_id):
+            if not staff_id:
+                raise RuntimeError("钉钉单聊发送缺少 staff_id")
+            response = await self._request(
+                "POST",
+                "/v1.0/robot/oToMessages/batchSend",
+                headers=headers,
+                json={
+                    "robotCode": robot_code,
+                    "userIds": [staff_id],
+                    "msgKey": "sampleText",
+                    "msgParam": msg_param,
+                },
+            )
+        elif conversation_id:
+            response = await self._request(
+                "POST",
+                "/v1.0/robot/groupMessages/send",
+                headers=headers,
+                json={
+                    "robotCode": robot_code,
+                    "openConversationId": conversation_id,
+                    "msgKey": "sampleText",
+                    "msgParam": msg_param,
+                },
+            )
+        else:
+            raise RuntimeError("钉钉发送缺少 conversation_id / staff_id")
+        _raise_for_dingtalk(response, "发送钉钉消息")
+
+    async def aclose(self) -> None:
+        if self._client is not None and self._owns_client:
+            await self._client.aclose()
+        self._client = None
+
+    async def _access_token(self) -> str:
+        """缓存企业内部应用 accessToken，提前 60 秒过期。"""
+        if self._token is not None and time.monotonic() < self._token_expires_at:
+            return self._token
+        async with self._lock:
+            if self._token is not None and time.monotonic() < self._token_expires_at:
+                return self._token
+            response = await self._request(
+                "POST",
+                "/v1.0/oauth2/accessToken",
+                json={"appKey": self._app_key, "appSecret": self._app_secret},
+            )
+            data = _payload(response, "获取钉钉 accessToken")
+            token = str(data.get("accessToken") or "")
+            if not token:
+                raise RuntimeError("钉钉 accessToken 响应缺少令牌")
+            expire = int(data.get("expireIn") or data.get("expire_in") or 7200)
+            self._token = token
+            self._token_expires_at = time.monotonic() + max(60, expire - 60)
+            return token
+
+    async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        client = self._client
+        if client is None:
+            client = httpx.AsyncClient(timeout=self._timeout)
+            self._client = client
+            self._owns_client = True
+        return await client.request(method, f"{self._api_base}{path}", **kwargs)
+
+
+def _payload(response: httpx.Response, label: str) -> dict[str, Any]:
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"{label}失败：响应不是 JSON（HTTP {response.status_code}）") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{label}失败：响应结构异常（HTTP {response.status_code}）")
+    if response.status_code >= 400:
+        code = data.get("code") or data.get("errcode") or ""
+        message = data.get("message") or data.get("errmsg") or ""
+        raise RuntimeError(f"{label}失败：HTTP {response.status_code} code={code} {message}"[:500])
+    return data
+
+
+def _raise_for_dingtalk(response: httpx.Response, label: str) -> None:
+    _payload(response, label)
+
+
+class DingTalkBotChannel:
+    """钉钉正式频道：加密回调验签解密、入站建 turn、出站走审批。"""
+
+    def __init__(
+        self,
+        container: Container,
+        *,
+        app_key: str | None = None,
+        app_secret: str | None = None,
+        token: str | None = None,
+        aes_key: str | None = None,
+        api_base: str = DEFAULT_API_BASE,
+        bot_id: str | None = None,
+        sender: Any | None = None,
+        turn_wait_seconds: float = 900.0,
+    ) -> None:
+        self._container = container
+        self._app_key = (app_key or "").strip() or None
+        self._token = (token or "").strip() or None
+        self._aes_key = (aes_key or "").strip() or None
+        self._bot_id = _parse_uuid(bot_id)
+        if (bot_id or "").strip() and self._bot_id is None:
+            logger.warning("FLUX_DINGTALK_BOT_ID 不是合法 UUID，钉钉消息事件将被拒绝")
+        if sender is not None:
+            self._sender = sender
+        elif self._app_key and app_secret:
+            self._sender = DingTalkBotSender(
+                app_key=self._app_key,
+                app_secret=app_secret,
+                api_base=api_base,
+            )
+        else:
+            self._sender = None
+        self._background: set[asyncio.Task[Any]] = set()
+        #: 同一对话任务同一时刻只挂一张出站审批卡。
+        self._approval_lock = asyncio.Lock()
+        self._turn_wait_seconds = max(1.0, float(turn_wait_seconds))
+
+    async def handle(
+        self,
+        body: bytes,
+        query: Mapping[str, str] | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> DingTalkCallbackResult:
+        """处理一次钉钉 HTTP 回调，成功时返回官方加密 success。"""
+        raw = body or b""
+        params = query or {}
+        request_headers = headers or {}
+
+        missing = self._missing_config()
+        if missing is not None:
+            return missing
+
+        try:
+            envelope = json.loads(raw or b"{}")
+        except (UnicodeDecodeError, ValueError):
+            return DingTalkCallbackResult(400, {"error": "请求体不是合法 JSON"})
+        if not isinstance(envelope, dict):
+            return DingTalkCallbackResult(400, {"error": "请求体结构异常"})
+        encrypt = envelope.get("encrypt")
+        if not isinstance(encrypt, str) or not encrypt:
+            return DingTalkCallbackResult(400, {"error": "回调缺少有效的 encrypt 字段"})
+
+        signature = _lookup(params, request_headers, ("msg_signature", "signature"))
+        timestamp = _lookup(params, request_headers, ("timeStamp", "timestamp"))
+        nonce = _lookup(params, request_headers, ("nonce",))
+        try:
+            payload = decrypt_event(
+                token=self._token or "",
+                aes_key=self._aes_key or "",
+                owner_key=self._app_key or "",
+                signature=signature,
+                timestamp=timestamp,
+                nonce=nonce,
+                encrypt=encrypt,
+            )
+        except DingTalkCryptoError as exc:
+            # 签名失败与解密失败分开给状态码，便于平台侧排查；错误信息不含密钥。
+            status = 403 if "签名" in str(exc) else 400
+            logger.warning("钉钉回调校验失败 status=%s reason=%s", status, exc)
+            return DingTalkCallbackResult(status, {"error": str(exc)})
+
+        event_type, topic, event_id, data = _event_info(payload)
+
+        # 后台「验证有效性」推的就是 check_url：不需要 Bot，直接回加密 success。
+        if event_type == CHECK_URL_EVENT:
+            logger.info("dingtalk.check_url event=%s", event_id or "-")
+            return self._success()
+
+        if not _is_message_event(event_type, topic):
+            logger.info(
+                "dingtalk.event.ignored type=%s topic=%s event=%s",
+                event_type or "unknown",
+                topic or "-",
+                event_id or "-",
+            )
+            return self._success()
+
+        # 以下都是消息事件：必须知道归属 Bot，否则 fail-closed。
+        bot_id = self._bot_id
+        if bot_id is None:
+            return DingTalkCallbackResult(
+                400,
+                {"error": "未配置合法的 FLUX_DINGTALK_BOT_ID，拒绝处理钉钉消息事件"},
+            )
+
+        parsed = _parse_message(data, event_id)
+        if isinstance(parsed, DingTalkCallbackResult):
+            # 忽略类结果也必须回加密 success，否则钉钉会持续重推。
+            if parsed.status_code == 200:
+                logger.info(
+                    "dingtalk.inbound.ignored event=%s reason=%s",
+                    event_id or "-",
+                    parsed.payload.get("reason", "-"),
+                )
+                return self._success()
+            return parsed
+        message_id, text, dest = parsed
+
+        try:
+            bot = await self._container.bots.get(bot_id)
+        except NotFoundError:
+            logger.warning("钉钉回调指向的 Bot 不存在 bot=%s", bot_id)
+            return DingTalkCallbackResult(404, {"error": "FLUX_DINGTALK_BOT_ID 指向的 Bot 不存在"})
+
+        try:
+            turn, created = await self._container.bot_conversation.create_turn(
+                bot, content=text, client_turn_id=message_id
+            )
+        except AIOSError as exc:
+            logger.warning(
+                "钉钉入站建 turn 失败 bot=%s message=%s code=%s",
+                bot_id,
+                message_id,
+                exc.code,
+            )
+            return DingTalkCallbackResult(
+                exc.http_status,
+                {"error": exc.message, "code": exc.code},
+            )
+
+        if created:
+            self._schedule_tracking(
+                bot=bot,
+                turn=turn,
+                message_id=message_id,
+                dest=dest,
+            )
+        logger.info(
+            "dingtalk.inbound bot=%s message=%s turn=%s created=%s dest_keys=%s",
+            bot_id,
+            message_id,
+            turn.id,
+            created,
+            sorted(dest),
+        )
+        # 应答必须是官方加密 success，不能等 Bot 跑完（平台限时约 1500ms）。
+        return self._success()
+
+    async def on_approval_resolved(self, event: str, payload: dict[str, Any]) -> None:
+        """审批结果监听：只有「允许」才发送，且同一条草稿最多发送一次。"""
+        if event != Events.APPROVAL_RESOLVED:
+            return
+        if payload.get("kind") != DINGTALK_OUTBOUND_KIND:
+            return
+
+        meta = payload.get("meta")
+        meta = meta if isinstance(meta, dict) else {}
+        raw_draft_id = str(meta.get("draft_id") or "").strip()
+        if not raw_draft_id:
+            logger.warning("钉钉出站审批缺少 draft_id，已跳过")
+            return
+        try:
+            draft_id = uuid.UUID(raw_draft_id)
+        except ValueError:
+            logger.warning("钉钉出站审批的 draft_id 非法，已跳过 draft=%s", raw_draft_id)
+            return
+
+        service = getattr(self._container, "outbound_drafts", None)
+        if service is None:  # pragma: no cover - 装配错误，按 fail-closed 跳过
+            logger.error("出站草稿服务未装配，审批结果已忽略 draft=%s", raw_draft_id)
+            return
+
+        if payload.get("result") != "allowed" or payload.get("chosen") != APPROVAL_ALLOW:
+            await service.mark_denied(draft_id)
+            logger.info(
+                "dingtalk.outbound.skip decision=%s result=%s draft=%s",
+                payload.get("decision_id"),
+                payload.get("result"),
+                raw_draft_id,
+            )
+            return
+
+        draft = await service.claim(draft_id)
+        if draft is None:
+            logger.info("钉钉出站草稿不存在或已被处理 draft=%s", raw_draft_id)
+            return
+        dest = draft.dest if isinstance(draft.dest, dict) else {}
+        has_target = bool(
+            str(dest.get("conversation_id") or "").strip()
+            or str(dest.get("staff_id") or "").strip()
+        )
+        if draft.channel != "dingtalk" or not has_target:
+            await service.mark_failed(draft.id, "channel_or_dest_mismatch")
+            logger.error(
+                "钉钉出站草稿的频道或目标不匹配 draft=%s channel=%s dest_keys=%s",
+                draft.id,
+                draft.channel,
+                sorted(dest),
+            )
+            return
+        sender = self._sender
+        if sender is None:
+            # 标 failed 但保留正文，配置好凭据后仍可在草稿箱看到。
+            await service.mark_failed(draft.id, "sender_not_configured")
+            logger.error(
+                "未配置钉钉应用凭据，审批通过的草稿无法发送 draft=%s dest_keys=%s",
+                draft.id,
+                sorted(dest),
+            )
+            return
+        try:
+            await sender.send_text(dest, draft.body)
+        except Exception as exc:  # noqa: BLE001 - 发送失败只记录，不能拖垮决策接口
+            await service.mark_failed(draft.id, exc)
+            logger.exception(
+                "钉钉出站发送失败 draft=%s dest_keys=%s hash=%s chars=%s",
+                draft.id,
+                sorted(dest),
+                draft.body_hash,
+                len(draft.body or ""),
+            )
+            return
+        await service.mark_sent(draft.id)
+        logger.info(
+            "钉钉出站已发送 draft=%s dest_keys=%s hash=%s chars=%s",
+            draft.id,
+            sorted(dest),
+            draft.body_hash,
+            len(draft.body or ""),
+        )
+
+    async def aclose(self) -> None:
+        tasks = [task for task in self._background if not task.done()]
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
+        self._background.clear()
+        close = getattr(self._sender, "aclose", None)
+        if close is not None:
+            await close()
+
+    # --- 内部 ---
+
+    def _success(self) -> DingTalkCallbackResult:
+        return DingTalkCallbackResult(
+            200,
+            build_encrypted_response(
+                token=self._token or "",
+                aes_key=self._aes_key or "",
+                owner_key=self._app_key or "",
+            ),
+        )
+
+    def _missing_config(self) -> DingTalkCallbackResult | None:
+        """三项缺一不可；任一缺失都拒绝，错误里只报环境变量名。"""
+        if self._token is None:
+            return DingTalkCallbackResult(
+                400,
+                {"error": "未配置钉钉签名 token，拒绝处理回调（请设置 FLUX_DINGTALK_TOKEN）"},
+            )
+        if self._aes_key is None:
+            return DingTalkCallbackResult(
+                400,
+                {
+                    "error": (
+                        "未配置钉钉 EncodingAESKey，拒绝处理回调（请设置 FLUX_DINGTALK_AES_KEY）"
+                    )
+                },
+            )
+        if self._app_key is None:
+            return DingTalkCallbackResult(
+                400,
+                {"error": "未配置钉钉 AppKey，拒绝处理回调（请设置 FLUX_DINGTALK_APP_KEY）"},
+            )
+        return None
+
+    def _schedule_tracking(
+        self,
+        *,
+        bot: Any,
+        turn: Any,
+        message_id: str,
+        dest: dict[str, str],
+    ) -> None:
+        task = asyncio.create_task(
+            self._track_turn(bot=bot, turn=turn, message_id=message_id, dest=dest),
+            name="flux-dingtalk-turn",
+        )
+        self._background.add(task)
+
+        def _cleanup(done: asyncio.Task[Any]) -> None:
+            self._background.discard(done)
+
+        task.add_done_callback(_cleanup)
+
+    async def _track_turn(
+        self,
+        *,
+        bot: Any,
+        turn: Any,
+        message_id: str,
+        dest: dict[str, str],
+    ) -> None:
+        """等这一轮结束；有回复就生成草稿并挂审批，绝不直接发送。"""
+        try:
+            final = await self._container.bot_conversation.wait_for_turn(
+                bot.id, turn.id, wait_seconds=self._turn_wait_seconds
+            )
+            if final.status != "completed" or final.reply_message_id is None:
+                logger.info("钉钉 turn 未产生可发送回复 turn=%s status=%s", turn.id, final.status)
+                return
+            async with self._approval_lock:
+                task = await self._container.task_repo.get(final.task_id)
+                if task.pending_decision() is not None:
+                    logger.info(
+                        "对话里已有待决策项，跳过新增钉钉出站审批 turn=%s task=%s",
+                        turn.id,
+                        final.task_id,
+                    )
+                    return
+                reply = await self._container.task_repo.get_message(
+                    final.task_id, final.reply_message_id
+                )
+                text = (reply.content or "").strip() if reply is not None else ""
+                if not text:
+                    logger.info("钉钉 turn 回复为空，不生成出站草稿 turn=%s", turn.id)
+                    return
+
+                service = self._container.outbound_drafts
+                # 先生成审批 id 并写进草稿，保证审批卡出现的瞬间两边已经能互相定位。
+                decision_id = uuid.uuid4().hex
+                draft = await service.create(
+                    channel="dingtalk",
+                    body=text,
+                    dest=dict(dest),
+                    bot_id=bot.id,
+                    task_id=final.task_id,
+                    turn_id=final.id,
+                    decision_id=decision_id,
+                )
+                target = dest.get("conversation_id") or dest.get("staff_id") or ""
+                await raise_approval(
+                    self._container,
+                    task_id=final.task_id,
+                    run_id=None,
+                    kind=DINGTALK_OUTBOUND_KIND,
+                    decision_id=decision_id,
+                    title="钉钉回复等待你确认",
+                    detail=(
+                        f"准备发送到钉钉会话 {target}（消息 {message_id}）：\n\n{_excerpt(text)}"
+                    ),
+                    meta={
+                        "channel": "dingtalk",
+                        "draft_id": str(draft.id),
+                        "conversation_id": dest.get("conversation_id", ""),
+                        "staff_id": dest.get("staff_id", ""),
+                        "robot_code": dest.get("robot_code", ""),
+                        "message_id": message_id,
+                        "bot_id": str(bot.id),
+                        "turn_id": str(final.id),
+                        "text_hash": draft.body_hash,
+                        "chars": len(text),
+                    },
+                )
+                logger.info(
+                    "钉钉出站审批已创建 draft=%s turn=%s task=%s hash=%s chars=%s",
+                    draft.id,
+                    final.id,
+                    final.task_id,
+                    draft.body_hash,
+                    len(text),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 后台跟踪失败只记录 id，不影响回调
+            logger.exception("钉钉 turn 跟踪失败 turn=%s", getattr(turn, "id", "?"))
+
+
+def _lookup(
+    params: Mapping[str, str],
+    headers: Mapping[str, str],
+    names: tuple[str, ...],
+) -> str | None:
+    """官方文档在查询串与 header 上的字段名不一致，按顺序兼容。"""
+    for name in names:
+        value = params.get(name)
+        if value:
+            return str(value)
+    lowered = {str(key).lower(): value for key, value in headers.items()}
+    for name in names:
+        value = lowered.get(name.lower())
+        if value:
+            return str(value)
+    return None
+
+
+def _event_info(payload: dict[str, Any]) -> tuple[str, str, str, dict[str, Any]]:
+    """兼容扁平旧事件与带 headers/data 的新事件，返回 (type, topic, id, data)。"""
+    headers = payload.get("headers")
+    headers = headers if isinstance(headers, dict) else {}
+    event_type = str(
+        payload.get("EventType") or payload.get("eventType") or headers.get("eventType") or ""
+    ).strip()
+    topic = str(headers.get("topic") or payload.get("topic") or "").strip()
+    event_id = str(
+        payload.get("eventId")
+        or payload.get("EventId")
+        or headers.get("eventId")
+        or payload.get("BizId")
+        or ""
+    ).strip()
+    data = payload.get("data")
+    if isinstance(data, str) and data.strip():
+        try:
+            data = json.loads(data)
+        except ValueError:
+            data = None
+    if not isinstance(data, dict):
+        data = payload
+    return event_type, topic, event_id, data
+
+
+def _is_message_event(event_type: str, topic: str) -> bool:
+    return event_type in MESSAGE_EVENT_TYPES or topic == BOT_MESSAGE_TOPIC
+
+
+def _parse_message(
+    data: dict[str, Any], event_id: str
+) -> tuple[str, str, dict[str, str]] | DingTalkCallbackResult:
+    message_type = str(
+        data.get("msgtype") or data.get("msgType") or data.get("messageType") or ""
+    ).strip()
+    if message_type != "text":
+        return DingTalkCallbackResult(
+            200,
+            {"ignored": True, "reason": f"不支持的消息类型：{message_type or 'unknown'}"},
+        )
+
+    message_id = str(
+        data.get("msgId")
+        or data.get("msgid")
+        or data.get("messageId")
+        or data.get("message_id")
+        or event_id
+        or ""
+    ).strip()
+    if not message_id:
+        return DingTalkCallbackResult(400, {"error": "回调缺少 msgId / eventId"})
+
+    text = _text_content(data)
+    if not text:
+        return DingTalkCallbackResult(200, {"ignored": True, "reason": "空文本消息"})
+
+    dest: dict[str, str] = {"message_id": message_id}
+    conversation_id = str(
+        data.get("conversationId")
+        or data.get("conversation_id")
+        or data.get("openConversationId")
+        or ""
+    ).strip()
+    staff_id = str(
+        data.get("senderStaffId") or data.get("sender_staff_id") or data.get("senderId") or ""
+    ).strip()
+    robot_code = str(data.get("robotCode") or data.get("robot_code") or "").strip()
+    conversation_type = str(
+        data.get("conversationType") or data.get("conversation_type") or ""
+    ).strip()
+    if conversation_id:
+        dest["conversation_id"] = conversation_id
+    if staff_id:
+        dest["staff_id"] = staff_id
+    if robot_code:
+        dest["robot_code"] = robot_code
+    if conversation_type:
+        dest["conversation_type"] = conversation_type
+    if "conversation_id" not in dest and "staff_id" not in dest:
+        return DingTalkCallbackResult(400, {"error": "回调缺少 conversationId / senderStaffId"})
+    return message_id, text, dest
+
+
+def _text_content(data: dict[str, Any]) -> str:
+    text = data.get("text")
+    if isinstance(text, dict):
+        content = text.get("content")
+        if isinstance(content, str):
+            return content.strip()
+    content = data.get("content")
+    if isinstance(content, dict):
+        value = content.get("text") or content.get("content")
+        if isinstance(value, str):
+            return value.strip()
+    return ""
+
+
+def _parse_uuid(value: str | None) -> uuid.UUID | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        return uuid.UUID(raw)
+    except ValueError:
+        return None
+
+
+def _excerpt(text: str) -> str:
+    if len(text) <= _DETAIL_TEXT_CHARS:
+        return text
+    return text[:_DETAIL_TEXT_CHARS] + "…"
