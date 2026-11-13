@@ -76,20 +76,45 @@ overlay 的关键配置：
 
 - **不写 `ports:`**，只 `expose: "8931"`：端口只在 compose 网络内可见，宿主机和
   局域网都连不上；能连上 sidecar 的只有 `browser` 网络里的 `flux-bot`。
-- `--headless --browser chromium --no-sandbox`：容器内无显示器，Chromium 以
-  root 运行时需要 `--no-sandbox`（官方 README 的容器示例同样如此）。
+- `--headless --browser chromium --no-sandbox`：容器内无显示器，必须 headless；
+  `--no-sandbox` 沿用官方 README 的容器示例（容器内 Chromium 沙箱常不可用）。
+  注意镜像默认以 `node`（uid 1000）运行，不是 root。
 - `--isolated`：浏览器 profile 放在内存里，容器重建即清空，不残留登录态。**代价**
   是每次重启都是全新 profile；若确实需要持久化登录态，改成 `--user-data-dir
-  /data/profile` 并给该路径单独挂一个命名卷（不要复用宿主机的真实浏览器 profile）。
-- `--allowed-hosts playwright-mcp`：该服务默认只接受 `localhost` / 回环地址和
-  `--host` 取值作为 Host 头；容器间用服务名访问，不把 `playwright-mcp` 列进来会
-  被拒绝。
-- `--output-dir /data/output`：截图 / 下载产物落在命名卷 `playwright-output` 上，
-  容器重建不丢。
+  /home/node/profile`，并把命名卷挂到 `/home/node`（挂到镜像里不存在的路径会
+  变成 `root:root`，见下面的「两个已知坑」），不要复用宿主机的真实浏览器 profile。
+- `--allowed-hosts playwright-mcp,playwright-mcp:8931`：该服务默认只接受
+  `localhost` / 回环地址和 `--host` 取值作为 Host 头。**必须同时列出带端口的
+  `host:port` 形式**，原因见下面的「两个已知坑」。
+- `--output-dir /home/node/output` + 命名卷 `playwright-home:/home/node`：截图 /
+  下载产物落在卷里，容器重建不丢。输出目录必须在已挂载且属于 `node` 的路径下，
+  原因见下面的「两个已知坑」。
+- 卷名是 `playwright-home` 而不是 `playwright-output`：它挂的是整个 `/home/node`
+  家目录，不只是输出目录；旧名字会误导人以为挂的是 `/data/output`。
 - `shm_size: "1gb"` + `init: true`：Chromium 对共享内存的需求远大于 docker 默认
   的 64MB；`init` 负责回收僵尸进程。
 - 基础编排里的 `flux-bot` 保留 `default` 网络（宿主机 8600 端口发布照常工作），
   额外加入 `browser` 网络，从而能按服务名解析到 `playwright-mcp`。
+
+#### 两个已知坑（2026-11-13 实机验证）
+
+在 Docker 29 上用钉死的 `v0.0.85` 镜像跑
+`docker compose -f docker-compose.yml -f docker-compose.browser.yml up` 时，
+下面两处配置各自会让浏览器能力**启动即坏**，且都不容易从日志一眼看出：
+
+1. **Host 头必须带端口。** 只写 `--allowed-hosts playwright-mcp` 时，HTTP 客户端
+   （Claude Code、httpx）访问 `http://playwright-mcp:8931/mcp` 发出的 Host 头是
+   `playwright-mcp:8931`，server 比对失败后直接回
+   `403 Access is only allowed at playwright-mcp`。改成逗号分隔的
+   `playwright-mcp,playwright-mcp:8931` 后返回 200。因此 403 不是「网络不通」，
+   而是白名单少了 `host:port`；验证连通性时也不能把 403 当成成功。
+2. **输出目录不能落在镜像里不存在的路径。** 原来把命名卷挂到 `/data/output`，
+   但该路径在官方镜像里不存在：Docker 会以 `root:root`、`0755` 新建挂载点，而
+   容器以 `node`（uid 1000）运行，于是 `browser_navigate` 在写页面快照时报
+   `EACCES: permission denied, open /data/output/page-....yml`。改为把卷挂到镜像
+   内已存在且属于 `node` 的 `/home/node`（空命名卷首次挂载会继承该目录属主），
+   输出目录用 `/home/node/output`，node 就能正常写入。`--isolated` 仍然保证
+   profile 只在内存里，不因挂载家目录而持久化登录态。
 
 #### 出站网络：为什么不用 `internal: true`
 
@@ -121,10 +146,15 @@ docker compose -f docker-compose.yml -f docker-compose.browser.yml ps
 # 3) 看 sidecar 是否已在监听 8931
 docker compose -f docker-compose.yml -f docker-compose.browser.yml logs playwright-mcp
 
-# 4) 从 flux-bot 容器内验证按服务名可达（任意 HTTP 响应都算连通；
-#    GET 一个 MCP 端点通常返回 400/405/406，连接被拒或 DNS 失败才是不通）
+# 4) 从 flux-bot 容器内验证按服务名可达。curl 会自动发 Host: playwright-mcp:8931，
+#    因此这一步同时校验 Host 白名单：GET 一个 MCP 端点通常返回 400/405/406；
+#    返回 403 说明 --allowed-hosts 少了 host:port，连接被拒 / DNS 失败才是网络不通
 docker compose -f docker-compose.yml -f docker-compose.browser.yml exec flux-bot \
   curl -sS -o /dev/null -w '%{http_code}\n' http://playwright-mcp:8931/mcp
+
+# 5) 确认输出目录对容器内的 node 用户可写（EACCES 说明卷挂载点属主不对）
+docker compose -f docker-compose.yml -f docker-compose.browser.yml exec playwright-mcp \
+  sh -c 'mkdir -p /home/node/output && touch /home/node/output/.probe && echo writable'
 ```
 
 然后发起一轮 Bot 任务，启动日志里应出现：
@@ -137,9 +167,10 @@ Claude 本轮注入扩展 MCP server：browser
 若日志里只有拒绝原因，按下面的配置约束核对。若 Claude Code 运行期连不上，先在
 `flux-bot` 里重跑第 4 步区分网络问题与端点路径问题。
 
-> **未验证声明**：本文档编写时（2026-11-12）**没有在本机构建、拉取或运行过**该
-> 镜像，**镜像大小未实测**。版本、digest、启动参数与端点来自上面的公开 registry /
-> README；仓库测试只对 compose 文件做 YAML 静态解析，不会联网或启动容器。
+> **验证范围**：镜像已在 2026-11-13 用 Docker 29 拉取并运行过，上面「两个已知坑」
+> 及对应修法均为实机结果；**镜像大小仍未实测**。版本、digest、启动参数与端点来自
+> 上面的公开 registry / README。仓库测试只对 compose 文件做 YAML 静态解析，不会
+> 联网或启动容器，所以它只能防配置回退，不能替代上面的手工验证。
 
 #### 不叠加 overlay 时
 
