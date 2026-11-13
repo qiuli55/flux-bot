@@ -77,6 +77,7 @@ from flux.core.permissions.risk import LEVEL_HIGH, LEVEL_LOW, LEVEL_PROTECTED, c
 from flux.core.task_engine.approvals import (
     APPROVAL_KIND_HIGH_RISK,
     APPROVAL_KIND_PROTECTED,
+    APPROVAL_TIMEOUT_SECONDS,
     raise_approval,
     wait_for_approval,
 )
@@ -337,6 +338,21 @@ _CLAUDE_PERMISSION_MODES: dict[str, str] = {
     PermissionMode.UNATTENDED.value: "bypassPermissions",
     PermissionMode.FULL.value: "bypassPermissions",
 }
+
+#: Claude Code 审批桥工具（Flux MCP server 名固定为 flux）。
+#: 仅在 Flux 正常模式（→ Claude `default`）且 mcp.json 里有 flux 端点时挂上：
+#: 无头 `-p` 里没人应答的权限询问会由 Flux 审批卡接住，而不是被静默拒绝。
+CLAUDE_PERMISSION_PROMPT_TOOL = "mcp__flux__permission_prompt"
+
+
+def _claude_mcp_servers(config_dir: Path) -> dict[str, Any]:
+    """读隔离配置里的 MCP server 表；读不到/格式坏都按"没有"处理（fail-closed）。"""
+    try:
+        payload = json.loads((config_dir / "mcp.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    servers = payload.get("mcpServers") if isinstance(payload, dict) else None
+    return servers if isinstance(servers, dict) else {}
 
 
 @dataclass
@@ -1059,14 +1075,31 @@ class CliRuntime:
             argv += ["--model", model]
         if resume:
             argv += ["--resume", resume]
+        mode_value = normalize_mode(mode)
         argv += [
             # 隔离配置：只用 Flux 注入的 MCP 端点，不继承用户机上的其它 MCP
             "--mcp-config",
             str(config_dir / "mcp.json"),
             "--strict-mcp-config",
             "--permission-mode",
-            _CLAUDE_PERMISSION_MODES[normalize_mode(mode)],
+            _CLAUDE_PERMISSION_MODES[mode_value],
         ]
+        if mode_value == PermissionMode.NORMAL.value:
+            if "flux" in _claude_mcp_servers(config_dir):
+                # 无头 -p 没人应答权限询问：交给 Flux 审批卡，而不是让 CLI 直接拒绝。
+                # 权限工具由 CLI 直接调用（不是模型工具调用），实测不会再触发权限询问，
+                # 因此不需要 --allowedTools；模型若自己调它，handler 会拒绝以避免套娃。
+                argv += ["--permission-prompt-tool", CLAUDE_PERMISSION_PROMPT_TOOL]
+                logger.info(
+                    "%s：正常模式启用 Flux 审批桥 tool=%s",
+                    self.runtime_id,
+                    CLAUDE_PERMISSION_PROMPT_TOOL,
+                )
+            else:
+                logger.warning(
+                    "%s：正常模式缺少 flux MCP 端点，需要审批的工具调用将被 Claude Code 直接拒绝",
+                    self.runtime_id,
+                )
         return (*argv, prompt)
 
     async def _resumable_claude_session(self, config_dir: Path, task_id: str, agent_id: str) -> str:
@@ -1264,6 +1297,16 @@ class CliRuntime:
         if normalize_mode(mode) in (PermissionMode.UNATTENDED.value, PermissionMode.FULL.value):
             # 容器内以 root 运行：bypassPermissions 需要显式声明沙箱环境，否则 CLI 拒绝启动
             env["IS_SANDBOX"] = "1"
+        if normalize_mode(mode) == PermissionMode.NORMAL.value:
+            # 审批桥可能等用户最多 10 分钟；HTTP MCP 默认单请求 60 秒就断，
+            # 不抬高这个上限的话，用户思考超过一分钟审批就会失败。
+            env["MCP_TOOL_TIMEOUT"] = str((APPROVAL_TIMEOUT_SECONDS + 60) * 1000)
+            logger.info(
+                "%s：正常模式审批等待上限 %d 秒，MCP 工具超时提升到 %s ms",
+                self.runtime_id,
+                APPROVAL_TIMEOUT_SECONDS,
+                env["MCP_TOOL_TIMEOUT"],
+            )
         return env
 
     @staticmethod

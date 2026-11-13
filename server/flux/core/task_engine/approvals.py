@@ -33,6 +33,8 @@ logger = get_logger(__name__)
 
 APPROVAL_KIND_HIGH_RISK = "high_risk_command"
 APPROVAL_KIND_PROTECTED = "protected_access"
+#: Claude Code `--permission-prompt-tool` 转来的工具级审批（正常模式的无头运行）
+APPROVAL_KIND_TOOL_PROMPT = "tool_permission_prompt"
 
 #: 审批卡上的两个选项（label 就是回传给 choose 接口的值）
 APPROVAL_ALLOW = "允许"
@@ -257,6 +259,7 @@ __all__ = [
     "APPROVAL_DENY",
     "APPROVAL_KIND_HIGH_RISK",
     "APPROVAL_KIND_PROTECTED",
+    "APPROVAL_KIND_TOOL_PROMPT",
     "APPROVAL_TIMEOUT_SECONDS",
     "ApprovalCancelledError",
     "ApprovalDeniedError",
