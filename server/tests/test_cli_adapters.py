@@ -189,6 +189,6 @@ def test_start_then_stop_cleans_process_group() -> None:
     assert process.popen.poll() is not None  # 已退出，不留孤儿
 
 
-def test_default_registry_has_opencode_and_codex() -> None:
+def test_default_registry_has_claude_opencode_and_codex() -> None:
     names = {adapter.name for adapter in build_default_adapters()}
-    assert names == {"opencode", "codex"}
+    assert names == {"claude-code", "opencode", "codex"}

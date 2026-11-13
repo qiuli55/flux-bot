@@ -281,11 +281,11 @@ def _create_key(client: TestClient) -> dict:
     response = client.post(
         f"{PREFIX}/keys",
         json={
-            "name": "DeepSeek 官方",
-            "provider": "deepseek",
-            "base_url": "https://api.deepseek.com",
-            "api_key": "sk-test-12345678",
-            "models": ["deepseek-v4-pro"],
+            "name": "Anthropic 官方",
+            "provider": "anthropic",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "sk-ant-test-12345678",
+            "models": ["claude-sonnet-5-5"],
         },
     )
     assert response.status_code == 200, response.text
@@ -330,11 +330,11 @@ def test_update_member_model_and_permission(client: TestClient) -> None:
 
     patched = client.patch(
         f"{PREFIX}/groups/{group['id']}/members/{bot['id']}",
-        json={"model": "deepseek-v4-pro", "key_id": key["id"]},
+        json={"model": "claude-sonnet-5-5", "key_id": key["id"]},
     )
     assert patched.status_code == 200, patched.text
     member = patched.json()["data"][0]
-    assert member["model"] == "deepseek-v4-pro"
+    assert member["model"] == "claude-sonnet-5-5"
     assert member["api_key_id"] == key["id"]
 
     mode = client.patch(

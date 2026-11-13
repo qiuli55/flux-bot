@@ -5,7 +5,7 @@
 并把进程登记进**现有的** `RunSupervisor`——pid/pgid/心跳/超时/对账/取消升级链路全部复用，
 不新建第二套生命周期机制。
 
-每次 Run 有自己的私有目录 `<FLUX_DSH_HOME>/runs/<run_id>/`（0700）：里面是该 CLI 的隔离
+每次 Run 有自己的私有目录 `<FLUX_RUNTIME_HOME>/runs/<run_id>/`（0700）：里面是该 CLI 的隔离
 配置（0600），注入 Flux MCP 端点与一枚一次性 Bearer 令牌（scopes 仅 file.read / file.write /
 terminal.execute——没有 apply / git / secret）。
 令牌明文只出现在该配置文件里，不进日志、不进任何文档/证据；Run 结束立即撤销。
@@ -35,11 +35,18 @@ except ModuleNotFoundError:  # pragma: no cover - 3.10 用 tomli（见 pyproject
     import tomli as tomllib
 
 from flux.config import Settings
+from flux.core.agent_runtime.claude_auth import (
+    AUTH_VARS,
+    claude_auth_env,
+    resolve_auth_mode,
+    trim_inherited_auth_env,
+)
 from flux.core.agent_runtime.codex_account import (
     codex_account_home,
     codex_proxy_env,
     sync_account_auth,
 )
+from flux.core.agent_runtime.extra_mcp import parse_extra_mcp_servers
 from flux.core.agent_runtime.model_catalog import PROVIDER_TITLES
 from flux.core.agent_runtime.platforms import kill_group, secure_file, signal_group_graceful
 from flux.core.agent_runtime.protocol import build_runtime_env, compose_instruction
@@ -51,6 +58,7 @@ from flux.core.agent_runtime.runtimes.base import (
     EVENT_THINKING,
     EVENT_TOOL_CALL,
     EVENT_TOOL_RESULT,
+    RUNTIME_CLAUDE,
     RUNTIME_CODEX,
     RUNTIME_NATIVE_STREAMING,
     RUNTIME_OPENCODE,
@@ -76,6 +84,7 @@ from flux.core.permissions.risk import LEVEL_HIGH, LEVEL_LOW, LEVEL_PROTECTED, c
 from flux.core.task_engine.approvals import (
     APPROVAL_KIND_HIGH_RISK,
     APPROVAL_KIND_PROTECTED,
+    APPROVAL_TIMEOUT_SECONDS,
     raise_approval,
     wait_for_approval,
 )
@@ -189,13 +198,20 @@ def _float_of(value: Any) -> float:
 def _normalized_usage(raw: dict[str, Any]) -> dict[str, Any]:
     """把各运行时的用量字段名收敛成同一套键（codex 用 input_tokens，opencode 用 input）。"""
     cache = raw.get("cache") if isinstance(raw.get("cache"), dict) else {}
+    created = raw.get("cache_creation") if isinstance(raw.get("cache_creation"), dict) else {}
+    cache_write = cache.get(
+        "write", raw.get("cache_write_input_tokens", raw.get("cache_creation_input_tokens"))
+    )
+    if cache_write is None and created:
+        # Claude 新版把写入量拆成 ephemeral 5m/1h 两项
+        cache_write = sum(_int_of(v) for v in created.values() if isinstance(v, (int, float)))
     return {
         "input": raw.get("input", raw.get("input_tokens")),
         "output": raw.get("output", raw.get("output_tokens")),
         "cache_read": cache.get(
             "read", raw.get("cached_input_tokens", raw.get("cache_read_input_tokens"))
         ),
-        "cache_write": cache.get("write", raw.get("cache_write_input_tokens")),
+        "cache_write": cache_write,
     }
 
 
@@ -287,9 +303,21 @@ class _CliSpec:
     extra_args: tuple[str, ...]
 
 
-#: 两个外部 CLI 的启动差异（argv 按本机实测版本校准：codex-cli 0.157.1 / opencode 1.18.29
-#: [2026-10-05 快照]）
+#: 三个外部 CLI 的启动差异（argv 按本机实测版本校准：codex-cli 0.157.1 / opencode 1.18.29 /
+#: claude-code 2.1.323 [2026-11-12 快照]）
 _SPECS: dict[str, _CliSpec] = {
+    RUNTIME_CLAUDE: _CliSpec(
+        runtime_id=RUNTIME_CLAUDE,
+        adapter_name="claude-code",
+        binary_env="FLUX_CLAUDE_CLI_BINARY",
+        # 非交互一次性执行：stdout 输出 JSONL 事件流（stream-json 必须搭 --verbose）
+        extra_args=(
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+        ),
+    ),
     RUNTIME_CODEX: _CliSpec(
         runtime_id=RUNTIME_CODEX,
         adapter_name="codex",
@@ -307,6 +335,36 @@ _SPECS: dict[str, _CliSpec] = {
         extra_args=("--format", "json", "--print-logs", "--log-level", "ERROR"),
     ),
 }
+
+
+#: Flux 权限模式 → Claude Code `--permission-mode`：
+#: plan 只读、normal 默认逐次询问、unattended/full 不再打断（Flux 侧令牌与审批仍生效）。
+#: 额外注入的 MCP server（claude_extra_mcp_servers）共用这张映射，不单独放行。
+#: 注意 headless 语义：`claude -p` 下 default 模式无人可应答审批，需要授权的工具调用
+#: （MCP 工具、Bash、编辑）会被直接拒绝，所以 normal 实际是"未预授权即拒绝"而非逐次
+#: 询问；扩展 server 的工具在 normal 下同样不可用，需要时用 unattended / full 或
+#: --allowedTools 预放行（后续可把 --permission-prompt-tool 接到 Flux 审批卡）。
+_CLAUDE_PERMISSION_MODES: dict[str, str] = {
+    PermissionMode.PLAN.value: "plan",
+    PermissionMode.NORMAL.value: "default",
+    PermissionMode.UNATTENDED.value: "bypassPermissions",
+    PermissionMode.FULL.value: "bypassPermissions",
+}
+
+#: Claude Code 审批桥工具（Flux MCP server 名固定为 flux）。
+#: 仅在 Flux 正常模式（→ Claude `default`）且 mcp.json 里有 flux 端点时挂上：
+#: 无头 `-p` 里没人应答的权限询问会由 Flux 审批卡接住，而不是被静默拒绝。
+CLAUDE_PERMISSION_PROMPT_TOOL = "mcp__flux__permission_prompt"
+
+
+def _claude_mcp_servers(config_dir: Path) -> dict[str, Any]:
+    """读隔离配置里的 MCP server 表；读不到/格式坏都按"没有"处理（fail-closed）。"""
+    try:
+        payload = json.loads((config_dir / "mcp.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    servers = payload.get("mcpServers") if isinstance(payload, dict) else None
+    return servers if isinstance(servers, dict) else {}
 
 
 @dataclass
@@ -595,8 +653,10 @@ class CliRuntime:
         # Bot 任务的执行目录来自 tasks.workspace 快照（每个 Bot 一个独立目录）；
         # 普通对话没有该字段，仍用全局工作区。
         task_workspace = str(getattr(task, "workspace", "") or "").strip()
-        workspace = task_workspace or self._settings.workspace_root or self._settings.dsh_workspace
-        run_dir = Path(self._settings.dsh_home).expanduser() / "runs" / run_id
+        workspace = (
+            task_workspace or self._settings.workspace_root or self._settings.runtime_workspace
+        )
+        run_dir = Path(self._settings.runtime_home).expanduser() / "runs" / run_id
         task_key = str(getattr(task, "id", "") or "")
         #: 生效执行时限：runtime 能力表默认值 + Settings 通用覆盖（见 config.agent_limits）
         limits = self._settings.agent_limits(self.runtime_id)
@@ -631,13 +691,24 @@ class CliRuntime:
         # 启动时写一次（常驻期间不重写），隔离性不降级。
         config_dir = run_dir
         if self.runtime_id == RUNTIME_CODEX and task_key:
-            config_dir = Path(self._settings.dsh_home).expanduser() / "runs" / f"task-{task_key}"
+            config_dir = (
+                Path(self._settings.runtime_home).expanduser() / "runs" / f"task-{task_key}"
+            )
+        elif self.runtime_id == RUNTIME_CLAUDE and task_key:
+            # Claude Code 的 --resume 依赖 CLI 自己写在 CLAUDE_CONFIG_DIR 下的会话文件：
+            # 按任务固定一份目录，下一轮才找得回上一轮的会话；一次性进程不进池。
+            config_dir = (
+                Path(self._settings.runtime_home).expanduser()
+                / "runs"
+                / f"task-{task_key}"
+                / "claude-home"
+            )
         elif pool_key:
             # 池化进程按「复用键」固定一个配置目录：进程活着期间配置不变，复用时无需重写。
             # 键里含模式/模型/密钥通道，所以目录名必须带键哈希——同任务换模型要各自
             # 一份 opencode.json，否则两轮写配置会互相覆盖。
             config_dir = (
-                Path(self._settings.dsh_home).expanduser()
+                Path(self._settings.runtime_home).expanduser()
                 / "runs"
                 / f"task-{task_key}"
                 / f"{self.runtime_id}-{_pool_dir_digest(pool_key)}"
@@ -678,6 +749,22 @@ class CliRuntime:
             raise
 
         env = {**os.environ}
+        if self.runtime_id == RUNTIME_CLAUDE:
+            # 父进程可能导出过另一套 Anthropic 鉴权变量；两套同时存在会让 CLI 报
+            # 鉴权冲突。Flux 注入了通道就只摘另一套；没注入时沿用父进程的配置
+            # （向后兼容），只有两套同时继承时才择一，详见 trim_inherited_auth_env。
+            injected = any(name in runtime_env for name in AUTH_VARS)
+            dropped = trim_inherited_auth_env(
+                env,
+                injected=runtime_env,
+                base_url=_claude_auth_base_url(channel, self._settings),
+                mode=self._settings.anthropic_auth_mode,
+            )
+            if dropped and injected:
+                logger.info(
+                    "Claude 子进程忽略父进程继承的鉴权变量 %s（以 Flux 解析的通道为准）",
+                    ",".join(dropped),
+                )
         env.update(
             build_runtime_env(
                 # 池化进程是任务级常驻：不写死某一轮的 run_id（否则下一轮就是过期 id）。
@@ -686,9 +773,7 @@ class CliRuntime:
                 workspace=workspace,
                 task_id=str(getattr(task, "id", "")) or None,
                 agent_id=agent_id,
-                mcp_endpoint=(
-                    self._settings.dsh_mcp_url if self._settings.dsh_mcp_enabled else None
-                ),
+                mcp_endpoint=(self._settings.mcp_url if self._settings.mcp_enabled else None),
                 permission_mode=mode,
             )
         )
@@ -726,7 +811,18 @@ class CliRuntime:
                     "token_id": token_id,
                 }
         else:
-            argv = self._build_argv(instruction, mode)
+            if self.runtime_id == RUNTIME_CLAUDE:
+                # 会话续聊：外部会话绑定表里记着上一轮的 session_id，且会话文件仍在隔离
+                # 目录里才 --resume；否则新建会话（旧文件被清理时 resume 会直接失败）。
+                argv = self._build_claude_argv(
+                    instruction,
+                    mode,
+                    config_dir=config_dir,
+                    model=model_override,
+                    resume=await self._resumable_claude_session(config_dir, task_key, agent_id),
+                )
+            else:
+                argv = self._build_argv(instruction, mode)
         if pooled is not None:
             self._pool_entries[run_id] = pooled
         if pool_key:
@@ -990,6 +1086,66 @@ class CliRuntime:
         run_args = rest[:-1]
         return (executable, *run_args, *self._spec.extra_args, prompt)
 
+    def _build_claude_argv(
+        self,
+        instruction: str,
+        mode: str = "normal",
+        *,
+        config_dir: Path,
+        model: str = "",
+        resume: str = "",
+    ) -> tuple[str, ...]:
+        """Claude Code 一次性执行的 argv：prompt 固定最后，会话/模型/权限/MCP 走选项。"""
+        base = list(self._build_argv(instruction, mode))
+        prompt = base.pop()
+        argv = [*base]
+        if model:
+            argv += ["--model", model]
+        if resume:
+            argv += ["--resume", resume]
+        mode_value = normalize_mode(mode)
+        argv += [
+            # 隔离配置：只用 Flux 注入的 MCP 端点，不继承用户机上的其它 MCP
+            "--mcp-config",
+            str(config_dir / "mcp.json"),
+            "--strict-mcp-config",
+            "--permission-mode",
+            _CLAUDE_PERMISSION_MODES[mode_value],
+        ]
+        if mode_value == PermissionMode.NORMAL.value:
+            if "flux" in _claude_mcp_servers(config_dir):
+                # 无头 -p 没人应答权限询问：交给 Flux 审批卡，而不是让 CLI 直接拒绝。
+                # 权限工具由 CLI 直接调用（不是模型工具调用），实测不会再触发权限询问，
+                # 因此不需要 --allowedTools；模型若自己调它，handler 会拒绝以避免套娃。
+                argv += ["--permission-prompt-tool", CLAUDE_PERMISSION_PROMPT_TOOL]
+                logger.info(
+                    "%s：正常模式启用 Flux 审批桥 tool=%s",
+                    self.runtime_id,
+                    CLAUDE_PERMISSION_PROMPT_TOOL,
+                )
+            else:
+                logger.warning(
+                    "%s：正常模式缺少 flux MCP 端点，需要审批的工具调用将被 Claude Code 直接拒绝",
+                    self.runtime_id,
+                )
+        return (*argv, prompt)
+
+    async def _resumable_claude_session(self, config_dir: Path, task_id: str, agent_id: str) -> str:
+        """取可续聊的会话 id：绑定表里有记录、且会话文件还在隔离目录里才返回。"""
+        session_id = await self._stored_session(task_id or None, agent_id)
+        if not session_id:
+            return ""
+        with contextlib.suppress(OSError):
+            if any(config_dir.rglob(f"{session_id}.jsonl")):
+                return session_id
+        logger.info(
+            "%s：会话文件已不在隔离目录，本轮新建会话 task=%s session=%s",
+            self.runtime_id,
+            task_id,
+            session_id,
+        )
+        return ""
+
     def _binary_path(self) -> str:
         """CLI 可执行文件：环境变量覆盖优先，否则用 Adapter 探测到的绝对路径。"""
         override = os.environ.get(self._spec.binary_env)
@@ -1000,7 +1156,7 @@ class CliRuntime:
     async def _issue_token(
         self, agent_id: str, run_id: str, mode: str = "normal", *, task_id: str = ""
     ) -> tuple[str | None, str | None]:
-        if not self._settings.dsh_mcp_enabled:
+        if not self._settings.mcp_enabled:
             logger.warning(
                 "%s：MCP 注入已关闭，本次 Run 的 Agent 将看不到项目、也提不了提案",
                 self.runtime_id,
@@ -1036,9 +1192,19 @@ class CliRuntime:
         mode: str = "normal",
         task_id: str = "",
     ) -> dict[str, str]:
-        url = self._settings.dsh_mcp_url.strip()
+        url = self._settings.mcp_url.strip()
         if token_raw is not None and not url.startswith(("http://", "https://")):
             raise ConfigurationError(f"MCP 端点必须是 http(s) URL：{url!r}", details={"url": url})
+        if self.runtime_id == RUNTIME_CLAUDE:
+            return self._write_claude_config(
+                run_dir,
+                url,
+                token_raw,
+                run_id,
+                channel=channel,
+                mode=mode,
+                task_id=task_id,
+            )
         if self.runtime_id == RUNTIME_CODEX:
             home = run_dir / "codex-home"
             home.mkdir(parents=True, exist_ok=True)
@@ -1097,6 +1263,113 @@ class CliRuntime:
                 task_id=task_id,
             )
         return env
+
+    def _write_claude_config(
+        self,
+        config_dir: Path,
+        url: str,
+        token_raw: str | None,
+        run_id: str,
+        *,
+        channel: Any = None,
+        mode: str = "normal",
+        task_id: str = "",
+    ) -> dict[str, str]:
+        """Claude Code 的隔离配置：MCP 端点 + 模型通道（OpenClaw 网关 / 官方 API）。
+
+        配置目录按任务固定（见 prepare），CLI 的会话文件也落在这里，`--resume` 才能续聊。
+        密钥只进子进程环境；没有密钥通道时沿用用户 `claude login` 的账号登录态。
+        """
+        config_dir.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(config_dir, 0o700)
+        servers: dict[str, Any] = {}
+        if token_raw is not None and url:
+            headers = {"Authorization": f"Bearer {token_raw}"}
+            if task_id:
+                headers["X-Flux-Task-Id"] = task_id
+            else:
+                headers["X-Flux-Run-Id"] = run_id
+            servers["flux"] = {"type": "http", "url": url, "headers": headers}
+        # 运维扩展点：合并 FLUX_CLAUDE_EXTRA_MCP_SERVERS 里的额外 MCP server（解析阶段
+        # 只放行 http / sse 远程型，详见 extra_mcp.py）。Flux 的 "flux" 条目恒胜：解析
+        # 阶段已丢弃同名项，这里再用 setdefault 兜第二道，绝不覆盖真实端点。
+        # 权限：这里不做任何额外放行——plan / normal 模式下扩展 server 的工具与 flux
+        # 工具一样受 --permission-mode 约束。Bot 以 `claude -p`（headless）运行，
+        # default 模式无人可应答审批，未预授权的工具调用会被直接拒绝，因此 normal
+        # 下扩展 server（如 browser）的工具实际不可用，而不是逐次询问；只有
+        # unattended / full 才整体放行（映射见 _CLAUDE_PERMISSION_MODES）。需要浏览器
+        # 时用 unattended / full，或后续把 --permission-prompt-tool 接到 Flux 审批卡。
+        extra_servers = parse_extra_mcp_servers(
+            getattr(self._settings, "claude_extra_mcp_servers", "")
+        )
+        if extra_servers:
+            for name, spec in extra_servers.items():
+                servers.setdefault(name, spec)
+            # 只记名字：headers 里可能有令牌。
+            logger.info("Claude 本轮注入扩展 MCP server：%s", ", ".join(extra_servers))
+        mcp_file = config_dir / "mcp.json"
+        mcp_file.write_text(
+            json.dumps({"mcpServers": servers}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        self._secure(mcp_file)
+        state = config_dir / ".claude.json"
+        if not state.exists():
+            # 首次 onboarding（条款/主题）会阻塞非交互执行：预置成已完成
+            state.write_text(
+                json.dumps({"hasCompletedOnboarding": True, "numStartups": 1}) + "\n",
+                encoding="utf-8",
+            )
+            self._secure(state)
+        env: dict[str, str] = {"CLAUDE_CONFIG_DIR": str(config_dir)}
+        key = str(getattr(channel, "api_key", "") or "").strip() if channel is not None else ""
+        if not key and channel is None:
+            key = (self._settings.anthropic_api_key or "").strip()
+        base_url = _claude_auth_base_url(channel, self._settings)
+        auth_mode = resolve_auth_mode(base_url, self._settings.anthropic_auth_mode)
+        auth_env = claude_auth_env(key, base_url, auth_mode)
+        if auth_env:
+            # 官方直连走 X-Api-Key，第三方网关走 Authorization: Bearer；只注入其一
+            env.update(auth_env)
+            logger.info("Claude 鉴权通道 mode=%s", auth_mode)
+        else:
+            # 没有密钥通道：沿用 `claude login` 的账号登录态（订阅套餐额度）
+            self._inject_claude_credentials(config_dir)
+        if base_url:
+            # 第三方订阅：先 OpenClaw 登录，再把客户端指向它的 Anthropic 兼容网关
+            env["ANTHROPIC_BASE_URL"] = base_url
+        if normalize_mode(mode) in (PermissionMode.UNATTENDED.value, PermissionMode.FULL.value):
+            # 容器内以 root 运行：bypassPermissions 需要显式声明沙箱环境，否则 CLI 拒绝启动
+            env["IS_SANDBOX"] = "1"
+        if normalize_mode(mode) == PermissionMode.NORMAL.value:
+            # 审批桥可能等用户最多 10 分钟；HTTP MCP 默认单请求 60 秒就断，
+            # 不抬高这个上限的话，用户思考超过一分钟审批就会失败。
+            env["MCP_TOOL_TIMEOUT"] = str((APPROVAL_TIMEOUT_SECONDS + 60) * 1000)
+            logger.info(
+                "%s：正常模式审批等待上限 %d 秒，MCP 工具超时提升到 %s ms",
+                self.runtime_id,
+                APPROVAL_TIMEOUT_SECONDS,
+                env["MCP_TOOL_TIMEOUT"],
+            )
+        return env
+
+    @staticmethod
+    def _inject_claude_credentials(config_dir: Path) -> None:
+        """把用户 `claude login` 的凭据复制进隔离目录（订阅额度随账号走）。"""
+        target = config_dir / ".credentials.json"
+        if target.exists():
+            return
+        for raw in ("~/.claude/.credentials.json", "~/.config/claude/.credentials.json"):
+            source = Path(raw).expanduser()
+            if not source.is_file():
+                continue
+            try:
+                target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+                os.chmod(target, 0o600)
+            except OSError:
+                logger.warning("Claude 凭据复制失败 source=%s", source, exc_info=True)
+            return
 
     def _inject_account_auth(self, home: Path) -> None:
         """把 Flux 账号目录的 ChatGPT 登录态复制进本次 Run 的隔离 CODEX_HOME。
@@ -1346,7 +1619,7 @@ class CliRuntime:
             idle_timeout=(
                 launch.limits.idle_timeout_seconds
                 if launch.limits
-                else self._settings.dsh_idle_timeout_seconds
+                else self._settings.run_idle_timeout_seconds
             ),
             permission_mode=launch.permission_mode,
             approval_handler=on_native_approval,
@@ -1516,6 +1789,10 @@ class CliRuntime:
     ) -> None:
         """线程内逐行读 stdout → 统一事件；进程退出后按退出码落终态。"""
         texts: list[str] = []
+        #: Claude 的 text_delta 是逐 token 片段：必须无缝拼接，不能按块换行
+        claude_text: list[str] = []
+        claude_session = ""
+        claude_final = ""
         usage = self._usage.setdefault(launch.run_id, _RunUsage())
         stream = process.popen.stdout
         if stream is not None:
@@ -1523,12 +1800,32 @@ class CliRuntime:
                 parsed = self._adapter.parse_event(line)
                 if parsed is None:
                     continue
+                if self.runtime_id == RUNTIME_CLAUDE:
+                    claude_session = str(parsed.get("session_id") or "") or claude_session
                 event = self._normalize(parsed, launch.run_id)
+                if (
+                    self.runtime_id == RUNTIME_CLAUDE
+                    and event.type == EVENT_MESSAGE
+                    and str(parsed.get("type") or "").strip().lower() == "assistant"
+                ):
+                    # assistant 事件回放整段文本，与已流式输出的 delta 重复
+                    text = _text_of(event.data)
+                    if text and "".join(claude_text).endswith(text):
+                        event = RuntimeEvent(
+                            EVENT_STATUS,
+                            launch.run_id,
+                            {**event.data, "phase": "assistant", "text": ""},
+                        )
+                if self.runtime_id == RUNTIME_CLAUDE and event.type == EVENT_FINAL:
+                    claude_final = _text_of(event.data) or claude_final
                 delta = _accumulate_usage(usage, event, parsed)
                 if event.type == EVENT_MESSAGE:
                     text = _text_of(event.data)
                     if text:
-                        texts.append(text)
+                        if self.runtime_id == RUNTIME_CLAUDE:
+                            claude_text.append(text)
+                        else:
+                            texts.append(text)
                 record = {
                     **event.data,
                     "run_id": launch.run_id,
@@ -1541,8 +1838,18 @@ class CliRuntime:
                     asyncio.run_coroutine_threadsafe(self._record_usage(launch, delta), loop)
         code = process.popen.wait()
         status = DshRunStatus.COMPLETED if code == 0 else DshRunStatus.FAILED
+        if self.runtime_id == RUNTIME_CLAUDE:
+            response = "".join(claude_text) or claude_final
+            if claude_session:
+                # 下一轮 --resume 用这里的会话 id（会话文件在 CLI 配置目录里）
+                asyncio.run_coroutine_threadsafe(
+                    self._remember_session(launch.task_id, claude_session, launch.agent_id),
+                    loop,
+                )
+        else:
+            response = "\n".join(texts)
         asyncio.run_coroutine_threadsafe(
-            self._finalize(launch, status, code, "\n".join(texts), queue), loop
+            self._finalize(launch, status, code, response, queue), loop
         )
 
     async def _on_event(self, event: RuntimeEvent, record: dict[str, Any]) -> None:
@@ -1580,6 +1887,8 @@ class CliRuntime:
             return _normalize_codex_event(parsed, run_id, self.runtime_id)
         if self.runtime_id == RUNTIME_OPENCODE:
             return _normalize_opencode_event(parsed, run_id, self.runtime_id)
+        if self.runtime_id == RUNTIME_CLAUDE:
+            return _normalize_claude_event(parsed, run_id, self.runtime_id)
         return _normalize_event(parsed, run_id, self.runtime_id)
 
     def _open_stderr(self, launch: RuntimeLaunch) -> tuple[Any, Any]:
@@ -1800,7 +2109,7 @@ class CliRuntime:
 
     @staticmethod
     def _snapshot(launch: RuntimeLaunch, status: str, process: Any = None) -> dict[str, Any]:
-        """构造与 DshRun.to_dict 同形的 Run 快照（对外 API 形态一致）。"""
+        """构造 Run 快照（对外 API 形态一致）。"""
         pid = getattr(process, "pid", None)
         pgid = getattr(process, "pgid", None)
         return {
@@ -2024,6 +2333,122 @@ def _normalize_codex_event(parsed: dict[str, Any], run_id: str, runtime_id: str)
         # 兜底认通用词表（包装脚本/其它 CLI 可能直接吐统一词表的行）
         return RuntimeEvent(mapped, run_id, data)
     # 前后未识别的一律 status（codex 的 INFO 日志与提示走 stderr，不该出现在这里）
+    return RuntimeEvent(EVENT_STATUS, run_id, data)
+
+
+def _claude_tool_fields(block: dict[str, Any]) -> dict[str, Any]:
+    """Claude 的 tool_use 块 → 时间线字段（入参在 `input`，没有 state 包装）。"""
+    payload = block.get("input") if isinstance(block.get("input"), dict) else {}
+    command = payload.get("command") if isinstance(payload.get("command"), str) else ""
+    fields: dict[str, Any] = {
+        "name": str(block.get("name") or "tool"),
+        "detail": _clip(command or payload, _TOOL_DETAIL_CHARS),
+        "status": "running",
+    }
+    call_id = block.get("id")
+    if isinstance(call_id, str) and call_id.strip():
+        fields["call_id"] = call_id
+    return fields
+
+
+#: Claude Code `--output-format stream-json --include-partial-messages` 事件（2.x）：
+#:   {"type":"system","subtype":"init","session_id":"..."}
+#:   {"type":"stream_event","event":{"type":"content_block_delta",
+#:     "delta":{"type":"text_delta",...}}}
+#:   {"type":"stream_event","event":{"type":"content_block_delta",
+#:     "delta":{"type":"thinking_delta",...}}}
+#:   {"type":"assistant","message":{"content":[{"type":"tool_use",...},{"type":"text",...}]}}
+#:   {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":...,"content":...}]}}
+#:   {"type":"result","subtype":"success","result":"...","usage":{...},"total_cost_usd":...}
+#: 文本以 delta 为准（真流式）；assistant 里的整段文本是回放，交给 `_pump` 去重。
+def _normalize_claude_event(parsed: dict[str, Any], run_id: str, runtime_id: str) -> RuntimeEvent:
+    raw_type = str(parsed.get("type") or "").strip().lower()
+    subtype = str(parsed.get("subtype") or "").strip().lower()
+    data = {**parsed, "runtime_id": runtime_id}
+    session_id = str(parsed.get("session_id") or "").strip()
+    if session_id:
+        data["session_id"] = session_id
+
+    if raw_type == "system":
+        return RuntimeEvent(EVENT_STATUS, run_id, {**data, "phase": subtype or "system"})
+    if raw_type == "stream_event":
+        payload = parsed.get("event") if isinstance(parsed.get("event"), dict) else {}
+        payload_type = str(payload.get("type") or "").strip().lower()
+        delta = payload.get("delta") if isinstance(payload.get("delta"), dict) else {}
+        delta_type = str(delta.get("type") or "").strip().lower()
+        if delta_type == "text_delta":
+            return RuntimeEvent(
+                EVENT_MESSAGE, run_id, {**data, "text": str(delta.get("text") or "")}
+            )
+        if delta_type == "thinking_delta":
+            return RuntimeEvent(
+                EVENT_THINKING, run_id, {**data, "text": str(delta.get("thinking") or "")}
+            )
+        return RuntimeEvent(EVENT_STATUS, run_id, {**data, "phase": delta_type or payload_type})
+    if raw_type == "assistant":
+        message = parsed.get("message") if isinstance(parsed.get("message"), dict) else {}
+        content = message.get("content") if isinstance(message.get("content"), list) else []
+        block = next(
+            (p for p in content if isinstance(p, dict) and p.get("type") == "tool_use"), None
+        )
+        if block is not None:
+            return RuntimeEvent(EVENT_TOOL_CALL, run_id, {**data, **_claude_tool_fields(block)})
+        text = "".join(
+            str(p.get("text") or "")
+            for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+        if text.strip():
+            # 没开 partial-message 的版本只有整段文本
+            return RuntimeEvent(EVENT_MESSAGE, run_id, {**data, "text": text})
+        return RuntimeEvent(EVENT_STATUS, run_id, {**data, "phase": "assistant"})
+    if raw_type == "user":
+        message = parsed.get("message") if isinstance(parsed.get("message"), dict) else {}
+        content = message.get("content") if isinstance(message.get("content"), list) else []
+        blocks = [p for p in content if isinstance(p, dict)]
+        failed = any(block.get("is_error") for block in blocks)
+        first = blocks[0] if blocks else {}
+        return RuntimeEvent(
+            EVENT_TOOL_RESULT,
+            run_id,
+            {
+                **data,
+                "status": "error" if failed else "ok",
+                "call_id": str(first.get("tool_use_id") or ""),
+                "output": _clip(first.get("content"), _TOOL_OUTPUT_CHARS),
+            },
+        )
+    if raw_type == "result":
+        if parsed.get("is_error") or subtype not in ("", "success"):
+            return RuntimeEvent(
+                EVENT_ERROR,
+                run_id,
+                {
+                    **data,
+                    "message": str(parsed.get("result") or subtype or "claude error"),
+                },
+            )
+        usage = parsed.get("usage") if isinstance(parsed.get("usage"), dict) else {}
+        return RuntimeEvent(
+            EVENT_FINAL,
+            run_id,
+            {
+                **data,
+                "status": "completed",
+                # result 自带整段答复：没有 delta 时由 _pump 兜底当最终文本
+                "text": str(parsed.get("result") or ""),
+                "step_finished": True,
+                "usage": _normalized_usage(usage),
+                "cost": parsed.get("total_cost_usd"),
+            },
+        )
+    if raw_type == "error":
+        return RuntimeEvent(
+            EVENT_ERROR, run_id, {**data, "message": _text_of(parsed) or "claude error"}
+        )
+    mapped = _EVENT_TYPE_MAP.get(raw_type)
+    if mapped is not None:
+        return RuntimeEvent(mapped, run_id, data)
     return RuntimeEvent(EVENT_STATUS, run_id, data)
 
 
@@ -2297,6 +2722,14 @@ def _codex_channel_lines(channel: Any, *, model: str) -> list[str]:
     return lines
 
 
+def _claude_auth_base_url(channel: Any, settings: Settings) -> str:
+    """Claude 本轮生效的模型通道 base_url：密钥库通道优先，空则回落到全局配置。"""
+    base_url = str(getattr(channel, "base_url", "") or "").strip() if channel is not None else ""
+    if not base_url:
+        base_url = (settings.anthropic_base_url or "").strip()
+    return base_url
+
+
 def _key_provider_id(channel: Any) -> str:
     """密钥库 provider 的唯一标识：codex/opencode 的 provider 块名。"""
     key_id = str(getattr(channel, "key_id", "") or "").replace("-", "")
@@ -2505,7 +2938,7 @@ def build_cli_runtime(
 
 #: 供测试/调用方复用：把 Run 目录里的配置路径暴露出来（排障用，不含令牌）
 def run_dir_for(settings: Settings, run_id: str) -> Path:
-    return Path(settings.dsh_home).expanduser() / "runs" / run_id
+    return Path(settings.runtime_home).expanduser() / "runs" / run_id
 
 
 __all__ = [

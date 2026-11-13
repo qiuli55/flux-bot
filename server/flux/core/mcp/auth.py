@@ -85,7 +85,7 @@ class AgentIdentity:
     """一次 MCP 调用的调用方身份——每个字段都来自令牌 + 注册表，不来自请求体。
 
     `agent_id` 是 canonical UUID，`name` 是注册表里的 display_name（slug）。
-    `run_id` 不属于令牌：它来自 DSH 进程注入的 `X-Flux-Run-Id` 头，由 MCP 层校验该 Run
+    `run_id` 不属于令牌：它来自 Agent 进程注入的 `X-Flux-Run-Id` 头，由 MCP 层校验该 Run
     归属本身份后才附加（见 `server.mcp_endpoint`）——用于把 Agent 派生的终端会话绑到 Run 上，
     Run 终态时据此回收，避免终端命令进程泄漏。
     """
@@ -96,7 +96,7 @@ class AgentIdentity:
     name: str = ""
     run_id: str | None = None
     #: 本次 Run 的权限模式（plan / normal / full），由 MCP 层从 agent_runs 快照读取后附加。
-    #: 不在令牌里：DSH 内置 Agent 用长期令牌，能力位是写死的超集，只能按 Run 判定模式。
+    #: 不在令牌里：Agent 用长期令牌，能力位是写死的超集，只能按 Run 判定模式。
     permission_mode: str = "normal"
     #: Bot 级执行白名单（来自 Bot 配置）：None = 不额外限制。
     #: 由 MCP 层按 run → task → bot 解析后附加，仅约束本次 Run。

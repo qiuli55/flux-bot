@@ -176,7 +176,7 @@ def _task_view(task: Task | None) -> dict[str, Any] | None:
 
 
 def _workspace_view(container: Any, settings: Settings) -> dict[str, Any]:
-    path = settings.workspace_root or settings.dsh_workspace
+    path = settings.workspace_root or settings.runtime_workspace
     branch: str | None = None
     # Git 信息是尽力而为：未配置工作区根或它根本不是仓库时，如实返回 null，不报错。
     if settings.workspace_root:

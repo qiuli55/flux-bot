@@ -261,10 +261,10 @@ async def _cmd_doctor(container: Container) -> tuple[dict[str, Any], int]:
 
     checks.append(
         _check(
-            "dsh",
+            "runtime",
             True,
             "info",
-            f"dsh_enabled={settings.dsh_enabled}",
+            f"default_runtime=claude-code runtime_home={settings.runtime_home}",
         )
     )
 

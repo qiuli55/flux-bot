@@ -17,23 +17,27 @@ from flux.config import Settings, get_settings
 from flux.connectors.base import ConnectorRegistry
 from flux.core.agent_runtime.adapters import build_default_adapters
 from flux.core.agent_runtime.codex_account import CodexAccountService
-from flux.core.agent_runtime.dsh_client import FluxDshClient
 from flux.core.agent_runtime.installation import InstallationRepository, InstallationService
 from flux.core.agent_runtime.manager import AgentManager
 from flux.core.agent_runtime.repository import AgentRepository
 from flux.core.agent_runtime.run_repository import AgentRunRepository
 from flux.core.agent_runtime.runtimes.service import TaskRunService
 from flux.core.agent_runtime.session_repository import TaskRuntimeSessionRepository
+from flux.core.agent_runtime.supervisor import RunSupervisor
 from flux.core.agent_runtime.trace import RunTraceRecorder
 from flux.core.agent_runtime.trace_repository import RunTraceRepository
 from flux.core.billing.service import BillingService
 from flux.core.bot.conversation import BotConversationService
 from flux.core.bot.service import BotService
+from flux.core.bot.subtasks import BotSubtaskService
 from flux.core.bot.webhook_triggers import WebhookTriggerService
 from flux.core.capability_import.repository import ImportedCapabilityRepository
 from flux.core.capability_import.scanners import AgentScanner
 from flux.core.capability_import.service import CapabilityImportService
+from flux.core.channels.dingtalk_bot import DingTalkBotChannel
 from flux.core.channels.feishu_bot import FeishuBotChannel
+from flux.core.channels.outbound_drafts import OutboundDraftService
+from flux.core.channels.wecom_bot import WeComBotChannel
 from flux.core.code_intelligence.service import CodeIntelligenceService
 from flux.core.connectors.email import EmailConnectorService
 from flux.core.connectors.framework import ConnectorFrameworkService, build_default_catalog
@@ -76,12 +80,16 @@ from flux.core.memory.shared_user import SharedUserMemoryService
 from flux.core.memory.shared_user_repository import SharedUserMemoryRepository
 from flux.core.model_gateway.providers.registry import build_providers
 from flux.core.model_gateway.router import ModelRouter
+from flux.core.pages.repository import ArtifactPageRepository
+from flux.core.pages.service import ArtifactPageService
 from flux.core.permission_engine.policy import PermissionPolicy
 from flux.core.project_brain.refresh import BrainRefresher
 from flux.core.project_brain.repository import ProjectBrainRepository
 from flux.core.project_brain.service import ProjectBrain
 from flux.core.project_files.explorer import WorkspaceFileExplorer
 from flux.core.project_scanner.scanner import ProjectScanner
+from flux.core.skills.repository import SkillLibraryRepository
+from flux.core.skills.service import SkillLibraryService
 from flux.core.supervisor import (
     FeishuChannel,
     FeishuWebhook,
@@ -104,14 +112,15 @@ from flux.core.supervisor import (
 from flux.core.task_engine.agent_switch import AgentSwitchService
 from flux.core.task_engine.assistant import TaskAssistant
 from flux.core.task_engine.conversation_summary import ConversationSummarizer
-from flux.core.task_engine.dsh_bridge import AUTO_RETRY_FOLLOWUP, TaskRunBridge
 from flux.core.task_engine.memory_repository import TaskMemoryRepository
 from flux.core.task_engine.repository import TaskRepository
+from flux.core.task_engine.run_bridge import AUTO_RETRY_FOLLOWUP, TaskRunBridge
 from flux.core.task_engine.scheduler import TaskScheduler
 from flux.core.task_engine.stream import TaskStreamHub, TaskStreamRelay
 from flux.core.terminal.pty_service import HumanPtyService
 from flux.core.terminal.repository import TerminalRepository
 from flux.core.terminal.service import TerminalService
+from flux.core.vault.service import VaultService
 from flux.core.virtual_workspace.apply_engine import ApplyEngine
 from flux.core.virtual_workspace.batch_repository import ApplyBatchRepository
 from flux.core.virtual_workspace.repository import ProposalRepository
@@ -150,6 +159,8 @@ class Container:
     memory: MemoryService = field(init=False)
     task_repo: TaskRepository = field(init=False)
     key_vault: KeyVaultService = field(init=False)
+    #: 用户保险库（站点登录 / 支付卡 / 联系人），密文复用密钥库同一把主密钥
+    vault: VaultService = field(init=False)
     #: 外部连接器（GitHub）：按本地账号隔离的 OAuth 连接 + 只读 REST 工具
     github: GitHubConnectorService = field(init=False)
     #: 用户账号连接器框架（catalog / install / uninstall）；与 Agent 执行侧注册表分离
@@ -175,9 +186,15 @@ class Container:
     #: 跨 Bot 共享的用户记忆：画像（只由用户侧 API 写）+ 去重日志（只追加）
     shared_user_memory_repo: SharedUserMemoryRepository = field(init=False)
     shared_user_memory: SharedUserMemoryService = field(init=False)
+    #: 制品页面：Bot 产出的可分享静态内容，版本只追加，公开面按 share_token 读取
+    pages: ArtifactPageService = field(init=False)
+    #: 技能库：库内技能包 CRUD + 每 Bot 分配；对话时把正文注入 context
+    skill_library_repo: SkillLibraryRepository = field(init=False)
+    skills: SkillLibraryService = field(init=False)
     proposal_repo: ProposalRepository = field(init=False)
     batch_repo: ApplyBatchRepository = field(init=False)
-    dsh: FluxDshClient = field(init=False)
+    #: Run 生命周期看护（所有 Agent runtime 共用：Claude Code / Codex / OpenCode）
+    run_supervisor: RunSupervisor = field(init=False)
     agent_tokens: AgentTokenService = field(init=False)
     agent_repo: AgentRepository = field(init=False)
     run_repo: AgentRunRepository = field(init=False)
@@ -195,8 +212,14 @@ class Container:
     webhook_triggers: WebhookTriggerService = field(init=False)
     #: Bot 对话轮次：持久化 turn + 每 Bot 串行后台队列（legacy 对话也复用其助理逻辑）
     bot_conversation: BotConversationService = field(init=False)
+    #: 统一出站草稿：正文与状态落库，审批通过后原子认领并发送一次
+    outbound_drafts: OutboundDraftService = field(init=False)
     #: 正式飞书频道：加密回调入站建 turn，出站回复必须经审批卡放行
     feishu_bot: FeishuBotChannel = field(init=False)
+    #: 正式钉钉频道：HTTP 事件订阅入站建 turn，出站回复同样必须经审批卡放行
+    dingtalk_bot: DingTalkBotChannel = field(init=False)
+    #: 正式企业微信频道：加密回调入站建 turn，出站回复必须经审批卡放行
+    wecom_bot: WeComBotChannel = field(init=False)
     # IDE 行内补全（AI_COMPLETION_SPEC）：偏好/当前 Agent 落盘 + 模型解析 + 流式生成
     completion_prefs: CompletionPrefsStore = field(init=False)
     completion_resolver: CompletionModelResolver = field(init=False)
@@ -245,6 +268,9 @@ class Container:
         self.task_repo = TaskRepository(self.session_factory)  # type: ignore[attr-defined]
         # 密钥库：Agent 模型通道的 API Key（加密落库），与任务级 model / api_key_id 配合解析
         self.key_vault = KeyVaultService(self.session_factory, self.settings)  # type: ignore[attr-defined]
+        # 用户保险库：登录密码 / 卡号 / CVV 与模型密钥共用同一把主密钥；
+        # 写入入口只有用户侧 REST API（不注册 MCP / Agent 写工具）。
+        self.vault = VaultService(self.session_factory, self.key_vault)  # type: ignore[attr-defined]
         # 外部连接器：令牌复用同一把密钥库主密钥加密，按本地账号隔离
         self.github = GitHubConnectorService(
             self.session_factory,  # type: ignore[attr-defined]
@@ -316,6 +342,11 @@ class Container:
             self.session_factory  # type: ignore[attr-defined]
         )
         self.shared_user_memory = SharedUserMemoryService(self.shared_user_memory_repo)
+        # 制品页面：管理面走 REST，公开面只按不可猜测的 share_token 读取 published
+        self.pages = ArtifactPageService(ArtifactPageRepository(self.session_factory))  # type: ignore[attr-defined]
+        # 技能库：正文存库、按 Bot 分配，对话轮次只做 context 注入（不经过 agent_runtime）
+        self.skill_library_repo = SkillLibraryRepository(self.session_factory)  # type: ignore[attr-defined]
+        self.skills = SkillLibraryService(self.skill_library_repo)
         self.groups = GroupOrchestrator(
             self.group_repo,
             self.task_repo,
@@ -419,7 +450,7 @@ class Container:
         )
         # MCP 能力面的鉴权（目标架构 §3.2）：令牌是 agent 进入平台的唯一凭据，
         # 与权限策略同源——工具要求的 Capability 直接取自 flux.enums.Capability。
-        # 先于 DSH 装配：DSH 起 Run 时要拿内置 Agent 的令牌注入 MCP patch（P0-01）。
+        # 先于 Agent Run 装配：起 Run 时要拿内置 Agent 的令牌注入 MCP 配置（P0-01）。
         # P3-16：令牌只引用 Agent Registry 的 canonical UUID，故注入注册表做校验与解析。
         self.agent_tokens = AgentTokenService(self.session_factory, self.agents)  # type: ignore[attr-defined]
         # Run 权威状态落 agent_runs 表（P2-15）：多实例共享同库时用 owner_pid 区分归属
@@ -433,15 +464,14 @@ class Container:
         self.runtime_sessions = TaskRuntimeSessionRepository(
             self.session_factory  # type: ignore[attr-defined]
         )
-        # DSH Agent Runtime（集成方案 §18 Phase 1）：内置 agent 的接入层，
-        # 未启用（FLUX_DSH_ENABLED=false）时调用 ensure_ready() 才报错，装配本身无副作用。
-        self.dsh = FluxDshClient(
-            self.settings,
+        # Run 权威状态机：状态流转、超时、进程树清理、对账与重启恢复都在这里，
+        # 所有 Agent runtime（Claude Code / Codex / OpenCode）共用同一个实例。
+        self.run_supervisor = RunSupervisor(
+            settings=self.settings,
+            repository=self.run_repo,
             bus=self.bus,
-            token_service=self.agent_tokens,
-            run_repository=self.run_repo,
         )
-        # DSH Run 终态 → 任务状态（P0-05）：订阅事件总线，Run 结束即回写所属任务。
+        # Run 终态 → 任务状态（P0-05）：订阅事件总线，Run 结束即回写所属任务。
         # 同时把任务级对账挂上看护器的对账循环：事件在崩溃时会丢，running 任务需要兜底收尾
         # （P2-04 / TC-502），Run 状态先对完再让下游据真实状态判断。
         self.task_runs = TaskRunBridge(
@@ -455,7 +485,7 @@ class Container:
             memory=self.task_memory,
         )
         self.task_runs.attach(self.bus)
-        # DSH / CLI 的运行事件 → 任务流：前端订阅 SSE 就能看到 Agent 正在干什么
+        # Runtime 的运行事件 → 任务流：前端订阅 SSE 就能看到 Agent 正在干什么
         # 同时把增量合并成执行轨迹，Run 终态落库（任务详情的思考过程与命令输出靠它回看）
         TaskStreamRelay(self.task_stream, self.run_trace).attach(self.bus)
         # 上下文闭环：提案 applied 后刷新项目 Brain 快照（同项目节流，失败不阻塞 Apply）
@@ -466,7 +496,7 @@ class Container:
             bus=self.bus,
         )
         self.brain_refresher.attach()
-        self.dsh.supervisor.add_reconcile_hook(self.task_runs.reconcile_orphan_tasks)
+        self.run_supervisor.add_reconcile_hook(self.task_runs.reconcile_orphan_tasks)
         # MCP 工具调用成功 = 一次有效进展（P2-15 §2.4）：接线到看护器，避免 idle timeout 误杀
         self.bus.subscribe(Events.MCP_TOOL_CALLED, self._on_mcp_tool_called)
         # Run 落终态 → 回收该 Run 经 terminal.execute 派生的终端会话/命令进程（FINDING-1）：
@@ -481,7 +511,7 @@ class Container:
         ):
             self.bus.subscribe(_terminal_event, self._on_run_terminal)
         # P2-1 §6.2：任务「开始执行」的编排收口——按 agent.config["runtime"] 分发
-        # dsh / codex / opencode。CLI runtime 复用同一个 RunSupervisor 与令牌服务，不新建生命周期。
+        # claude-code / codex / opencode。所有 runtime 复用同一个 RunSupervisor 与令牌服务。
         # ChatGPT 账号登录态由它提供：codex Run 会把 auth.json 注入隔离 CODEX_HOME。
         self.codex_account = CodexAccountService(self.settings)
         # 计费账本与额度闸门：CLI runtime 的每一步用量都落到这里；先于 TaskRunService
@@ -502,6 +532,11 @@ class Container:
         self.webhook_triggers = WebhookTriggerService(self)
         # Bot 对话：一轮落一条 bot_turns，后台按 Bot 串行调用同一个助手逻辑。
         self.bot_conversation = BotConversationService(self)
+        # 统一出站草稿：飞书等频道把待发送正文落库，审批结果只做状态迁移。
+        self.outbound_drafts = OutboundDraftService(self.session_factory)  # type: ignore[attr-defined]
+        # Bot 后台子任务：独立于对话轮次跑的 tasks 行，结果以 kind=subtask 消息回到父对话。
+        # 它不碰 last_task_id / chat_task_id，也不参与开工忙闲锁。
+        self.bot_subtasks = BotSubtaskService(self)
         # 正式飞书频道：入站回调建 turn；出站草稿走审批卡，用户点「允许」后才发送。
         # 监听器只处理 kind=feishu_outbound 的审批结果，与既有审批闸门共存。
         self.feishu_bot = FeishuBotChannel(
@@ -514,6 +549,30 @@ class Container:
             bot_id=self.settings.feishu_bot_id,
         )
         self.bus.subscribe(Events.APPROVAL_RESOLVED, self.feishu_bot.on_approval_resolved)
+        # 正式钉钉频道：HTTP 事件订阅验签/解密后建 turn；出站同样只挂审批卡。
+        # kind=dingtalk_outbound 与飞书监听器互不干扰，两个订阅并存。
+        self.dingtalk_bot = DingTalkBotChannel(
+            self,
+            app_key=self.settings.dingtalk_app_key,
+            app_secret=self.settings.dingtalk_app_secret,
+            token=self.settings.dingtalk_token,
+            aes_key=self.settings.dingtalk_aes_key,
+            api_base=self.settings.dingtalk_api_base,
+            bot_id=self.settings.dingtalk_bot_id,
+        )
+        self.bus.subscribe(Events.APPROVAL_RESOLVED, self.dingtalk_bot.on_approval_resolved)
+        # 正式企业微信频道：与飞书并列订阅审批结果，只处理 kind=wecom_outbound。
+        self.wecom_bot = WeComBotChannel(
+            self,
+            corp_id=self.settings.wecom_corp_id,
+            agent_id=self.settings.wecom_agent_id,
+            secret=self.settings.wecom_secret,
+            token=self.settings.wecom_token,
+            encoding_aes_key=self.settings.wecom_encoding_aes_key,
+            api_base=self.settings.wecom_api_base,
+            bot_id=self.settings.wecom_bot_id,
+        )
+        self.bus.subscribe(Events.APPROVAL_RESOLVED, self.wecom_bot.on_approval_resolved)
         # 上游瞬时故障（429 / ReadTimeout）自动续跑一轮：事件桥只做判定与冷却，
         # 真正重新起 Run 交给 TaskRunService（沿用任务自己的 Agent / 模型 / 权限模式）。
         self.task_runs.set_retry_handler(self._auto_retry_task)
@@ -561,7 +620,7 @@ class Container:
             self.task_repo,
             self.task_run_service,
             self.agents,
-            dsh=self.dsh,
+            supervisor=self.run_supervisor,
         )
         self.supervisor_orchestrator = SupervisorOrchestrator(
             self.supervisor_repo,
@@ -677,7 +736,7 @@ class Container:
             return
         agent_id = payload.get("agent_id")
         if isinstance(agent_id, str):
-            await self.dsh.supervisor.note_mcp_activity(agent_id)
+            await self.run_supervisor.note_mcp_activity(agent_id)
 
     async def _on_run_terminal(self, _event: str, payload: dict[str, object]) -> None:
         """Run 落终态后，回收它名下派生的终端会话与命令进程（FINDING-1 防泄漏）。"""
@@ -700,8 +759,14 @@ class Container:
         # 正式飞书频道先收摊：取消仍在等 turn 的后台任务并关发送端连接池，
         # 避免 Bot 对话 worker 停掉时它们又去挂新的出站审批。
         await self.feishu_bot.aclose()
+        # 钉钉频道同理：先停跟踪任务与发送端，再停对话 worker。
+        await self.dingtalk_bot.aclose()
+        # 企业微信频道同理：先取消等待中的 turn 跟踪并关发送端连接池。
+        await self.wecom_bot.aclose()
         # Bot 对话 worker 先停：它要写 bot_turns / task_messages，不能跑在 dispose 之后。
         await self.bot_conversation.shutdown()
+        # 后台子任务同样会写 task_messages / tasks；取消并等待，避免退出时挂住。
+        await self.bot_subtasks.shutdown()
         # 退出时先停看护循环并清理仍在跑的 Agent 进程树，再释放连接（P2-15 §2.5）
         await self.human_pty.shutdown()
         await self.terminal.shutdown(close_sessions=close_terminal_sessions)
@@ -717,7 +782,8 @@ class Container:
             await channel.aclose()
         # 知识库 embedding 客户端同样持有连接池（未启用时是空操作）
         await self.knowledge_embedder.aclose()
-        await self.dsh.shutdown()
+        await self.run_supervisor.stop_background()
+        await self.run_supervisor.kill_active_processes()
         await self.engine.dispose()
 
 

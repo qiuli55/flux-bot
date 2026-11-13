@@ -349,7 +349,7 @@ def _event_payload(body: dict[str, Any], event_type: str) -> dict[str, Any]:
     if kind == "tool":
         fields = _tool_payload(body, part, item)
         # 连工具名都没有的空中间态不单独成卡；但带 call_id 的收尾事件必须放行，
-        # 否则轨迹里的命令永远停在「运行中」（DSH 的 tool/result 不带名称与参数）
+        # 否则轨迹里的命令永远停在「运行中」（部分 runtime 的 tool/result 不带名称与参数）
         if (
             not fields["name"]
             and not fields["detail"]

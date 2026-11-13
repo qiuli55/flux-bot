@@ -791,6 +791,8 @@ class BotService:
         if jobs:
             # return_exceptions：单个派发失败不能挡住其余协程收尾，也不能让 stop() 本身失败
             await asyncio.gather(*jobs, return_exceptions=True)
+        # 子任务与调度/事件派发共用同一个停机时机：先取消并等待它们写库结束。
+        await self._container.bot_subtasks.shutdown()
         task, self._task = self._task, None
         if task is None:
             return
@@ -868,11 +870,11 @@ class BotService:
             logger.warning("Bot %s 失败通知写入失败", bot.id, exc_info=True)
 
     def workspace_path(self, bot: Bot) -> Path:
-        """Bot 的执行目录：配置的绝对路径，或 `<dsh_home>/bots/<id>/workspace`。"""
+        """Bot 的执行目录：配置的绝对路径，或 `<runtime_home>/bots/<id>/workspace`。"""
         if bot.workspace:
             return Path(bot.workspace).expanduser()
-        dsh_home = Path(self._container.settings.dsh_home).expanduser()
-        return dsh_home / "bots" / str(bot.id) / "workspace"
+        runtime_home = Path(self._container.settings.runtime_home).expanduser()
+        return runtime_home / "bots" / str(bot.id) / "workspace"
 
     async def _launch_if_idle(
         self,
@@ -1206,12 +1208,7 @@ class BotService:
         model: str | None,
         key_id: str | None,
     ) -> tuple[str | None, uuid.UUID | None]:
-        """与建任务同一套模型/密钥校验；Agent 决定 runtime 原生模型目录。"""
-        runtime = DEFAULT_RUNTIME
-        if agent_id is not None:
-            with contextlib.suppress(Exception):
-                agent = self._container.agents.get(agent_id)
-                runtime = str(getattr(getattr(agent, "spec", None), "runtime", DEFAULT_RUNTIME))
+        """与建任务同一套模型/密钥校验；Bot 固定跑 Claude Code 底座。"""
         return await self._container.key_vault.resolve_selection(
-            runtime=runtime, model=model or "", key_id=key_id or None
+            runtime=DEFAULT_RUNTIME, model=model or "", key_id=key_id or None
         )

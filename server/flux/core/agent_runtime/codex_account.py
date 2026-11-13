@@ -1,6 +1,7 @@
 """ChatGPT 账号（Codex 订阅通道）的登录态管理。
 
-背景：Flux 每次 codex Run 都用隔离的 `CODEX_HOME`（`<FLUX_DSH_HOME>/runs/<run_id>/codex-home`），
+背景：Flux 每次 codex Run 都用隔离的 `CODEX_HOME`
+（`<FLUX_RUNTIME_HOME>/runs/<run_id>/codex-home`），
 里面只有 Flux 生成的 config.toml。隔离目录没有 `auth.json`，codex 在 Run 里就判定「未登录」，
 ChatGPT 订阅额度因此用不上。本模块把账号登录态收在 Flux 自己的账号目录
 （默认 `~/.flux/codex-account`），Run 时只复制 `auth.json` 过去，不碰用户的全局 `~/.codex`。

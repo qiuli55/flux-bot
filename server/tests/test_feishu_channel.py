@@ -377,7 +377,17 @@ def test_inbound_creates_turn_but_never_sends_automatically(
 
         # 回复只以草稿形式存在：审批完成前绝不调用发送接口
         assert context["sender"].messages == []
-        assert len(container.feishu_bot.drafts) == 1
+        drafts = client.get(
+            f"{PREFIX}/outbound-drafts",
+            params={"channel": "feishu", "status": "pending"},
+        ).json()["data"]
+        assert len(drafts) == 1
+        assert drafts[0]["id"] == pending["meta"]["draft_id"]
+        assert drafts[0]["body"] == "echo: 你好"
+        assert drafts[0]["dest"] == {"chat_id": CHAT_ID, "message_id": MESSAGE_ID}
+        assert drafts[0]["decision_id"] == pending["id"]
+        # 草稿详情来自数据库，而不是进程内表
+        assert container.outbound_drafts is not None
 
 
 def test_allow_sends_once_and_deny_does_not_send(settings: Settings, db_schema: None) -> None:
@@ -385,6 +395,7 @@ def test_allow_sends_once_and_deny_does_not_send(settings: Settings, db_schema: 
         assert client.post(WEBHOOK, json=_plain_body()).status_code == 200
         bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
         pending = _wait_pending_decision(client, bot["chat_task_id"])
+        draft_id = pending["meta"]["draft_id"]
 
         denied = client.post(
             f"{PREFIX}/tasks/{bot['chat_task_id']}/decisions/choose",
@@ -392,12 +403,18 @@ def test_allow_sends_once_and_deny_does_not_send(settings: Settings, db_schema: 
         )
         assert denied.status_code == 200, denied.text
         assert context["sender"].messages == []
+        # 拒绝只改状态，不发送；正文仍可从草稿接口读到
+        draft = client.get(f"{PREFIX}/outbound-drafts/{draft_id}").json()["data"]
+        assert draft["status"] == "denied"
+        assert draft["body"] == "echo: 你好"
+        assert draft["sent_at"] is None
 
     # 第二条消息走「允许」：只发送一次
     with _callback_client(settings) as (client, _container, context):
         assert client.post(WEBHOOK, json=_plain_body(message_id="om_allow")).status_code == 200
         bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
         pending = _wait_pending_decision(client, bot["chat_task_id"])
+        draft_id = pending["meta"]["draft_id"]
 
         allowed = client.post(
             f"{PREFIX}/tasks/{bot['chat_task_id']}/decisions/choose",
@@ -405,14 +422,35 @@ def test_allow_sends_once_and_deny_does_not_send(settings: Settings, db_schema: 
         )
         assert allowed.status_code == 200, allowed.text
         assert context["sender"].messages == [(CHAT_ID, "echo: 你好")]
+        sent = client.get(f"{PREFIX}/outbound-drafts/{draft_id}").json()["data"]
+        assert sent["status"] == "sent"
+        assert sent["sent_at"] is not None
+        assert sent["decision_id"] == pending["id"]
 
-        # 同一条决策不能再次放行；草稿已经取走，绝不会重复发送
+        # 同一条决策不能再次放行；草稿已是终态，绝不会重复发送
         again = client.post(
             f"{PREFIX}/tasks/{bot['chat_task_id']}/decisions/choose",
             json={"decision_id": pending["id"], "action": "choose", "option": "允许"},
         )
         assert again.status_code == 409
         assert context["sender"].messages == [(CHAT_ID, "echo: 你好")]
+
+
+def test_feishu_pending_draft_survives_process_restart(settings: Settings, db_schema: None) -> None:
+    """草稿落库而不是留在进程内：换一个容器仍能读到同一条 pending 草稿。"""
+    with _callback_client(settings) as (client, _container, context):
+        assert client.post(WEBHOOK, json=_plain_body()).status_code == 200
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        pending = _wait_pending_decision(client, bot["chat_task_id"])
+        draft_id = pending["meta"]["draft_id"]
+        assert context["sender"].messages == []
+
+    # 同一 SQLite 文件上重新起一套 app / 容器
+    with _app(settings, feishu_verification_token=VERIFY_TOKEN) as (client, _container):
+        draft = client.get(f"{PREFIX}/outbound-drafts/{draft_id}").json()["data"]
+        assert draft["status"] == "pending"
+        assert draft["body"] == "echo: 你好"
+        assert draft["bot_id"] == context["bot"]["id"]
 
 
 def test_send_error_is_logged_and_does_not_break_decision(
@@ -424,6 +462,7 @@ def test_send_error_is_logged_and_does_not_break_decision(
         assert client.post(WEBHOOK, json=_plain_body()).status_code == 200
         bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
         pending = _wait_pending_decision(client, bot["chat_task_id"])
+        draft_id = pending["meta"]["draft_id"]
 
         response = client.post(
             f"{PREFIX}/tasks/{bot['chat_task_id']}/decisions/choose",
@@ -432,6 +471,12 @@ def test_send_error_is_logged_and_does_not_break_decision(
         # 发送失败不能让决策接口 500
         assert response.status_code == 200, response.text
         assert len(sender.messages) == 1
+        # 失败标 failed 但保留正文，且错误串不含正文
+        failed = client.get(f"{PREFIX}/outbound-drafts/{draft_id}").json()["data"]
+        assert failed["status"] == "failed"
+        assert failed["body"] == "echo: 你好"
+        assert failed["error"]
+        assert "echo: 你好" not in failed["error"]
 
 
 def test_plaintext_callback_replay_is_idempotent(settings: Settings, db_schema: None) -> None:

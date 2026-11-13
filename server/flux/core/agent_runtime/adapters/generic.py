@@ -133,7 +133,7 @@ class GenericCliAdapter(CliAgentAdapter):
         `bootstrap=True`（默认）时把 Flux Runtime Bootstrap 拼在指令前（收口方案 §8.2）：
         被 Flux 托管启动的 CLI Agent 需要知道自己在 Flux 里、改动要走 proposal，
         而不是把 workspace 直写当成完成路径。Runtime Identity 由调用方经
-        `build_runtime_env` 注入 `env`，与 DSH 侧同一份真源。
+        `build_runtime_env` 注入 `env`，与其它 runtime 同一份真源。
         """
         executable = self._path or self._executable
         prompt = compose_instruction(instruction, mode) if bootstrap else instruction
