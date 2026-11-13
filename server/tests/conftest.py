@@ -44,7 +44,7 @@ def python_script(path: str | Path) -> str:
 def settings(tmp_path) -> Settings:
     """测试用配置：SQLite 落临时目录，日志降到 WARNING，供应商用离线回显。
 
-    三个真实供应商的密钥显式传 None：pydantic-settings 的默认值仍是"读环境"，
+    所有真实供应商的密钥显式传 None：pydantic-settings 的默认值仍是"读环境"，
     开发机仓库根的 .env 一旦填了 FLUX_OPENAI_API_KEY 之类，就会让"未配置供应商"
     的断言变成"已配置"，测试结果随开发机环境漂移。显式钉死让用例与外部环境无关。
     """
@@ -66,6 +66,9 @@ def settings(tmp_path) -> Settings:
         knowledge_worker_enabled=False,
         # Bot 调度循环同理：后台按 next_run_at 自动开工会让任务状态随用例时序漂移
         bot_scheduler_enabled=False,
+        # Webhook 密钥显式置空：避免开发机 .env 里的真实密钥让 fail-closed 断言失真
+        routine_webhook_secret=None,
+        github_webhook_secret=None,
         knowledge_embedding_api_key=None,
         memory_prefs_file=str(tmp_path / "memory-prefs.json"),
         # 补全偏好同样落临时目录：不能读写开发机 ~/.flux/completion-prefs.json
@@ -75,6 +78,10 @@ def settings(tmp_path) -> Settings:
         openai_api_key=None,
         anthropic_api_key=None,
         deepseek_api_key=None,
+        qwen_api_key=None,
+        zhipu_api_key=None,
+        kimi_api_key=None,
+        doubao_api_key=None,
         default_provider="local",
         # 密钥库用固定主密钥：用例不读 ~/.flux，也不在开发机留下密钥文件
         key_vault_secret="flux-test-key-vault-secret",
@@ -82,6 +89,8 @@ def settings(tmp_path) -> Settings:
         # 同样显式钉死：开发机仓库根 .env 的鉴权令牌/工作区会让整批 REST 用例 401 或走错目录
         auth_token=None,
         desktop_control_token=None,
+        # 桌面入口测试不访问公网 desktop.json：默认置空，需要时用例注入 MockTransport
+        desktop_config_url="",
         workspace_root=None,
         # 不读开发机 ~/.flux 里的自定义套餐，避免扩展套餐影响内置断言
         billing_plans_file="",

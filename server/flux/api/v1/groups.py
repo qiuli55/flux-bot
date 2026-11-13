@@ -63,7 +63,7 @@ def _member_dict(member: ChatGroupMember, bot: Bot) -> dict[str, Any]:
         "role": member.role,
         "model": bot.model,
         "api_key_id": str(bot.api_key_id) if bot.api_key_id is not None else None,
-        "permission_mode": bot.permission_mode or "normal",
+        "permission_mode": bot.permission_mode or "unattended",
     }
 
 

@@ -21,6 +21,7 @@ async def health(container: Container = Depends(get_container)) -> dict[str, obj
             "status": "ok",
             "app": container.settings.app_name,
             "env": container.settings.env,
+            "timezone": container.settings.timezone,
         }
     )
 
@@ -33,6 +34,7 @@ async def ready(container: Container = Depends(get_container)) -> JSONResponse:
         "database": database_ok,
         "providers": [str(name) for name in container.router.available()],
         "agents": container.agents.count(),
+        "timezone": container.settings.timezone,
     }
     if not database_ok:
         return JSONResponse(

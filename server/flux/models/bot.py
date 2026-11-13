@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, Integer, String, Text, Uuid
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from flux.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -58,6 +58,12 @@ class Bot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     #: 5 段 cron（分 时 日 月 周）。留空 = 只手动触发。
     schedule: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: 定时与预算窗口使用的 IANA 时区；NULL = 继承 FLUX_TIMEZONE。
+    timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: 停机错过触发点时的处理策略：skip / skip_silent / catch_up。
+    missed_run_policy: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="skip", server_default="skip"
+    )
     #: 下一次自动开工时间；调度器按它取到期任务，落库保证重启不丢。
     next_run_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
@@ -65,6 +71,13 @@ class Bot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     #: 最近一次开工的任务；不设外键，任务被清理后 Bot 仍可查
     last_task_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    #: 与这个 Bot 的对话任务（懒创建，一轮对话共用一条 tasks 行）。
+    #: 它与 last_task_id 无关：后者是最近一次定时/手动开工，聊天不会推进调度记录。
+    chat_task_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("tasks.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     #: 最近一次已结算结果的任务。调度器每轮都会看到 last_task_id，
     #: 用它保证同一条终态任务只计入健康统计一次。
     last_settled_task_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -84,7 +97,7 @@ class Bot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     #: 自动暂停的原因；用户手动恢复时清空
     paused_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    #: 每日 token 预算（按 UTC 自然日）。NULL 或 0 = 不限制；
+    #: 每日 token 预算（按 FLUX_TIMEZONE 的自然日）。NULL 或 0 = 不限制；
     #: 已用量不落库，直接从 usage_records 按当日聚合（账本是唯一权威，天然幂等）。
     token_budget: Mapped[int | None] = mapped_column(Integer, nullable=True)
     #: 失败时是否主动通知用户（写 bot_notifications）
@@ -114,9 +127,12 @@ class Bot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "workspace": self.workspace,
             "status": self.status or "active",
             "schedule": self.schedule,
+            "timezone": self.timezone,
+            "missed_run_policy": self.missed_run_policy or "skip",
             "next_run_at": _iso(self.next_run_at),
             "last_run_at": _iso(self.last_run_at),
             "last_task_id": str(self.last_task_id) if self.last_task_id is not None else None,
+            "chat_task_id": (str(self.chat_task_id) if self.chat_task_id is not None else None),
             "last_settled_task_id": (
                 str(self.last_settled_task_id) if self.last_settled_task_id is not None else None
             ),

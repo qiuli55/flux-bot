@@ -17,12 +17,19 @@ redis==8.1.0
 httpx==0.28.1
 # Agent manifest（YAML）解析与校验
 PyYAML==6.0.3
+# IANA 时区数据库：python:*-slim 基础镜像可能不带系统 zoneinfo，
+# 缺失时 FLUX_TIMEZONE=Asia/Shanghai 等非 UTC 名称会在启动校验阶段失败。
+tzdata>=2024.1
 # 上下文原文库的存储层压缩（FLUX_CONTEXT_MECHANISM §3.5），完全无损。
 # 缺失时 flux.core.context.store 自动退到标准库 lzma（同样无损），故不是硬依赖。
 zstandard>=0.23
+# 飞书加密回调的 AES-256-CBC 解密；标准库没有 AES，故引入维护良好的 cryptography。
+cryptography==50.0.2
 
 # --- 测试与开发 ---
 pytest==9.1.1
 pytest-asyncio==1.4.0
+# CI 用 --timeout 防止单个用例挂死整条流水线（本地也用它兜住 doctor 之类的外部探针）
+pytest-timeout==2.4.0
 aiosqlite==0.22.1
 ruff==0.16.9

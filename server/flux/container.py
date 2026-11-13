@@ -27,11 +27,15 @@ from flux.core.agent_runtime.supervisor import RunSupervisor
 from flux.core.agent_runtime.trace import RunTraceRecorder
 from flux.core.agent_runtime.trace_repository import RunTraceRepository
 from flux.core.billing.service import BillingService
+from flux.core.bot.conversation import BotConversationService
 from flux.core.bot.service import BotService
+from flux.core.bot.webhook_triggers import WebhookTriggerService
 from flux.core.capability_import.repository import ImportedCapabilityRepository
 from flux.core.capability_import.scanners import AgentScanner
 from flux.core.capability_import.service import CapabilityImportService
+from flux.core.channels.feishu_bot import FeishuBotChannel
 from flux.core.code_intelligence.service import CodeIntelligenceService
+from flux.core.connectors.framework import ConnectorFrameworkService, build_default_catalog
 from flux.core.context.lifecycle import ContextLifecycle
 from flux.core.context.metrics import BackfillObserver
 from flux.core.context.redact import RedactionStore
@@ -39,6 +43,7 @@ from flux.core.context.repository import ContextStepRepository
 from flux.core.context.store import ContentStore
 from flux.core.context.trust import VerificationLedger
 from flux.core.desktop.service import DesktopService
+from flux.core.devices.service import DeviceService
 from flux.core.event.bus import EventBus, Events
 from flux.core.git_integration.client import GitClient
 from flux.core.git_integration.service import GitService
@@ -66,6 +71,8 @@ from flux.core.memory.bot_memory_service import BotMemoryService
 from flux.core.memory.prefs import MemoryPrefsStore
 from flux.core.memory.repository import MemoryRepository
 from flux.core.memory.service import MemoryService
+from flux.core.memory.shared_user import SharedUserMemoryService
+from flux.core.memory.shared_user_repository import SharedUserMemoryRepository
 from flux.core.model_gateway.providers.registry import build_providers
 from flux.core.model_gateway.router import ModelRouter
 from flux.core.permission_engine.policy import PermissionPolicy
@@ -118,6 +125,8 @@ class Container:
     bus: EventBus = field(default_factory=EventBus)
     policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     engine: AsyncEngine = field(init=False)
+    #: 手机设备配对码与长期设备令牌（鉴权依赖直接从这里取缓存）。
+    devices: DeviceService = field(init=False)
     agents: AgentManager = field(init=False)
     router: ModelRouter = field(init=False)
     scheduler: TaskScheduler = field(init=False)
@@ -142,6 +151,8 @@ class Container:
     key_vault: KeyVaultService = field(init=False)
     #: 外部连接器（GitHub）：按本地账号隔离的 OAuth 连接 + 只读 REST 工具
     github: GitHubConnectorService = field(init=False)
+    #: 用户账号连接器框架（catalog / install / uninstall）；与 Agent 执行侧注册表分离
+    connector_framework: ConnectorFrameworkService = field(init=False)
     #: Bot 桌面入口参数：公开隧道地址 + 环境变量里的凭据
     desktop: DesktopService = field(init=False)
     task_runs: TaskRunBridge = field(init=False)
@@ -158,6 +169,9 @@ class Container:
     #: Bot 自己的长期记忆（第一人称）：摘要层合并覆盖 + 全文 chunk 层只追加
     bot_memory_repo: BotMemoryRepository = field(init=False)
     bot_memories: BotMemoryService = field(init=False)
+    #: 跨 Bot 共享的用户记忆：画像（只由用户侧 API 写）+ 去重日志（只追加）
+    shared_user_memory_repo: SharedUserMemoryRepository = field(init=False)
+    shared_user_memory: SharedUserMemoryService = field(init=False)
     proposal_repo: ProposalRepository = field(init=False)
     batch_repo: ApplyBatchRepository = field(init=False)
     #: Run 生命周期看护（所有 Agent runtime 共用：Claude Code / Codex / OpenCode）
@@ -175,6 +189,12 @@ class Container:
     task_run_service: TaskRunService = field(init=False)
     #: Bot 模式：常驻 Bot 的生命周期编排与定时触发（对话模式不经过它）
     bots: BotService = field(init=False)
+    #: 外部例程触发：Webhook 验签 + GitHub 事件映射，验签后统一投递到事件总线
+    webhook_triggers: WebhookTriggerService = field(init=False)
+    #: Bot 对话轮次：持久化 turn + 每 Bot 串行后台队列（legacy 对话也复用其助理逻辑）
+    bot_conversation: BotConversationService = field(init=False)
+    #: 正式飞书频道：加密回调入站建 turn，出站回复必须经审批卡放行
+    feishu_bot: FeishuBotChannel = field(init=False)
     # IDE 行内补全（AI_COMPLETION_SPEC）：偏好/当前 Agent 落盘 + 模型解析 + 流式生成
     completion_prefs: CompletionPrefsStore = field(init=False)
     completion_resolver: CompletionModelResolver = field(init=False)
@@ -217,6 +237,7 @@ class Container:
     def __post_init__(self) -> None:
         self.engine = create_engine(self.settings.database_url)
         self.session_factory = create_session_factory(self.engine)  # type: ignore[attr-defined]
+        self.devices = DeviceService(self.session_factory, self.settings)  # type: ignore[attr-defined]
         #: 内建 CLI Agent Adapter 集合：installation 状态机与 P2-1 的 CLI runtime 共用同一批实例
         cli_adapters = build_default_adapters()
         self.task_repo = TaskRepository(self.session_factory)  # type: ignore[attr-defined]
@@ -227,6 +248,14 @@ class Container:
             self.session_factory,  # type: ignore[attr-defined]
             self.settings,
             self.key_vault,
+        )
+        # 账号侧连接器目录：当前只上架 GitHub；安装状态按 account_key 隔离。
+        # Agent 执行侧的 connector 注册表（self.connectors）保持独立，互不替换。
+        self.connector_framework = ConnectorFrameworkService(
+            self.session_factory,  # type: ignore[attr-defined]
+            self.key_vault,
+            build_default_catalog(self.settings),
+            github=self.github,
         )
         # Bot 桌面：只做公开隧道地址代读 + 凭据拼装，无状态
         self.desktop = DesktopService(self.settings)
@@ -272,6 +301,11 @@ class Container:
             self.bot_memory_repo,
             summarizer=self.conversation_summarizer,
         )
+        # 共享用户记忆：与 Bot 记忆并存，只作为所有 Bot 都能看到的账号级背景
+        self.shared_user_memory_repo = SharedUserMemoryRepository(
+            self.session_factory  # type: ignore[attr-defined]
+        )
+        self.shared_user_memory = SharedUserMemoryService(self.shared_user_memory_repo)
         self.groups = GroupOrchestrator(
             self.group_repo,
             self.task_repo,
@@ -453,6 +487,22 @@ class Container:
             self,
             interval_seconds=self.settings.bot_scheduler_interval_seconds,  # type: ignore[attr-defined]
         )
+        # 外部 Webhook：验签后走事件总线，与进程内事件共用同一条 Bot / 例程派发链路。
+        self.webhook_triggers = WebhookTriggerService(self)
+        # Bot 对话：一轮落一条 bot_turns，后台按 Bot 串行调用同一个助手逻辑。
+        self.bot_conversation = BotConversationService(self)
+        # 正式飞书频道：入站回调建 turn；出站草稿走审批卡，用户点「允许」后才发送。
+        # 监听器只处理 kind=feishu_outbound 的审批结果，与既有审批闸门共存。
+        self.feishu_bot = FeishuBotChannel(
+            self,
+            app_id=self.settings.feishu_app_id,
+            app_secret=self.settings.feishu_app_secret,
+            verification_token=self.settings.feishu_verification_token,
+            encrypt_key=self.settings.feishu_encrypt_key,
+            api_base=self.settings.feishu_api_base,
+            bot_id=self.settings.feishu_bot_id,
+        )
+        self.bus.subscribe(Events.APPROVAL_RESOLVED, self.feishu_bot.on_approval_resolved)
         # 上游瞬时故障（429 / ReadTimeout）自动续跑一轮：事件桥只做判定与冷却，
         # 真正重新起 Run 交给 TaskRunService（沿用任务自己的 Agent / 模型 / 权限模式）。
         self.task_runs.set_retry_handler(self._auto_retry_task)
@@ -635,10 +685,15 @@ class Container:
         except ValueError:
             return ModelProvider.LOCAL
 
-    async def dispose(self) -> None:
+    async def dispose(self, *, close_terminal_sessions: bool = True) -> None:
+        # 正式飞书频道先收摊：取消仍在等 turn 的后台任务并关发送端连接池，
+        # 避免 Bot 对话 worker 停掉时它们又去挂新的出站审批。
+        await self.feishu_bot.aclose()
+        # Bot 对话 worker 先停：它要写 bot_turns / task_messages，不能跑在 dispose 之后。
+        await self.bot_conversation.shutdown()
         # 退出时先停看护循环并清理仍在跑的 Agent 进程树，再释放连接（P2-15 §2.5）
         await self.human_pty.shutdown()
-        await self.terminal.shutdown()
+        await self.terminal.shutdown(close_sessions=close_terminal_sessions)
         await self.code_intel.shutdown()
         await self.completion.shutdown()
         # CLI runtime 的常驻进程（声明 reusable_process 的，如 opencode serve）不在

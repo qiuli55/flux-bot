@@ -13,11 +13,15 @@
 from __future__ import annotations
 
 import secrets
+import sqlite3
 import threading
 import uuid
 from collections.abc import Iterable
+from contextlib import closing
+from pathlib import Path
 
 from sqlalchemy import select, update
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -350,8 +354,54 @@ class KeyVaultService:
             ) from exc
         if not secure_file(path):
             logger.warning("密钥库主密钥文件权限弱化（未能收紧到仅属主可访问）path=%s", path)
+        if self._has_stored_secrets():
+            logger.warning(
+                "密钥库主密钥文件不存在，已自动生成新主密钥：%s。"
+                "警告：数据库中已有加密密钥，新主密钥与它们不匹配，现有密钥将无法解密！"
+                "丢失该文件会导致已存密钥永久不可用；请立即备份该文件，"
+                "或设置 FLUX_KEY_VAULT_SECRET 以避免依赖本机文件。",
+                path,
+            )
+        else:
+            logger.warning(
+                "密钥库主密钥文件不存在，已自动生成：%s。"
+                "丢失该文件会导致已存的 API Key / GitHub Token 无法解密；"
+                "强烈建议设置 FLUX_KEY_VAULT_SECRET 或立即备份该文件。",
+                path,
+            )
         logger.info("key_vault.master_key_created path=%s", path)
         return secret
+
+    def _has_stored_secrets(self) -> bool:
+        """尽力检查库里是否已有密文；SQLite 用只读连接同步查，其他库直接跳过。
+
+        只在自动生成主密钥时调用一次，属于廉价探测；表不存在或连接失败都按
+        「无法确认」处理，不阻断密钥生成本身。
+        """
+        try:
+            url = make_url(self._settings.database_url)
+            if url.get_backend_name() != "sqlite" or not url.database:
+                return False
+            db_path = Path(url.database)
+            if not db_path.is_file():
+                return False
+            with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+                for table, column in (
+                    ("api_keys", "key_ciphertext"),
+                    ("github_connections", "token_ciphertext"),
+                    ("connector_installations", "credential_ciphertext"),
+                ):
+                    try:
+                        row = conn.execute(
+                            f"SELECT 1 FROM {table} WHERE {column} IS NOT NULL LIMIT 1"
+                        ).fetchone()
+                    except sqlite3.Error:
+                        continue
+                    if row is not None:
+                        return True
+        except (sqlite3.Error, OSError, ValueError):
+            return False
+        return False
 
     def _seal(self, secret: str) -> bytes:
         return self._box_or_create().seal(secret.encode("utf-8"))

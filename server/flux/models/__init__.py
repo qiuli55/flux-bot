@@ -14,8 +14,11 @@ from flux.models.bot import Bot
 from flux.models.bot_memory import BotMemory, BotMemoryChunk
 from flux.models.bot_notification import BotNotification
 from flux.models.bot_routine import BotRoutine
+from flux.models.bot_turn import BotTurn
 from flux.models.connector import ConnectorConfig, ConnectorLog
+from flux.models.connector_installation import ConnectorInstallation
 from flux.models.context import ContextBlob, ContextStep, ContextStepToken
+from flux.models.device import Device, PairingCode
 from flux.models.github import GithubConnection
 from flux.models.group import (
     ChatGroup,
@@ -31,6 +34,7 @@ from flux.models.memory import MemoryEntry
 from flux.models.project import Project, ProjectMemory
 from flux.models.run_trace import RunTraceItem
 from flux.models.runtime_session import TaskRuntimeSession
+from flux.models.shared_user_memory import UserJournalEntry, UserProfileEntry
 from flux.models.supervisor import (
     SupervisorAssignment,
     SupervisorDigest,
@@ -69,6 +73,7 @@ __all__ = [
     "BotMemoryChunk",
     "BotNotification",
     "BotRoutine",
+    "BotTurn",
     "ChatGroup",
     "ChatGroupEpoch",
     "ChatGroupMember",
@@ -76,10 +81,12 @@ __all__ = [
     "ChatGroupMemory",
     "ChatGroupMessage",
     "ConnectorConfig",
+    "ConnectorInstallation",
     "ConnectorLog",
     "ContextBlob",
     "ContextStep",
     "ContextStepToken",
+    "Device",
     "GithubConnection",
     "ImportedCapability",
     "KnowledgeChunk",
@@ -89,6 +96,7 @@ __all__ = [
     "OrganizationMember",
     "Project",
     "ProjectMemory",
+    "PairingCode",
     "ProviderAccount",
     "RunTraceItem",
     "SupervisorAssignment",
@@ -113,6 +121,8 @@ __all__ = [
     "UsageRecord",
     "UsageSnapshot",
     "User",
+    "UserJournalEntry",
+    "UserProfileEntry",
     "VirtualChange",
     "WechatSession",
 ]

@@ -40,6 +40,13 @@ class AgentCreateRequest(BaseModel):
     runtime: Literal["claude-code", "codex", "opencode"] = "claude-code"
 
 
+class DevicePairRequest(BaseModel):
+    """手机用一次性配对码兑换设备令牌。"""
+
+    code: str = Field(min_length=1, max_length=32)
+    device_name: str = Field(default="", max_length=128)
+
+
 class AgentTokenIssueRequest(BaseModel):
     """为某个 Agent 签发一枚 MCP 接入令牌（目标架构 §3.2）。
 
@@ -103,9 +110,13 @@ class BotCreateRequest(BaseModel):
     #: 独立工作目录（绝对路径）；留空 = <runtime_home>/bots/<id>/workspace
     workspace: str | None = Field(default=None, max_length=512)
     schedule: str | None = Field(default=None, max_length=64)
+    #: 该 Bot 的 IANA 时区；留空 = 继承 FLUX_TIMEZONE
+    timezone: str | None = Field(default=None, max_length=64)
+    #: 错过触发点的处理策略：skip / skip_silent / catch_up
+    missed_run_policy: str | None = Field(default=None, max_length=16)
     #: 连续失败多少次自动暂停；0 = 永不自动暂停
     failure_threshold: int = Field(default=3, ge=0, le=20)
-    #: 每日 token 预算（UTC 自然日）；留空或 0 = 无上限
+    #: 每日 token 预算（按 FLUX_TIMEZONE 的自然日）；留空或 0 = 无上限
     token_budget: int | None = Field(default=None, ge=0, le=1_000_000_000)
     #: 开工失败时是否主动通知（写一条 bot_notifications）
     notify_on_failure: bool = True
@@ -137,6 +148,10 @@ class BotUpdateRequest(BaseModel):
     decision_mode: DecisionMode | None = None
     workspace: str | None = Field(default=None, max_length=512)
     schedule: str | None = Field(default=None, max_length=64)
+    #: 该 Bot 的 IANA 时区；显式传 null 表示继承 FLUX_TIMEZONE
+    timezone: str | None = Field(default=None, max_length=64)
+    #: 错过触发点的处理策略：skip / skip_silent / catch_up
+    missed_run_policy: str | None = Field(default=None, max_length=16)
     status: BotStatus | None = None
     failure_threshold: int | None = Field(default=None, ge=0, le=20)
     #: 每日 token 预算；显式传 null 表示改为无上限
@@ -158,6 +173,8 @@ class BotRoutineCreateRequest(BaseModel):
     #: 5 段 cron；留空 = 只手动触发
     schedule: str | None = Field(default=None, max_length=64)
     enabled: bool = True
+    #: 可触发本例程的事件名；留空 = 只按 cron 跑
+    event_triggers: list[str] | None = Field(default=None, max_length=32)
 
 
 class BotRoutineUpdateRequest(BaseModel):
@@ -167,6 +184,8 @@ class BotRoutineUpdateRequest(BaseModel):
     instruction: str | None = Field(default=None, max_length=8000)
     schedule: str | None = Field(default=None, max_length=64)
     enabled: bool | None = None
+    #: 显式传 null / [] 表示清空事件触发
+    event_triggers: list[str] | None = Field(default=None, max_length=32)
 
 
 class BotRunRequest(BaseModel):
@@ -184,6 +203,18 @@ class BotMemoryCreateRequest(BaseModel):
     content: str = Field(min_length=1, max_length=8000)
     kind: BotMemoryKind = BotMemoryKind.FACT
     relevance: BotMemoryRelevance = BotMemoryRelevance.DIRECT
+
+
+class BotTurnCreateRequest(BaseModel):
+    """给 Bot 发一条对话消息（异步轮次）。
+
+    HTTP 只落 queued 就返回；客户端用 GET /bots/{id}/turns/{turn_id} 长轮询结果。
+    `client_turn_id` 是幂等键：网络重试带同一个值不会产生第二轮。
+    """
+
+    content: str = Field(min_length=1, max_length=20_000)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=5)
+    client_turn_id: str | None = Field(default=None, max_length=128)
 
 
 class TaskMessageCreateRequest(BaseModel):
@@ -254,11 +285,25 @@ class TaskModelRequest(BaseModel):
     key_id: str | None = Field(default=None, max_length=64)
 
 
+#: 密钥库接受的供应商值。与 flux.core.agent_runtime.model_catalog.KEY_PROVIDERS 保持同步；
+#: openai_compatible 是通用逃生口，其余都是内置供应商（中国区四家为 2026-11-12 接入）。
+KeyProviderName = Literal[
+    "deepseek",
+    "openai",
+    "openai_compatible",
+    "anthropic",
+    "qwen",
+    "zhipu",
+    "kimi",
+    "doubao",
+]
+
+
 class ApiKeyCreateRequest(BaseModel):
     """在密钥库中登记一条 API Key。明文只在请求体里出现，落库即加密。"""
 
     name: str = Field(min_length=1, max_length=128)
-    provider: Literal["deepseek", "openai", "openai_compatible", "anthropic"]
+    provider: KeyProviderName
     base_url: str = Field(default="", max_length=256)
     api_key: str = Field(min_length=1, max_length=4096)
     models: list[str] = Field(default_factory=list)
@@ -271,7 +316,7 @@ class ApiKeyUpdateRequest(BaseModel):
     """修改密钥库条目；未出现的字段保持不变，api_key 留空也表示不改。"""
 
     name: str | None = Field(default=None, max_length=128)
-    provider: Literal["deepseek", "openai", "openai_compatible", "anthropic"] | None = None
+    provider: KeyProviderName | None = None
     base_url: str | None = Field(default=None, max_length=256)
     api_key: str | None = Field(default=None, max_length=4096)
     models: list[str] | None = None
@@ -491,6 +536,19 @@ class ConnectorExecuteRequest(BaseModel):
     parameters: dict[str, Any] = Field(default_factory=dict)
     # 权限由服务端按 agent_id 解析（见 api/v1/connectors.py），客户端无法自行声明能力
     agent_id: str | None = None
+
+
+class ConnectorInstallRequest(BaseModel):
+    """安装一个用户账号连接器。
+
+    - api_key 类连接器：必须提供 `api_key`；
+    - oauth 类连接器：本接口只做校验并提示改用对应登录流程（GitHub 为设备码登录）。
+    """
+
+    auth_type: str | None = Field(default=None, max_length=32)
+    api_key: str | None = Field(default=None, max_length=4096)
+    #: 不传时使用 catalog 定义里的默认 scopes。
+    scopes: list[str] | None = Field(default=None, max_length=64)
 
 
 class GitPathsRequest(BaseModel):

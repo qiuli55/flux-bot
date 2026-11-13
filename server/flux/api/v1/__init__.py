@@ -11,6 +11,8 @@ from flux.api.v1 import (
     connectors,
     deliveries,
     designs,
+    desktop,
+    devices,
     git,
     groups,
     health,
@@ -24,6 +26,7 @@ from flux.api.v1 import (
     tasks,
     terminal,
     uploads,
+    user_memory,
     workspace,
 )
 
@@ -35,6 +38,8 @@ api_v1_router.include_router(keys.router)
 api_v1_router.include_router(installations.router)
 api_v1_router.include_router(tasks.router)
 api_v1_router.include_router(bots.router)
+api_v1_router.include_router(desktop.router)
+api_v1_router.include_router(devices.router)
 api_v1_router.include_router(groups.router)
 api_v1_router.include_router(workspace.router)
 api_v1_router.include_router(terminal.router)
@@ -48,6 +53,7 @@ api_v1_router.include_router(capabilities.router)
 api_v1_router.include_router(designs.router)
 api_v1_router.include_router(deliveries.router)
 api_v1_router.include_router(uploads.router)
+api_v1_router.include_router(user_memory.router)
 api_v1_router.include_router(codex_account.router)
 api_v1_router.include_router(supervisor.router)
 

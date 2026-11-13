@@ -21,12 +21,15 @@ dependencies = [
     "zstandard>=0.23",
     # 读取用户 ~/.codex/config.toml 的 MCP 声明：3.11+ 用标准库 tomllib，3.10 需 tomli
     "tomli>=2.0; python_version < '3.11'",
+    # 飞书加密回调需要 AES-256-CBC；标准库没有 AES，用维护良好的 cryptography
+    "cryptography>=42",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=9.1",
     "pytest-asyncio>=1.4",
+    "pytest-timeout>=2.4",
     "aiosqlite>=0.22",
     "ruff>=0.16",
 ]

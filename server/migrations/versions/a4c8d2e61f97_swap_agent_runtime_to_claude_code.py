@@ -5,7 +5,7 @@ DSH 引擎已移除，Claude Code 成为唯一默认底座。旧库里 `agents.c
 覆盖所有存量 Bot（新老 Bot 共用同一批内置 Agent 档案）。
 
 Revision ID: a4c8d2e61f97
-Revises: c8e4a1f72b93
+Revises: f4b7e1c9a260
 Create Date: 2026-11-13 12:00:00.000000
 
 """
@@ -17,7 +17,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "a4c8d2e61f97"
-down_revision: str | Sequence[str] | None = "c8e4a1f72b93"
+down_revision: str | Sequence[str] | None = "f4b7e1c9a260"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

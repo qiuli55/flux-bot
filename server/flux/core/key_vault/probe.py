@@ -21,10 +21,12 @@ from flux.core.agent_runtime.runtimes.base import ModelChannel
 from flux.core.key_vault.service import KeyVaultService
 from flux.core.model_gateway.base import ChatMessage
 from flux.core.model_gateway.providers.anthropic import AnthropicProvider
-from flux.core.model_gateway.providers.deepseek import DeepSeekProvider
-from flux.core.model_gateway.providers.openai import OpenAIProvider
 from flux.core.model_gateway.providers.openai_compatible import OpenAICompatibleProvider
+from flux.core.model_gateway.providers.registry import OPENAI_COMPATIBLE_PROVIDERS
 from flux.errors import AIOSError
+from flux.logging import get_logger
+
+logger = get_logger(__name__)
 
 #: 探测用输出上限（原因见模块说明，不能小）
 PROBE_MAX_TOKENS = 512
@@ -71,17 +73,9 @@ def _build_provider(
             max_retries=0,
             client=client,
         )
-    if channel.provider == "openai":
-        return OpenAIProvider(
-            model,
-            api_key=channel.api_key,
-            base_url=channel.base_url,
-            timeout=timeout,
-            max_retries=0,
-            client=client,
-        )
-    if channel.provider == "deepseek":
-        return DeepSeekProvider(
+    provider_cls = OPENAI_COMPATIBLE_PROVIDERS.get(channel.provider)
+    if provider_cls is not None:
+        return provider_cls(
             model,
             api_key=channel.api_key,
             base_url=channel.base_url,
@@ -141,13 +135,31 @@ async def probe_channel(
         else:
             result["error"] = _FRIENDLY_ERRORS.get(exc.code, exc.message)
         result["detail"] = exc.message
+        logger.warning(
+            "key_vault.probe failed provider=%s model=%s code=%s status=%s",
+            channel.provider,
+            model,
+            result["error_code"],
+            status,
+        )
     except Exception as exc:  # noqa: BLE001 - 探测是管理面辅助动作，任何异常都只能折叠成结果
         result["error_code"] = "probe_failed"
         result["error"] = f"探测失败：{exc}"[:500]
         result["detail"] = str(exc)[:500]
+        logger.warning(
+            "key_vault.probe error provider=%s model=%s error=%s",
+            channel.provider,
+            model,
+            exc,
+        )
     else:
         result["ok"] = True
         result["reply"] = (reply.content or "").strip()[:200]
+        logger.info(
+            "key_vault.probe ok provider=%s model=%s",
+            channel.provider,
+            model,
+        )
     finally:
         if owned:
             await client.aclose()

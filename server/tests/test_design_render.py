@@ -18,8 +18,14 @@ from flux.core import design_render as render
 SPEC_PATH = Path(__file__).resolve().parents[2] / "doc" / "design-spec.json"
 
 
+def _require_doc(path: Path) -> None:
+    if not path.is_file():
+        pytest.skip(f"缺少设计契约夹具 {path}（该文件随上游 Flux 仓库提供，不在本 Bot 仓库）")
+
+
 @pytest.fixture(scope="module")
 def spec() -> dict[str, Any]:
+    _require_doc(SPEC_PATH)
     return json.loads(SPEC_PATH.read_text(encoding="utf-8"))
 
 
