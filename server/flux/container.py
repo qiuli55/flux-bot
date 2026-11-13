@@ -16,6 +16,7 @@ from flux.cloud.memory_sync import CloudMemorySync
 from flux.config import Settings, get_settings
 from flux.connectors.base import ConnectorRegistry
 from flux.core.agent_runtime.adapters import build_default_adapters
+from flux.core.agent_runtime.browser_status import BrowserStatusProbe
 from flux.core.agent_runtime.codex_account import CodexAccountService
 from flux.core.agent_runtime.installation import InstallationRepository, InstallationService
 from flux.core.agent_runtime.manager import AgentManager
@@ -34,6 +35,7 @@ from flux.core.bot.webhook_triggers import WebhookTriggerService
 from flux.core.capability_import.repository import ImportedCapabilityRepository
 from flux.core.capability_import.scanners import AgentScanner
 from flux.core.capability_import.service import CapabilityImportService
+from flux.core.channels.activity import ChannelActivityRegistry
 from flux.core.channels.dingtalk_bot import DingTalkBotChannel
 from flux.core.channels.feishu_bot import FeishuBotChannel
 from flux.core.channels.outbound_drafts import OutboundDraftService
@@ -222,6 +224,10 @@ class Container:
     bot_conversation: BotConversationService = field(init=False)
     #: 统一出站草稿：正文与状态落库，审批通过后原子认领并发送一次
     outbound_drafts: OutboundDraftService = field(init=False)
+    #: 频道入站活动（最近接收 / 近期错误）：进程内登记，重启清空
+    channel_activity: ChannelActivityRegistry = field(init=False)
+    #: 浏览器 MCP 探活（2 秒超时 + 30 秒缓存）：进程内单例，避免状态轮询打爆 sidecar
+    browser_probe: BrowserStatusProbe = field(init=False)
     #: 正式飞书频道：加密回调入站建 turn，出站回复必须经审批卡放行
     feishu_bot: FeishuBotChannel = field(init=False)
     #: 正式钉钉频道：HTTP 事件订阅入站建 turn，出站回复同样必须经审批卡放行
@@ -555,6 +561,9 @@ class Container:
         self.bot_conversation = BotConversationService(self)
         # 统一出站草稿：飞书等频道把待发送正文落库，审批结果只做状态迁移。
         self.outbound_drafts = OutboundDraftService(self.session_factory)  # type: ignore[attr-defined]
+        # 入站活动与浏览器探活都是进程内状态：不落库、重启清空，只服务状态接口。
+        self.channel_activity = ChannelActivityRegistry()
+        self.browser_probe = BrowserStatusProbe()
         # Bot 后台子任务：独立于对话轮次跑的 tasks 行，结果以 kind=subtask 消息回到父对话。
         # 它不碰 last_task_id / chat_task_id，也不参与开工忙闲锁。
         self.bot_subtasks = BotSubtaskService(self)

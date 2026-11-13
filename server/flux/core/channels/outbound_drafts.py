@@ -15,7 +15,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from flux.enums import OutboundDraftStatus
@@ -139,6 +139,33 @@ class OutboundDraftService:
         if status:
             statement = statement.where(OutboundDraft.status == status)
         statement = statement.order_by(OutboundDraft.created_at.desc()).limit(limit)
+        async with self._session_factory() as session:
+            rows = await session.scalars(statement)
+            return list(rows)
+
+    async def latest_sent_at(self, channel: str) -> datetime | None:
+        """该频道最近一次成功发送的时间；从未发送返回 None。
+
+        走 `sent_at` 而不是 `created_at`：草稿可能先创建、隔一段时间才被批准发送。
+        """
+        statement = select(func.max(OutboundDraft.sent_at)).where(
+            OutboundDraft.channel == channel,
+            OutboundDraft.status == OutboundDraftStatus.SENT.value,
+        )
+        async with self._session_factory() as session:
+            return await session.scalar(statement)
+
+    async def recent_failures(self, channel: str, *, limit: int = 5) -> list[OutboundDraft]:
+        """该频道最近的发送失败草稿，最新在前（只读，供状态接口使用）。"""
+        statement = (
+            select(OutboundDraft)
+            .where(
+                OutboundDraft.channel == channel,
+                OutboundDraft.status == OutboundDraftStatus.FAILED.value,
+            )
+            .order_by(OutboundDraft.resolved_at.desc(), OutboundDraft.created_at.desc())
+            .limit(max(0, limit))
+        )
         async with self._session_factory() as session:
             rows = await session.scalars(statement)
             return list(rows)

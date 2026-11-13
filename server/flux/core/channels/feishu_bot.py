@@ -289,11 +289,17 @@ class FeishuBotChannel:
                 message_id,
                 exc.code,
             )
+            activity = getattr(self._container, "channel_activity", None)
+            if activity is not None:
+                activity.record_error("feishu", exc.code, exc.message)
             return FeishuCallbackResult(
                 exc.http_status,
                 {"error": exc.message, "code": exc.code},
             )
 
+        activity = getattr(self._container, "channel_activity", None)
+        if activity is not None:
+            activity.record_receive("feishu")
         if created:
             self._schedule_tracking(bot=bot, turn=turn, chat_id=chat_id, message_id=message_id)
         logger.info(
