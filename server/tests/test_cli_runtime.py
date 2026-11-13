@@ -424,6 +424,63 @@ for line in sys.stdin:
 """
 
 
+#: 仿 Claude Code `--output-format stream-json --include-partial-messages`（2.1.323 实测形态）：
+#: 正文增量（text_delta）→ assistant 回放整段文本 → result 收口。
+#: MODE=whitespace：增量带前导空格与纯空白帧，result 与回放都是完整正文。
+#: MODE=tool：两段正文中间夹一次工具调用，验证多 assistant 消息不重复。
+#: MODE=noresult：没有 result 事件，验证只靠增量 + assistant 回放时的去重兜底。
+_FAKE_CLAUDE_SCRIPT_TEMPLATE = """#!/usr/bin/env python3
+import json
+import os
+import sys
+
+MODE = "__MODE__"
+ARGV_FILE = os.environ.get("FAKE_CLAUDE_ARGV_FILE")
+if ARGV_FILE:
+    with open(ARGV_FILE, "w", encoding="utf-8") as fh:
+        json.dump(sys.argv[1:], fh, ensure_ascii=False)
+
+FULL = "✅ 1. 杭州\\n\\n✅ 2. 西湖"
+PREAMBLE = "先看一下现有文件。"
+
+def send(payload):
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+def delta(text):
+    send({"type": "stream_event",
+          "event": {"type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": text}}})
+
+send({"type": "system", "subtype": "init", "session_id": "sess-fake"})
+if MODE == "tool":
+    delta(PREAMBLE)
+    send({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": PREAMBLE},
+        {"type": "tool_use", "id": "tool-1", "name": "Read",
+         "input": {"file_path": "store.py"}}]}})
+    send({"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "tool-1", "content": "ok"}]}})
+    for chunk in ["\\n\\n", "✅", " 1. 杭州", "\\n\\n", "✅", " 2. 西湖"]:
+        delta(chunk)
+    send({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "\\n\\n" + FULL}]}})
+    send({"type": "result", "subtype": "success", "result": "\\n\\n" + FULL,
+          "usage": {"input_tokens": 12, "output_tokens": 8}})
+else:
+    for chunk in ["✅", " 1. 杭州", "\\n\\n", "✅", " 2. 西湖"]:
+        delta(chunk)
+    send({"type": "assistant", "message": {"content": [{"type": "text", "text": FULL}]}})
+    if MODE != "noresult":
+        send({"type": "result", "subtype": "success", "result": FULL,
+              "usage": {"input_tokens": 10, "output_tokens": 5}})
+sys.exit(0)
+"""
+
+
+def _fake_claude_script(mode: str) -> str:
+    return _FAKE_CLAUDE_SCRIPT_TEMPLATE.replace("__MODE__", mode)
+
+
 def _write_script(path: Path, body: str) -> str:
     """造一个两平台都能被直接启动的假 CLI。
 
@@ -951,6 +1008,196 @@ def test_opencode_server_streams_text_incrementally(
             "后面还有第三段和第四段，用来验证增量是逐段推送的。"
         )
         assert "".join(chunks) == expected
+
+
+def _claude_test_settings(settings: Settings) -> Settings:
+    """钉死模型与密钥：用例断言 argv 里的 --model，不能随开发机 .env 漂移。"""
+    return settings.model_copy(
+        update={
+            "anthropic_model": "claude-sonnet-5-5",
+            "anthropic_api_key": "sk-test-not-real-key",
+        }
+    )
+
+
+def _argv_option(argv: list[str] | tuple[str, ...], flag: str) -> str:
+    assert flag in argv, f"argv 缺少 {flag}: {argv}"
+    return argv[list(argv).index(flag) + 1]
+
+
+def test_claude_argv_uses_configured_default_model_when_task_has_none(tmp_path: Path) -> None:
+    """任务未指定模型时必须显式下发 runtime 默认模型。
+
+    Claude CLI 收不到 --model 会用自己的内置模型名；接在非 Anthropic 网关后时该名字
+    不存在（实测 400 Model is unavailable）。这里校验 argv，而不是只校验计费字段。
+    """
+    settings = Settings(
+        workspace_root=str(tmp_path),
+        runtime_workspace=str(tmp_path / "ws"),
+        runtime_home=str(tmp_path / "home"),
+        mcp_enabled=False,
+        anthropic_model="claude-sonnet-5-5",
+        anthropic_api_key="sk-test-not-real-key",
+    )
+    runtime = CliRuntime(
+        runtime_id=RUNTIME_CLAUDE,
+        adapter=SimpleNamespace(_path="/usr/local/bin/claude"),
+        settings=settings,
+        supervisor=None,
+    )
+
+    launch = asyncio.run(
+        runtime.prepare(
+            task=SimpleNamespace(id="t-default"),
+            agent=SimpleNamespace(id_str="a1"),
+            run_id="r-default",
+            instruction="hi",
+        )
+    )
+
+    assert _argv_option(launch.argv, "--model") == "claude-sonnet-5-5"
+    assert launch.model == "claude-sonnet-5-5"
+
+
+def test_claude_argv_task_model_overrides_configured_default(tmp_path: Path) -> None:
+    """任务级模型优先于 runtime 默认模型（移动端切换的模型要真正传给 CLI）。"""
+    settings = Settings(
+        workspace_root=str(tmp_path),
+        runtime_workspace=str(tmp_path / "ws"),
+        runtime_home=str(tmp_path / "home"),
+        mcp_enabled=False,
+        anthropic_model="claude-sonnet-5-5",
+        anthropic_api_key="sk-test-not-real-key",
+    )
+    runtime = CliRuntime(
+        runtime_id=RUNTIME_CLAUDE,
+        adapter=SimpleNamespace(_path="/usr/local/bin/claude"),
+        settings=settings,
+        supervisor=None,
+    )
+
+    launch = asyncio.run(
+        runtime.prepare(
+            task=SimpleNamespace(id="t-task", model="claude-opus-5-5"),
+            agent=SimpleNamespace(id_str="a1"),
+            run_id="r-task",
+            instruction="hi",
+        )
+    )
+
+    assert _argv_option(launch.argv, "--model") == "claude-opus-5-5"
+    assert launch.model == "claude-opus-5-5"
+
+
+def test_claude_argv_omits_model_when_nothing_is_configured(tmp_path: Path) -> None:
+    """任务与配置都为空时保持原行为：不传 --model，让 CLI 用自己的默认值。"""
+    settings = Settings(
+        workspace_root=str(tmp_path),
+        runtime_workspace=str(tmp_path / "ws"),
+        runtime_home=str(tmp_path / "home"),
+        mcp_enabled=False,
+        anthropic_model="",
+        anthropic_api_key="sk-test-not-real-key",
+    )
+    runtime = CliRuntime(
+        runtime_id=RUNTIME_CLAUDE,
+        adapter=SimpleNamespace(_path="/usr/local/bin/claude"),
+        settings=settings,
+        supervisor=None,
+    )
+
+    launch = asyncio.run(
+        runtime.prepare(
+            task=SimpleNamespace(id="t-none"),
+            agent=SimpleNamespace(id_str="a1"),
+            run_id="r-none",
+            instruction="hi",
+        )
+    )
+
+    assert "--model" not in launch.argv
+    assert launch.model == ""
+
+
+def test_claude_stream_keeps_whitespace_and_emits_final_text_once(
+    settings: Settings, tmp_path: Path, db_schema: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """增量里的前后空白必须保留，最终答复只出现一次。
+
+    复现：deltas ['✅',' 1. 杭州','\\n\\n','✅',' 2. 西湖'] + assistant 回放 + result。
+    旧实现每帧 strip（' 1. 杭州' → '1. 杭州'），拼接后与回放文本对不上，回放被当成
+    新正文追加，run_finished 里出现「残缺正文 + 完整正文」两遍。
+    """
+    binary = _write_script(tmp_path / "fake-claude-stream", _fake_claude_script("whitespace"))
+    argv_file = tmp_path / "claude-argv.json"
+    monkeypatch.setenv("FAKE_CLAUDE_ARGV_FILE", str(argv_file))
+    with _cli_app(
+        _claude_test_settings(settings),
+        tmp_path,
+        binary,
+        env_name="FLUX_CLAUDE_CLI_BINARY",
+    ) as client:
+        container = client.app.state.container
+        _mark_ready(container, RUNTIME_CLAUDE)
+        agent_id = _create_cli_agent(client, RUNTIME_CLAUDE)
+        started = _start_task(client, agent_id)
+        task_id = started["task"]["id"]
+
+        _wait_status(client, task_id, "completed")
+        message = _wait_last_message(client, task_id, "run_finished")
+        full = "✅ 1. 杭州\n\n✅ 2. 西湖"
+        assert message["content"] == full
+        assert message["content"].count("杭州") == 1, message["content"]
+
+        # 任务没有模型覆盖：argv 要带上 runtime 配置的默认模型（BUG-D 的端到端校验）
+        argv = json.loads(argv_file.read_text(encoding="utf-8"))
+        assert _argv_option(argv, "--model") == "claude-sonnet-5-5"
+
+
+def test_claude_multi_message_with_tool_call_is_not_duplicated(
+    settings: Settings, tmp_path: Path, db_schema: None
+) -> None:
+    """工具调用把一轮拆成多段 assistant 消息时，最终答复仍只出现一次。"""
+    binary = _write_script(tmp_path / "fake-claude-tool", _fake_claude_script("tool"))
+    with _cli_app(
+        _claude_test_settings(settings),
+        tmp_path,
+        binary,
+        env_name="FLUX_CLAUDE_CLI_BINARY",
+    ) as client:
+        container = client.app.state.container
+        _mark_ready(container, RUNTIME_CLAUDE)
+        agent_id = _create_cli_agent(client, RUNTIME_CLAUDE)
+        started = _start_task(client, agent_id)
+        task_id = started["task"]["id"]
+
+        _wait_status(client, task_id, "completed")
+        message = _wait_last_message(client, task_id, "run_finished")
+        assert message["content"] == "✅ 1. 杭州\n\n✅ 2. 西湖"
+        assert message["content"].count("✅ 1. 杭州") == 1, message["content"]
+
+
+def test_claude_stream_without_result_does_not_duplicate_replay(
+    settings: Settings, tmp_path: Path, db_schema: None
+) -> None:
+    """没有 result 的旧版本/异常中断路径：增量与回放按空白归一后只保留一份。"""
+    binary = _write_script(tmp_path / "fake-claude-noresult", _fake_claude_script("noresult"))
+    with _cli_app(
+        _claude_test_settings(settings),
+        tmp_path,
+        binary,
+        env_name="FLUX_CLAUDE_CLI_BINARY",
+    ) as client:
+        container = client.app.state.container
+        _mark_ready(container, RUNTIME_CLAUDE)
+        agent_id = _create_cli_agent(client, RUNTIME_CLAUDE)
+        started = _start_task(client, agent_id)
+        task_id = started["task"]["id"]
+
+        _wait_status(client, task_id, "completed")
+        message = _wait_last_message(client, task_id, "run_finished")
+        assert message["content"] == "✅ 1. 杭州\n\n✅ 2. 西湖"
+        assert message["content"].count("✅ 1. 杭州") == 1, message["content"]
 
 
 def test_cli_prepare_sets_pwd_to_workspace(tmp_path: Path) -> None:
