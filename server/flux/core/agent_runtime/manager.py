@@ -2,7 +2,7 @@
 
 Flux 本身不执行 Agent——没有 loop、不组装 prompt、不存对话（目标架构 §1）。
 本类只维护平台上的 Agent 档案：创建、查询、列出、停止，并在状态跃迁时发布事件；
-执行由各 Agent 自己的运行时完成（内置 DSH Agent 或外部 Codex / Claude Code 等）。
+执行由各 Agent 自己的运行时完成（Claude Code / Codex / OpenCode 等）。
 档案里的 permissions 是平台侧权限的唯一来源（Connector 按 agent_id 解析）。
 
 P3-16 起档案落库（agents 表），canonical id（UUID）是 Agent 身份的唯一权威：
@@ -44,7 +44,7 @@ class AgentSpec:
     skills: tuple[str, ...] = ()
     tools: tuple[str, ...] = ()
     permissions: frozenset[Capability] = frozenset()
-    #: 执行该 Agent 的 runtime（P2-1 §6.2）：dsh（内置，默认）/ codex / opencode。
+    #: 执行该 Agent 的 runtime（P2-1 §6.2）：claude-code（默认）/ codex / opencode。
     #: 落库在 agents.config["runtime"]；曾经不进 to_dict，2026-10-06 起随 to_dict 输出
     #: （UI 需要看到"这个 Agent 由谁执行"，否则接入 CLI 后无法确认任务会走哪条路）——
     #: 属向后兼容的加字段，M0 冻结的既有字段语义不变。

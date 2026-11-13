@@ -6,8 +6,13 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# Node 20 + Claude Code CLI：Bot 的 Agent 底座（npm 全局装 claude）
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl passwd util-linux \
+    && apt-get install -y --no-install-recommends curl ca-certificates gnupg passwd util-linux \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g @anthropic-ai/claude-code \
+    && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 flux \
     && useradd --uid 1000 --gid 1000 --no-create-home --shell /usr/sbin/nologin flux
@@ -20,16 +25,16 @@ COPY server/ ./
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# 数据与 DSH 家目录都落在挂载卷里，容器重建不丢 Bot 与例程
+# 数据与运行期目录都落在挂载卷里，容器重建不丢 Bot 与例程
 ENV HOME=/data/home \
     FLUX_DATABASE_URL=sqlite+aiosqlite:////data/flux.db \
-    FLUX_DSH_HOME=/data/dsh-home \
+    FLUX_RUNTIME_HOME=/data/runtime-home \
+    FLUX_RUNTIME_WORKSPACE=/data/runtime-ws \
     FLUX_UPLOADS_DIR=/data/uploads \
     FLUX_DELIVERIES_DIR=/data/deliveries \
-    FLUX_DSH_WORKSPACE=/data/dsh-ws \
     FLUX_WORKSPACE_ROOT=/data/workspace \
     FLUX_BOT_PORT=8600 \
-    FLUX_DSH_MCP_URL=http://127.0.0.1:8600/mcp
+    FLUX_MCP_URL=http://127.0.0.1:8600/mcp
 
 VOLUME ["/data"]
 EXPOSE 8600

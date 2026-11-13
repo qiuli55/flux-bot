@@ -321,7 +321,7 @@ class TaskRepository:
             return task
 
     async def set_run_id(self, task_id: uuid.UUID, run_id: str | None) -> Task:
-        """记下该任务触发的 DSH Run（P0-05），Run 终态靠它回写任务状态。
+        """记下该任务触发的 Agent Run（P0-05），Run 终态靠它回写任务状态。
 
         传 None 是"撤回预登记"——起 Run 失败时用它把任务退回"还没执行"的状态。
         """
@@ -344,7 +344,7 @@ class TaskRepository:
             return task
 
     async def get_by_run_id(self, run_id: str) -> Task | None:
-        """按 DSH Run 反查任务；没有对应任务时返回 None（Run 可以是独立发起的）。"""
+        """按 Run 反查任务；没有对应任务时返回 None（Run 可以是独立发起的）。"""
         async with self._session_factory() as session:
             return await session.scalar(select(Task).where(Task.run_id == run_id))
 

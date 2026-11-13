@@ -17,13 +17,13 @@ from flux.config import Settings, get_settings
 from flux.connectors.base import ConnectorRegistry
 from flux.core.agent_runtime.adapters import build_default_adapters
 from flux.core.agent_runtime.codex_account import CodexAccountService
-from flux.core.agent_runtime.dsh_client import FluxDshClient
 from flux.core.agent_runtime.installation import InstallationRepository, InstallationService
 from flux.core.agent_runtime.manager import AgentManager
 from flux.core.agent_runtime.repository import AgentRepository
 from flux.core.agent_runtime.run_repository import AgentRunRepository
 from flux.core.agent_runtime.runtimes.service import TaskRunService
 from flux.core.agent_runtime.session_repository import TaskRuntimeSessionRepository
+from flux.core.agent_runtime.supervisor import RunSupervisor
 from flux.core.agent_runtime.trace import RunTraceRecorder
 from flux.core.agent_runtime.trace_repository import RunTraceRepository
 from flux.core.billing.service import BillingService
@@ -103,9 +103,9 @@ from flux.core.supervisor import (
 from flux.core.task_engine.agent_switch import AgentSwitchService
 from flux.core.task_engine.assistant import TaskAssistant
 from flux.core.task_engine.conversation_summary import ConversationSummarizer
-from flux.core.task_engine.dsh_bridge import AUTO_RETRY_FOLLOWUP, TaskRunBridge
 from flux.core.task_engine.memory_repository import TaskMemoryRepository
 from flux.core.task_engine.repository import TaskRepository
+from flux.core.task_engine.run_bridge import AUTO_RETRY_FOLLOWUP, TaskRunBridge
 from flux.core.task_engine.scheduler import TaskScheduler
 from flux.core.task_engine.stream import TaskStreamHub, TaskStreamRelay
 from flux.core.terminal.pty_service import HumanPtyService
@@ -174,7 +174,8 @@ class Container:
     shared_user_memory: SharedUserMemoryService = field(init=False)
     proposal_repo: ProposalRepository = field(init=False)
     batch_repo: ApplyBatchRepository = field(init=False)
-    dsh: FluxDshClient = field(init=False)
+    #: Run 生命周期看护（所有 Agent runtime 共用：Claude Code / Codex / OpenCode）
+    run_supervisor: RunSupervisor = field(init=False)
     agent_tokens: AgentTokenService = field(init=False)
     agent_repo: AgentRepository = field(init=False)
     run_repo: AgentRunRepository = field(init=False)
@@ -408,7 +409,7 @@ class Container:
         )
         # MCP 能力面的鉴权（目标架构 §3.2）：令牌是 agent 进入平台的唯一凭据，
         # 与权限策略同源——工具要求的 Capability 直接取自 flux.enums.Capability。
-        # 先于 DSH 装配：DSH 起 Run 时要拿内置 Agent 的令牌注入 MCP patch（P0-01）。
+        # 先于 Agent Run 装配：起 Run 时要拿内置 Agent 的令牌注入 MCP 配置（P0-01）。
         # P3-16：令牌只引用 Agent Registry 的 canonical UUID，故注入注册表做校验与解析。
         self.agent_tokens = AgentTokenService(self.session_factory, self.agents)  # type: ignore[attr-defined]
         # Run 权威状态落 agent_runs 表（P2-15）：多实例共享同库时用 owner_pid 区分归属
@@ -422,15 +423,14 @@ class Container:
         self.runtime_sessions = TaskRuntimeSessionRepository(
             self.session_factory  # type: ignore[attr-defined]
         )
-        # DSH Agent Runtime（集成方案 §18 Phase 1）：内置 agent 的接入层，
-        # 未启用（FLUX_DSH_ENABLED=false）时调用 ensure_ready() 才报错，装配本身无副作用。
-        self.dsh = FluxDshClient(
-            self.settings,
+        # Run 权威状态机：状态流转、超时、进程树清理、对账与重启恢复都在这里，
+        # 所有 Agent runtime（Claude Code / Codex / OpenCode）共用同一个实例。
+        self.run_supervisor = RunSupervisor(
+            settings=self.settings,
+            repository=self.run_repo,
             bus=self.bus,
-            token_service=self.agent_tokens,
-            run_repository=self.run_repo,
         )
-        # DSH Run 终态 → 任务状态（P0-05）：订阅事件总线，Run 结束即回写所属任务。
+        # Run 终态 → 任务状态（P0-05）：订阅事件总线，Run 结束即回写所属任务。
         # 同时把任务级对账挂上看护器的对账循环：事件在崩溃时会丢，running 任务需要兜底收尾
         # （P2-04 / TC-502），Run 状态先对完再让下游据真实状态判断。
         self.task_runs = TaskRunBridge(
@@ -444,7 +444,7 @@ class Container:
             memory=self.task_memory,
         )
         self.task_runs.attach(self.bus)
-        # DSH / CLI 的运行事件 → 任务流：前端订阅 SSE 就能看到 Agent 正在干什么
+        # Runtime 的运行事件 → 任务流：前端订阅 SSE 就能看到 Agent 正在干什么
         # 同时把增量合并成执行轨迹，Run 终态落库（任务详情的思考过程与命令输出靠它回看）
         TaskStreamRelay(self.task_stream, self.run_trace).attach(self.bus)
         # 上下文闭环：提案 applied 后刷新项目 Brain 快照（同项目节流，失败不阻塞 Apply）
@@ -455,7 +455,7 @@ class Container:
             bus=self.bus,
         )
         self.brain_refresher.attach()
-        self.dsh.supervisor.add_reconcile_hook(self.task_runs.reconcile_orphan_tasks)
+        self.run_supervisor.add_reconcile_hook(self.task_runs.reconcile_orphan_tasks)
         # MCP 工具调用成功 = 一次有效进展（P2-15 §2.4）：接线到看护器，避免 idle timeout 误杀
         self.bus.subscribe(Events.MCP_TOOL_CALLED, self._on_mcp_tool_called)
         # Run 落终态 → 回收该 Run 经 terminal.execute 派生的终端会话/命令进程（FINDING-1）：
@@ -470,7 +470,7 @@ class Container:
         ):
             self.bus.subscribe(_terminal_event, self._on_run_terminal)
         # P2-1 §6.2：任务「开始执行」的编排收口——按 agent.config["runtime"] 分发
-        # dsh / codex / opencode。CLI runtime 复用同一个 RunSupervisor 与令牌服务，不新建生命周期。
+        # claude-code / codex / opencode。所有 runtime 复用同一个 RunSupervisor 与令牌服务。
         # ChatGPT 账号登录态由它提供：codex Run 会把 auth.json 注入隔离 CODEX_HOME。
         self.codex_account = CodexAccountService(self.settings)
         # 计费账本与额度闸门：CLI runtime 的每一步用量都落到这里；先于 TaskRunService
@@ -550,7 +550,7 @@ class Container:
             self.task_repo,
             self.task_run_service,
             self.agents,
-            dsh=self.dsh,
+            supervisor=self.run_supervisor,
         )
         self.supervisor_orchestrator = SupervisorOrchestrator(
             self.supervisor_repo,
@@ -666,7 +666,7 @@ class Container:
             return
         agent_id = payload.get("agent_id")
         if isinstance(agent_id, str):
-            await self.dsh.supervisor.note_mcp_activity(agent_id)
+            await self.run_supervisor.note_mcp_activity(agent_id)
 
     async def _on_run_terminal(self, _event: str, payload: dict[str, object]) -> None:
         """Run 落终态后，回收它名下派生的终端会话与命令进程（FINDING-1 防泄漏）。"""
@@ -706,7 +706,8 @@ class Container:
             await channel.aclose()
         # 知识库 embedding 客户端同样持有连接池（未启用时是空操作）
         await self.knowledge_embedder.aclose()
-        await self.dsh.shutdown()
+        await self.run_supervisor.stop_background()
+        await self.run_supervisor.kill_active_processes()
         await self.engine.dispose()
 
 

@@ -193,42 +193,30 @@ class Settings(BaseSettings):
     # 平台内部模型调用的单次输出上限；None 表示不设上限，由模型自身的默认输出上限决定。
     model_max_output_tokens: int | None = None
 
-    # --- DSH Agent Runtime（集成方案 §17 配置表；Phase 1 用官方 Python SDK）---
-    # 是否启用 DSH Agent Runtime（默认关闭，未启用时 /dsh 接口返回 503）
-    dsh_enabled: bool = False
-    # DSH_HOME 绝对路径：profiles / plugins / 会话落盘，必须放仓库外
-    dsh_home: str = "/opt/flux/dsh-home"
-    # DSH Agent 的工作目录（cwd），Phase 1 用独立空目录，不指向真实项目
-    dsh_workspace: str = "/opt/flux/dsh-ws"
+    # --- Agent 执行内核（Claude Code / Codex / OpenCode 共用）---
+    # 运行期文件根目录：会话目录、隔离配置、Bot 工作区的父目录，必须放仓库外
+    runtime_home: str = "/opt/flux/runtime-home"
+    # Agent 的默认工作目录（cwd），未指定任务工作区时使用
+    runtime_workspace: str = "/opt/flux/runtime-ws"
     # 手机端聊天附件（用户上传的文件）：按上传 id 一目录存放，Agent 按绝对路径直接读
     uploads_dir: str = "/opt/flux/uploads"
     # AI 下发给用户的文件：按 delivery id 一目录存放，手机端按卡片里的 id/序号取文件
     deliveries_dir: str = "/opt/flux/deliveries"
-    # DSH provider 路由
-    dsh_provider: str = "deepseek-official"
-    # DSH 模型 id
-    dsh_model: str = "deepseek-v4-flash"
-    # 单次输出 token 上限
-    dsh_max_tokens: int = 49152
-    # 初始化握手超时（秒）
-    dsh_init_timeout_seconds: float = 30.0
-    # 单轮超时（秒）；0 表示不设限
-    dsh_run_timeout_seconds: float = 0.0
 
     # --- Run 生命周期看护（修复方案 §2.3~§2.7）---
     # 三类 timeout，全部可关（0 = 关闭该判据）：
     #   startup：进程起来但始终没有进入 RUNNING（构造/握手卡住）的上限
     #   idle：进程还在、但既无输出也无 MCP 活动、状态也不变的上限
     #   hard：无论有无输出都不放行的绝对上限
-    dsh_startup_timeout_seconds: float = 120.0
-    dsh_idle_timeout_seconds: float = 600.0
-    dsh_hard_timeout_seconds: float = 1800.0
+    run_startup_timeout_seconds: float = 120.0
+    run_idle_timeout_seconds: float = 600.0
+    run_hard_timeout_seconds: float = 1800.0
     # 心跳周期：写 last_heartbeat_at 并检查三类超时 / 进程存活
-    dsh_heartbeat_interval_seconds: float = 5.0
+    run_heartbeat_interval_seconds: float = 5.0
     # Reconciler 对账周期：数据库状态 ↔ 真实进程状态
-    dsh_reconcile_interval_seconds: float = 10.0
+    run_reconcile_interval_seconds: float = 10.0
     # Cancel 优雅期：SIGTERM 进程组后等这么久，仍在则 SIGKILL
-    dsh_cancel_grace_seconds: float = 5.0
+    run_cancel_grace_seconds: float = 5.0
 
     # --- Agent 执行时限通用覆盖（所有 runtime 共用；0 = 用 runtime 默认表）---
     # 各 runtime 的默认值登记在 runtimes/base.py 的 RUNTIME_LIMITS 里；这里只做运维级
@@ -248,18 +236,18 @@ class Settings(BaseSettings):
     # 上下文预算：估算输入超过该 token 数时压缩/重开会话；0 = 不限制
     agent_context_compact_tokens: int = 80000
 
-    # --- DSH × MCP 注入（目标架构 §3；P0-01 真闭环）---
-    # 内置 Agent 只能经 MCP 看项目、提提案；启动 DSH 时自动生成 patch 注入 MCP 客户端插件。
-    # 关闭后 DSH 会退化成"没有平台的裸 agent"——仅用于本地排查，默认必须开着。
-    dsh_mcp_enabled: bool = True
+    # --- MCP 注入（目标架构 §3；P0-01 真闭环）---
+    # Agent 只能经 MCP 看项目、提提案；起 Run 时自动生成隔离的 MCP 客户端配置。
+    # 关闭后 Agent 会退化成"没有平台的裸 agent"——仅用于本地排查，默认必须开着。
+    mcp_enabled: bool = True
     # Flux MCP 端点（streamable-http）。默认同机默认端口；隔离实例请显式指向自己的端口
-    dsh_mcp_url: str = "http://127.0.0.1:8000/mcp"
+    mcp_url: str = "http://127.0.0.1:8000/mcp"
     # MCP serverName（注入后工具名形如 mcp__flux__workspace.read）
-    dsh_mcp_server_name: str = "flux"
+    mcp_server_name: str = "flux"
     # 内置 Agent 的令牌身份：Flux 用它在 MCP 面盖章 provenance
-    dsh_mcp_agent_id: str = "flux-builtin"
+    mcp_agent_id: str = "flux-builtin"
     # 单次工具调用超时（毫秒）
-    dsh_mcp_tool_timeout_ms: int = 60000
+    mcp_tool_timeout_ms: int = 60000
 
     # --- 外部 CLI Agent：Codex 的模型通道（P2-1 §6.2 续，2026-10-06）---
     # codex 把「鉴权方式」当全局状态，Flux 只能给它一个隔离的 CODEX_HOME（顺便注入 MCP），
@@ -333,12 +321,12 @@ class Settings(BaseSettings):
     supervisor_outbox_max_attempts: int = 5
     # watchdog：派活后迟迟没进入执行的租约上限（秒），超时回收并写 timed_out 报告。
     supervisor_dispatch_timeout_seconds: float = 120.0
-    # watchdog：单次 Run 执行时长上限（秒）；0 表示不限制，交给 DSH 自身超时。
+    # watchdog：单次 Run 执行时长上限（秒）；0 表示不限制，交给 runtime 自身超时。
     supervisor_run_timeout_seconds: float = 0.0
 
     # --- Bot 模式（常驻 Bot）---
     # Bot 独立服务监听的端口（entrypoint.sh / Dockerfile 用 FLUX_BOT_PORT 传入）。
-    # Bot 节点据此在未显式配置 FLUX_DSH_MCP_URL 时推导同机 MCP 端点。
+    # Bot 节点据此在未显式配置 FLUX_MCP_URL 时推导同机 MCP 端点。
     bot_port: int = 8600
     # 后台调度 worker：按 next_run_at 扫到期 Bot 并开工。测试里关掉，避免与用例抢时序。
     bot_scheduler_enabled: bool = True

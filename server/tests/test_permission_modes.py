@@ -24,6 +24,8 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
+from flux.core.agent_runtime.protocol import build_runtime_env
+from flux.core.agent_runtime.runtimes.cli import _CLAUDE_PERMISSION_MODES
 from flux.core.mcp.auth import AgentIdentity
 from flux.core.mcp.server import McpServer, _attach_run_id
 from flux.core.mcp.tools.base import ToolContext
@@ -825,3 +827,22 @@ async def test_default_mode_cannot_call_forbidden_write_tools(apply_container) -
     )
     payload = result["error"]
     assert payload["message"] == "未知工具：workspace.apply"
+
+
+# ---------------------------------------------------- 7. Claude Code 权限模式映射
+
+
+def test_claude_permission_mode_mapping() -> None:
+    """plan 只读、normal 逐次询问；unattended/full 不再打断（Flux 侧仍管令牌）。"""
+    assert _CLAUDE_PERMISSION_MODES["plan"] == "plan"
+    assert _CLAUDE_PERMISSION_MODES["normal"] == "default"
+    assert _CLAUDE_PERMISSION_MODES["full"] == "bypassPermissions"
+    assert _CLAUDE_PERMISSION_MODES["unattended"] == "bypassPermissions"
+
+
+def test_runtime_env_carries_flux_permission_mode() -> None:
+    env = build_runtime_env(run_id="run-1", workspace="/tmp/ws", permission_mode="unattended")
+    assert env["FLUX_PERMISSION_MODE"] == "unattended"
+
+    plan_env = build_runtime_env(run_id="run-2", workspace="/tmp/ws", permission_mode="plan")
+    assert plan_env["FLUX_PERMISSION_MODE"] == "plan"
