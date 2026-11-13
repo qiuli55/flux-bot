@@ -27,6 +27,7 @@ from flux.core.context.redact import redact
 from flux.core.event.bus import Events
 from flux.core.mcp.auth import AgentIdentity
 from flux.core.mcp.tools import ALL_TOOLS, TOOLS, ToolContext, ToolSpec
+from flux.core.mcp.tools.permission_tools import PERMISSION_PROMPT_TOOL_NAME
 from flux.core.permissions.modes import (
     allowed_tools,
     denied_message,
@@ -171,7 +172,14 @@ class McpServer:
             )
             return _result(request_id, _tool_error(message))
 
-        if identity.allowed_tools is not None and name not in identity.allowed_tools:
+        # 审批桥不属于 Agent 能力：它只把 Claude Code 的权限询问转成人工审批卡，
+        # 不执行任何操作。Bot 工具白名单若把它挡住，正常模式下所有需要审批的调用
+        # 都会变成"桥不可用"，因此这里豁免（能力位检查仍然生效）。
+        if (
+            name != PERMISSION_PROMPT_TOOL_NAME
+            and identity.allowed_tools is not None
+            and name not in identity.allowed_tools
+        ):
             message = f"Bot 执行白名单未包含工具 {name}，已拒绝执行"
             await self._publish(Events.MCP_TOOL_DENIED, identity, spec, error="bot_allowed_tools")
             logger.warning("MCP Bot 工具白名单拒绝 agent=%s tool=%s", identity.agent_id, name)

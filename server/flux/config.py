@@ -56,6 +56,15 @@ class Settings(BaseSettings):
                     data = {**data, "timezone": tz}
         return data
 
+    @field_validator("anthropic_auth_mode")
+    @classmethod
+    def _validate_anthropic_auth_mode(cls, value: str) -> str:
+        """非法值不让服务起不来：告警并由解析层统一回退 auto。"""
+        # 惰性导入：config 是最底层模块，避免在模块加载期拉起 agent_runtime 包
+        from flux.core.agent_runtime.claude_auth import normalize_auth_mode
+
+        return normalize_auth_mode(value)
+
     @field_validator("timezone")
     @classmethod
     def _validate_timezone(cls, value: str) -> str:
@@ -138,6 +147,13 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = None
     anthropic_base_url: str = "https://api.anthropic.com"
     anthropic_model: str = "claude-sonnet-5-5"
+    # Claude Code 的鉴权头（code.claude.com/docs/en/env-vars，[2026-11-12 快照]）：
+    #   auto       = base_url 为空或官方域名时用 ANTHROPIC_API_KEY（X-Api-Key），
+    #                否则用 ANTHROPIC_AUTH_TOKEN（Authorization: Bearer），适合 LLM 网关；
+    #   api_key    = 强制 ANTHROPIC_API_KEY；
+    #   auth_token = 强制 ANTHROPIC_AUTH_TOKEN。
+    # 两者互斥（同时设置会触发 CLI 鉴权冲突告警），非法值告警后按 auto 处理。
+    anthropic_auth_mode: str = "auto"
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-flash"
@@ -338,6 +354,9 @@ class Settings(BaseSettings):
     bot_scheduler_enabled: bool = True
     # 轮询间隔（秒）：cron 的最小粒度是分钟，30 秒足够且不会压垮 SQLite。
     bot_scheduler_interval_seconds: float = 30.0
+    # 后台子任务等待内核 Run 收尾的总时限（秒）：超时即终止 Run 并按失败回写父对话；
+    # 0 或负数表示不设上限（仍受 Run 自身的 idle / hard 超时约束）。
+    bot_subtask_timeout_seconds: float = 3600.0
     # 外部例程触发（Webhook）的 HMAC 密钥。留空 = fail-closed，拒绝所有入站请求。
     # 通用入口校验 X-Flux-Signature；GitHub 入口校验 X-Hub-Signature-256。
     routine_webhook_secret: str | None = None
