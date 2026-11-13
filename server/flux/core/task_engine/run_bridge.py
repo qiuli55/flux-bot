@@ -1,12 +1,12 @@
-"""把 DSH Run 的终态回写到它所属的任务（P0-05「开始执行」链路的收尾）。
+"""把 Agent Run 的终态回写到它所属的任务（P0-05「开始执行」链路的收尾）。
 
-平台自己不起 Run——Run 由 FluxDshClient 交给后台任务跑。Run 结束时会发
-`dsh.run_completed / failed / cancelled` 事件，本桥接订阅这三个事件，
+平台自己不起 Run——Run 由各 runtime（Claude Code / Codex / OpenCode）交给后台任务跑。
+Run 结束时会发 `dsh.run_completed / failed / cancelled` 事件，本桥接订阅这三个事件，
 按 `tasks.run_id` 找到任务并落终态 + 追加一条真实的结果消息。
 
 两条不做的事，都很明确：
 
-1. 不认识的 run_id 一律忽略——DSH Run 也可以由 `/dsh/runs` 独立发起，没有对应任务很正常；
+1. 不认识的 run_id 一律忽略——Run 也可以独立发起，没有对应任务很正常；
 2. 任务已经停在 `waiting_for_user_decision` 时不动状态——那是用户要求的暂停，
    平台不能因为 run 线程结束就把"等人决策"改写成完成/失败（文档 §5 必须测试项）。
 
@@ -102,7 +102,7 @@ AUTO_RETRY_FOLLOWUP = (
 
 
 class TaskRunBridge:
-    """DSH Run 终态 → 任务状态 / 结果消息。"""
+    """Agent Run 终态 → 任务状态 / 结果消息。"""
 
     def __init__(
         self,
@@ -263,7 +263,7 @@ class TaskRunBridge:
         if task.status in _FINAL_STATUSES:
             return
         if task.status == TaskStatus.WAITING_FOR_USER_DECISION.value:
-            logger.info("dsh.run 结束但任务正等人决策，保留等待态 task=%s run=%s", task.id, run_id)
+            logger.info("run 结束但任务正等人决策，保留等待态 task=%s run=%s", task.id, run_id)
             return
         if self._trace is not None:
             # 先落轨迹再写结果消息：手机端收到 run_finished 后立刻拉详情也能读全
@@ -424,7 +424,7 @@ class TaskRunBridge:
     ) -> bool:
         """429/超时这类上游瞬时故障自动续跑一轮，避免用户看到一次「假失败」。
 
-        只对 `dsh.run_failed` 生效；每轮失败链最多重试一次（budget 置 0 后放行真实失败），
+        只对 `dsh.run_failed` 事件生效；每轮失败链最多重试一次（budget 置 0 后放行真实失败），
         取消/人工暂停/业务错误不在重试范围。重试期间任务保持 running，界面不出现失败气泡。
         """
         if event != Events.DSH_RUN_FAILED or self._retry_handler is None:

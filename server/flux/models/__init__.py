@@ -31,10 +31,12 @@ from flux.models.group import (
 from flux.models.imported_capability import ImportedCapability
 from flux.models.knowledge import KnowledgeChunk, KnowledgeDocument
 from flux.models.memory import MemoryEntry
+from flux.models.outbound_draft import OutboundDraft
 from flux.models.project import Project, ProjectMemory
 from flux.models.run_trace import RunTraceItem
 from flux.models.runtime_session import TaskRuntimeSession
 from flux.models.shared_user_memory import UserJournalEntry, UserProfileEntry
+from flux.models.skill_package import BotSkill, SkillPackage
 from flux.models.supervisor import (
     SupervisorAssignment,
     SupervisorDigest,
@@ -74,6 +76,7 @@ __all__ = [
     "BotMemoryChunk",
     "BotNotification",
     "BotRoutine",
+    "BotSkill",
     "BotTurn",
     "ChatGroup",
     "ChatGroupEpoch",
@@ -95,11 +98,13 @@ __all__ = [
     "MemoryEntry",
     "Organization",
     "OrganizationMember",
+    "OutboundDraft",
     "Project",
     "ProjectMemory",
     "PairingCode",
     "ProviderAccount",
     "RunTraceItem",
+    "SkillPackage",
     "SupervisorAssignment",
     "SupervisorDigest",
     "SupervisorEval",
