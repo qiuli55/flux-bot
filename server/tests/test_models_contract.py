@@ -140,6 +140,11 @@ SPEC_TABLES = {
     # 与 bot_memories（每 Bot 记忆）和 memories（三层记忆）分开存储。
     "user_profile_entries",
     "user_journal_entries",
+    # 用户保险库（迁移 d7a1f4c9b2e6）：站点登录 / 支付卡 / 联系人。
+    # 密码、完整卡号、CVV 均以 SecretBox 信封密文落库；接口只回掩码。
+    "vault_logins",
+    "vault_cards",
+    "vault_contacts",
     # 技能包库（迁移 a7c1e9d4b2f6）：可 CRUD 的技能正文 + 每 Bot 启用/排序分配。
     "skill_packages",
     "bot_skills",

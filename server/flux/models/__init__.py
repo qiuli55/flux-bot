@@ -57,6 +57,7 @@ from flux.models.task_memory import TaskMemoryCard
 from flux.models.terminal import TerminalEvent, TerminalSession
 from flux.models.usage import UsageRecord, UsageSnapshot
 from flux.models.user import Organization, OrganizationMember, ProviderAccount, User
+from flux.models.vault import VaultCard, VaultContact, VaultLogin
 from flux.models.wechat import WechatSession
 from flux.models.workspace import VirtualChange
 
@@ -128,6 +129,9 @@ __all__ = [
     "User",
     "UserJournalEntry",
     "UserProfileEntry",
+    "VaultCard",
+    "VaultContact",
+    "VaultLogin",
     "VirtualChange",
     "WechatSession",
 ]
