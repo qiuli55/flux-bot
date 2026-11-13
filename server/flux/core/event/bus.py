@@ -86,6 +86,12 @@ class Events:
     GITHUB_ISSUE_COMMENT = "github.issue_comment"
     GITHUB_RELEASE = "github.release"
     GITHUB_WORKFLOW_RUN = "github.workflow_run"
+    #: Bot 后台子任务（2026-11-13）：起止均发一次，载荷含 bot_id / subtask_id /
+    #: parent_task_id / status；父对话里另有 kind=subtask 的消息与 subtask_update 流事件。
+    SUBTASK_STARTED = "subtask.started"
+    SUBTASK_COMPLETED = "subtask.completed"
+    SUBTASK_FAILED = "subtask.failed"
+    SUBTASK_CANCELLED = "subtask.cancelled"
 
 
 class EventBus:

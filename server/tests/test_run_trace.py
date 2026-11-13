@@ -1,4 +1,4 @@
-"""执行轨迹测试：DSH 工具事件映射、工具分类、思考/命令合并、run 摘要接口。"""
+"""执行轨迹测试：工具分类、思考/命令合并、run 摘要接口。"""
 
 from __future__ import annotations
 
@@ -6,10 +6,8 @@ import asyncio
 import uuid
 from typing import Any
 
-from deepseek_harness import Notification
 from fastapi.testclient import TestClient
 
-from flux.core.agent_runtime.dsh_events import to_flux_event
 from flux.core.agent_runtime.run_repository import utcnow
 from flux.core.agent_runtime.trace import (
     RunTraceRecorder,
@@ -34,92 +32,6 @@ class _MemoryTraceRepository:
         self, run_id: str, task_id: str | uuid.UUID | None, items: list[dict[str, Any]]
     ) -> None:
         self.replaced.append((run_id, task_id, list(items)))
-
-
-def test_to_flux_event_maps_tool_call_and_result() -> None:
-    """DSH 的 tool/call 与 tool/result 必须映射成命令卡字段，否则内置 Agent 没有轨迹。"""
-    _, call = to_flux_event(
-        Notification(
-            method="session.event",
-            payload={
-                "sessionId": "s1",
-                "event": {
-                    "type": "tool/call",
-                    "data": {
-                        "turn": 1,
-                        "step": 1,
-                        "callId": "call_1",
-                        "name": "bash",
-                        "arguments": '{"command": "ls -la", "description": "列目录"}',
-                    },
-                },
-            },
-        )
-    )
-    assert call["event_type"] == "tool/call"
-    assert call["name"] == "bash"
-    assert call["status"] == "running"
-    assert call["call_id"] == "call_1"
-    assert '"ls -la"' in call["detail"]
-
-    _, result = to_flux_event(
-        Notification(
-            method="session.event",
-            payload={
-                "sessionId": "s1",
-                "event": {
-                    "type": "tool/result",
-                    "data": {
-                        "turn": 1,
-                        "step": 1,
-                        "callId": "call_1",
-                        "message": {
-                            "role": "user",
-                            "source": {"kind": "tool", "callId": "call_1"},
-                            "content": [
-                                {
-                                    "type": "tool-result",
-                                    "toolCallId": "call_1",
-                                    "isError": False,
-                                    "content": [{"type": "text", "text": "a.txt\n"}],
-                                }
-                            ],
-                        },
-                    },
-                },
-            },
-        )
-    )
-    assert result["event_type"] == "tool/result"
-    assert result["call_id"] == "call_1"
-    assert result["output"] == "a.txt\n"
-    assert result["status"] == "completed"
-
-    _, failed = to_flux_event(
-        Notification(
-            method="session.event",
-            payload={
-                "sessionId": "s1",
-                "event": {
-                    "type": "tool/result",
-                    "data": {
-                        "callId": "call_2",
-                        "message": {
-                            "content": [
-                                {
-                                    "type": "tool-result",
-                                    "isError": True,
-                                    "content": [{"type": "text", "text": "boom"}],
-                                }
-                            ]
-                        },
-                    },
-                },
-            },
-        )
-    )
-    assert failed["status"] == "error"
-    assert failed["output"] == "boom"
 
 
 def test_classify_tool_and_extract_paths() -> None:

@@ -15,9 +15,7 @@ asyncpg==0.31.0
 redis==8.1.0
 # 模型供应商适配器用手写 httpx 调用上游 HTTP API（不用官方 SDK），故列为运行时依赖
 httpx==0.28.1
-# 官方 Python SDK，自带 runtime 可执行，不需要系统 Node
-deepseek-harness-sdk==0.1.5rc1
-# DSH loader patch（YAML）生成：注入 MCP 客户端插件配置
+# Agent manifest（YAML）解析与校验
 PyYAML==6.0.3
 # IANA 时区数据库：python:*-slim 基础镜像可能不带系统 zoneinfo，
 # 缺失时 FLUX_TIMEZONE=Asia/Shanghai 等非 UTC 名称会在启动校验阶段失败。

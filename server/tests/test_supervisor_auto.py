@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,10 +22,10 @@ from flux.config import Settings
 from flux.container import Container
 from flux.core.supervisor.planner import PlannedTicket, TicketPlan
 from tests.conftest import create_agent
+from tests.fakes import read_cli_argv
 from tests.test_supervisor import (
     PREFIX,
     _assessor,
-    _hold_behavior,
     _ingest,
     _planner,
     _StubProvider,
@@ -67,7 +68,7 @@ def test_auto_mode_continues_dependency_chain(
     settings: Settings, tmp_path: Path, db_schema: None
 ) -> None:
     """上游 done 后自动派下游：全程不手动 POST /threads/{id}/dispatch。"""
-    with _supervised(settings, tmp_path) as (client, _factory, container):
+    with _supervised(settings, tmp_path) as (client, _log_path, container):
         create_agent(client, name="dev-1", role="developer")
         _enable_auto(client, container, _CHAIN)
         _ingest(client, external_id="om_auto_chain", thread_key="feishu:chat_auto_chain")
@@ -92,7 +93,7 @@ def test_observe_mode_never_auto_dispatches(
     settings: Settings, tmp_path: Path, db_schema: None
 ) -> None:
     """默认 observe：即使已经规划出工单树，也不会自动起 Run。"""
-    with _supervised(settings, tmp_path) as (client, factory, container):
+    with _supervised(settings, tmp_path) as (client, log_path, container):
         create_agent(client, name="dev-1", role="developer")
         container.supervisor_orchestrator._planner = _planner(_StubProvider(_CHAIN))
         trigger = _ingest(client, external_id="om_observe", thread_key="feishu:chat_observe")
@@ -103,14 +104,14 @@ def test_observe_mode_never_auto_dispatches(
         client.post(f"{PREFIX}/process")
         tickets = client.get(f"{PREFIX}/tickets").json()["data"]
         assert {ticket["stage"] for ticket in tickets} == {"planned"}
-        assert factory.created == []
+        assert read_cli_argv(log_path) == []
 
 
 def test_independent_tickets_dispatch_in_same_round(
     settings: Settings, tmp_path: Path, db_schema: None
 ) -> None:
     """投机执行：无依赖兄弟工单受并发位约束，可在同一轮一起跑。"""
-    with _supervised(settings, tmp_path, behavior=_hold_behavior) as (client, factory, container):
+    with _supervised(settings, tmp_path, hold=True) as (client, log_path, container):
         create_agent(client, name="dev-1", role="developer")
         container.supervisor_orchestrator._planner = _planner(_StubProvider(_PARALLEL))
         trigger = _ingest(client, external_id="om_parallel", thread_key="feishu:chat_parallel")
@@ -123,7 +124,10 @@ def test_independent_tickets_dispatch_in_same_round(
         for ticket in planned["tickets"]:
             _wait_ticket(client, ticket["id"], "running")
         # 两个替身 Run 同时在跑，而不是排队等第一张结束
-        assert len(factory.created) == 2
+        deadline = time.monotonic() + 5
+        while len(read_cli_argv(log_path)) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(read_cli_argv(log_path)) == 2
 
 
 def test_watchdog_endpoint_reports_idle(client: TestClient) -> None:

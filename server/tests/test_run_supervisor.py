@@ -31,9 +31,9 @@ from flux.core.agent_runtime import platforms
 from flux.core.agent_runtime.run_repository import AgentRunRepository, utcnow
 from flux.core.agent_runtime.supervisor import RunSupervisor
 from flux.core.event.bus import EventBus, Events
-from flux.core.task_engine import dsh_bridge
-from flux.core.task_engine.dsh_bridge import TaskRunBridge
+from flux.core.task_engine import run_bridge
 from flux.core.task_engine.repository import TaskRepository
+from flux.core.task_engine.run_bridge import TaskRunBridge
 from flux.db.session import create_engine, create_session_factory
 from flux.enums import BrainSection, DshRunStatus, TaskStatus
 from flux.models import Base
@@ -58,10 +58,9 @@ def _settings(tmp_path: Path, **overrides: object) -> Settings:
         anthropic_api_key=None,
         deepseek_api_key=None,
         default_provider="local",
-        dsh_enabled=True,
-        dsh_home=str(tmp_path / "dsh-home"),
-        dsh_workspace=str(tmp_path / "dsh-ws"),
-        dsh_mcp_enabled=False,
+        runtime_home=str(tmp_path / "runtime-home"),
+        runtime_workspace=str(tmp_path / "runtime-ws"),
+        mcp_enabled=False,
     )
     return base.model_copy(update=overrides) if overrides else base
 
@@ -78,9 +77,9 @@ async def test_startup_timeout_is_not_stuck_running(tmp_path: Path) -> None:
     clock = _Clock()
     settings = _settings(
         tmp_path,
-        dsh_startup_timeout_seconds=0.5,
-        dsh_idle_timeout_seconds=0,
-        dsh_hard_timeout_seconds=0,
+        run_startup_timeout_seconds=0.5,
+        run_idle_timeout_seconds=0,
+        run_hard_timeout_seconds=0,
     )
     repo, engine = await _repo(settings)
     bus = EventBus()
@@ -106,9 +105,9 @@ async def test_idle_timeout_after_no_progress(tmp_path: Path) -> None:
     clock = _Clock()
     settings = _settings(
         tmp_path,
-        dsh_startup_timeout_seconds=0,
-        dsh_idle_timeout_seconds=0.5,
-        dsh_hard_timeout_seconds=0,
+        run_startup_timeout_seconds=0,
+        run_idle_timeout_seconds=0.5,
+        run_hard_timeout_seconds=0,
     )
     repo, engine = await _repo(settings)
     sup = RunSupervisor(settings=settings, repository=repo, clock=clock)
@@ -138,9 +137,9 @@ async def test_hard_timeout_terminates_long_run(tmp_path: Path) -> None:
     clock = _Clock()
     settings = _settings(
         tmp_path,
-        dsh_startup_timeout_seconds=0,
-        dsh_idle_timeout_seconds=0,
-        dsh_hard_timeout_seconds=0.5,
+        run_startup_timeout_seconds=0,
+        run_idle_timeout_seconds=0,
+        run_hard_timeout_seconds=0.5,
     )
     repo, engine = await _repo(settings)
     sup = RunSupervisor(settings=settings, repository=repo, clock=clock)
@@ -166,7 +165,7 @@ async def test_cancel_cleans_the_whole_process_group(tmp_path: Path) -> None:
     （组标识同样是组长 pid）。探活用 `platforms.is_alive`——Windows 的 `os.kill(pid, 0)`
     会抛 ValueError（只支持 SIGTERM 与 CTRL_* 事件），旧写法在 Windows 上根本跑不了。
     """
-    settings = _settings(tmp_path, dsh_cancel_grace_seconds=0.3)
+    settings = _settings(tmp_path, run_cancel_grace_seconds=0.3)
     repo, engine = await _repo(settings)
     sup = RunSupervisor(settings=settings, repository=repo)
 
@@ -202,10 +201,10 @@ async def test_stuck_cancelling_is_self_healed(tmp_path: Path) -> None:
     clock = _Clock()
     settings = _settings(
         tmp_path,
-        dsh_startup_timeout_seconds=0,
-        dsh_idle_timeout_seconds=0,
-        dsh_hard_timeout_seconds=0,
-        dsh_cancel_grace_seconds=0,
+        run_startup_timeout_seconds=0,
+        run_idle_timeout_seconds=0,
+        run_hard_timeout_seconds=0,
+        run_cancel_grace_seconds=0,
     )
     repo, engine = await _repo(settings)
     sup = RunSupervisor(settings=settings, repository=repo, clock=clock)
@@ -229,9 +228,9 @@ async def test_restart_recovery_fixes_leftover_rows(tmp_path: Path) -> None:
     """TC-15F：重启后按真实进程/属主修正遗留非终态行，不留僵尸 running。"""
     settings = _settings(
         tmp_path,
-        dsh_startup_timeout_seconds=0,
-        dsh_idle_timeout_seconds=0,
-        dsh_hard_timeout_seconds=0,
+        run_startup_timeout_seconds=0,
+        run_idle_timeout_seconds=0,
+        run_hard_timeout_seconds=0,
     )
     repo, engine = await _repo(settings)
     sup = RunSupervisor(settings=settings, repository=repo, owner_pid=os.getpid())
@@ -290,7 +289,7 @@ async def _make_running_task(tasks: TaskRepository, description: str) -> uuid.UU
 
 def _age_orphan(monkeypatch: pytest.MonkeyPatch) -> None:
     """把宽限期清零，等价于"这条任务已经安静足够久"。"""
-    monkeypatch.setattr(dsh_bridge, "_ORPHAN_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(run_bridge, "_ORPHAN_GRACE_SECONDS", 0.0)
 
 
 async def test_orphan_task_without_run_returns_to_pending(
@@ -428,7 +427,7 @@ async def _retry_env(
     list[uuid.UUID],
 ]:
     """一套「任务已在跑、Run 刚失败」的环境，handler 只记录被调用的任务。"""
-    monkeypatch.setattr(dsh_bridge, "_AUTO_RETRY_DELAY_SECONDS", delay)
+    monkeypatch.setattr(run_bridge, "_AUTO_RETRY_DELAY_SECONDS", delay)
     tasks, runs, engine = await _task_env(tmp_path)
     task_id = await _make_running_task(tasks, "给项目补一个 /ping 接口")
     run_id = "run-retry-1"

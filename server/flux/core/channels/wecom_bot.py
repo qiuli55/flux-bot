@@ -1,0 +1,638 @@
+"""正式企业微信（WeCom）频道：加密回调入站 + 受审批保护的出站。
+
+与 Supervisor 的微信桥、飞书频道相互独立：这里面向企业微信自建应用的
+「接收消息与事件」回调（官方文档 path/90930），把文本消息变成 Flux Bot 的对话
+轮次；回复只落 `outbound_drafts` 并挂审批卡，用户点「允许」后才真正发送。
+
+入站：
+
+- GET 校验 URL：按官方约定验签（token / timestamp / nonce / echostr 字典序
+  sha1），解密 echostr 后**返回明文**，不是密文也不是 JSON；
+- POST 加密 XML：验签（密文参与排序）→ AES-CBC 解密 → 校验 receiveid；
+- 未配置 token 或 EncodingAESKey 时拒绝一切回调（fail-closed）；
+- 只处理 ``MsgType=text``，``MsgId`` 作为 ``client_turn_id`` 去重；
+- 同步建 turn 后立即回 ``success``，不等待模型完成。
+
+出站红线：**任何发给外部联系人的文本都不得自动发送**。只创建 pending 草稿并
+调用 `raise_approval`；只有「允许」才原子认领并调用企业微信应用消息接口，
+拒绝 / 发送失败都保留正文，绝不自动重试。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import time
+import uuid
+import xml.etree.ElementTree as ET
+from collections.abc import Mapping
+from contextlib import suppress
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+import httpx
+
+from flux.core.channels.wecom_crypto import WeComCryptoError, decrypt_message, verify_signature
+from flux.core.event.bus import Events
+from flux.core.task_engine.approvals import APPROVAL_ALLOW, raise_approval
+from flux.errors import AIOSError, NotFoundError
+from flux.logging import get_logger
+
+if TYPE_CHECKING:
+    from flux.container import Container
+
+logger = get_logger(__name__)
+
+__all__ = [
+    "WECOM_OUTBOUND_KIND",
+    "WeComBotChannel",
+    "WeComBotSender",
+    "WeComCallbackResult",
+]
+
+#: 出站审批使用的决策 kind（ASCII，便于检索与断言）
+WECOM_OUTBOUND_KIND = "wecom_outbound"
+#: 企业微信应用消息单条文本上限（官方为 2048 字节，按 UTF-8 字节保守截断）
+MAX_TEXT_BYTES = 2048
+#: 审批卡里展示的草稿摘录上限
+_DETAIL_TEXT_CHARS = 1500
+#: 回调体上限：正常消息远小于此，超限直接拒绝，避免 XML 解析消耗
+_MAX_BODY_BYTES = 1_048_576
+#: 官方成功响应：企业微信看到 ``success`` 或空串即认为已消费，不再重推
+_SUCCESS_BODY = "success"
+#: httpx 会把完整请求 URL 打到 INFO：企业微信的 access_token / corpsecret 在
+#: query 里，必须在这里脱敏，否则日志会带出凭据。
+_SECRET_QUERY_RE = re.compile(r"((?:access_token|corpsecret)=)[^&\s\"]+")
+
+
+class _RedactSecretQuery(logging.Filter):
+    """把 httpx 日志里的 access_token / corpsecret 值替换成 ``***``。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple):
+            record.args = tuple(_scrub(arg) for arg in args)
+        elif isinstance(args, dict):
+            record.args = {key: _scrub(value) for key, value in args.items()}
+        return True
+
+
+def _scrub(value: object) -> object:
+    if isinstance(value, httpx.URL):
+        text = str(value)
+    elif isinstance(value, str):
+        text = value
+    else:
+        return value
+    scrubbed = _SECRET_QUERY_RE.sub(r"\1***", text)
+    return scrubbed if scrubbed != text else value
+
+
+def _install_httpx_redaction() -> None:
+    """幂等安装一次；只影响 httpx 的日志记录，不改请求本身。"""
+    target = logging.getLogger("httpx")
+    if not any(isinstance(item, _RedactSecretQuery) for item in target.filters):
+        target.addFilter(_RedactSecretQuery())
+
+
+@dataclass(frozen=True)
+class WeComCallbackResult:
+    """回调处理结果：HTTP 状态码 + 纯文本返回体（不套统一 JSON 信封）。"""
+
+    status_code: int
+    body: str = _SUCCESS_BODY
+    media_type: str = "text/plain; charset=utf-8"
+    headers: dict[str, str] = field(default_factory=dict)
+
+
+class WeComBotSender:
+    """企业微信自建应用出站：access_token + 应用消息接口。
+
+    发送目标由草稿的 ``dest`` 决定：``touser`` 走 ``/cgi-bin/message/send``，
+    ``chatid`` 走 ``/cgi-bin/appchat/send``。日志与异常只带 errcode / errmsg，
+    绝不回显 corpsecret / access_token。
+    """
+
+    def __init__(
+        self,
+        *,
+        corp_id: str,
+        secret: str,
+        agent_id: str | int,
+        api_base: str = "https://qyapi.weixin.qq.com",
+        timeout_seconds: float = 15.0,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self._corp_id = corp_id
+        self._secret = secret
+        self._agent_id = _int_or_zero(agent_id)
+        self._api_base = api_base.rstrip("/") or "https://qyapi.weixin.qq.com"
+        self._timeout = max(1.0, float(timeout_seconds))
+        self._client = client
+        self._owns_client = client is None
+        self._token: str | None = None
+        self._token_expires_at = 0.0
+        self._lock = asyncio.Lock()
+        _install_httpx_redaction()
+
+    async def send_text(self, dest: Mapping[str, Any], text: str) -> None:
+        touser = str(dest.get("touser") or "").strip()
+        chatid = str(dest.get("chatid") or "").strip()
+        if not touser and not chatid:
+            raise RuntimeError("企业微信出站草稿缺少 touser / chatid")
+        content = _clip_text(text or "", MAX_TEXT_BYTES)
+        token = await self._access_token()
+        if chatid:
+            path = "/cgi-bin/appchat/send"
+            payload: dict[str, Any] = {
+                "chatid": chatid,
+                "msgtype": "text",
+                "text": {"content": content},
+            }
+        else:
+            path = "/cgi-bin/message/send"
+            payload = {
+                "touser": touser,
+                "msgtype": "text",
+                "agentid": self._agent_id,
+                "text": {"content": content},
+            }
+        response = await self._request(
+            "POST",
+            path,
+            params={"access_token": token},
+            json=payload,
+        )
+        _payload(response, "发送企业微信消息")
+
+    async def aclose(self) -> None:
+        if self._client is not None and self._owns_client:
+            await self._client.aclose()
+        self._client = None
+
+    async def _access_token(self) -> str:
+        """缓存 access_token，提前 60 秒过期，避免边界上刚好失效。"""
+        if self._token is not None and time.monotonic() < self._token_expires_at:
+            return self._token
+        async with self._lock:
+            if self._token is not None and time.monotonic() < self._token_expires_at:
+                return self._token
+            response = await self._request(
+                "GET",
+                "/cgi-bin/gettoken",
+                params={"corpid": self._corp_id, "corpsecret": self._secret},
+            )
+            data = _payload(response, "获取企业微信 access_token")
+            token = str(data.get("access_token") or "")
+            if not token:
+                raise RuntimeError("企业微信 access_token 响应缺少令牌")
+            expires_in = int(data.get("expires_in") or 7200)
+            self._token = token
+            self._token_expires_at = time.monotonic() + max(60, expires_in - 60)
+            return token
+
+    async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        client = self._client
+        if client is None:
+            client = httpx.AsyncClient(timeout=self._timeout)
+            self._client = client
+            self._owns_client = True
+        return await client.request(method, f"{self._api_base}{path}", **kwargs)
+
+
+def _int_or_zero(value: str | int | None) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+def _payload(response: httpx.Response, label: str) -> dict[str, Any]:
+    """解析企业微信响应；errcode 非 0 或 HTTP 失败都抛 RuntimeError。"""
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"{label}失败：响应不是 JSON（HTTP {response.status_code}）") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{label}失败：响应结构异常（HTTP {response.status_code}）")
+    errcode = data.get("errcode")
+    if response.status_code >= 400 or errcode not in (0, None):
+        errmsg = data.get("errmsg") or ""
+        raise RuntimeError(
+            f"{label}失败：HTTP {response.status_code} errcode={errcode} {errmsg}"[:500]
+        )
+    return data
+
+
+class WeComBotChannel:
+    """企业微信正式频道：回调验签/解密、入站建 turn、出站走审批。"""
+
+    def __init__(
+        self,
+        container: Container,
+        *,
+        corp_id: str | None = None,
+        agent_id: str | None = None,
+        secret: str | None = None,
+        token: str | None = None,
+        encoding_aes_key: str | None = None,
+        api_base: str = "https://qyapi.weixin.qq.com",
+        bot_id: str | None = None,
+        sender: Any | None = None,
+        turn_wait_seconds: float = 900.0,
+    ) -> None:
+        self._container = container
+        self._corp_id = (corp_id or "").strip() or None
+        self._agent_id = (str(agent_id).strip() if agent_id is not None else "") or None
+        self._token = (token or "").strip() or None
+        self._encoding_aes_key = (encoding_aes_key or "").strip() or None
+        self._bot_id = _parse_uuid(bot_id)
+        if (bot_id or "").strip() and self._bot_id is None:
+            logger.warning("FLUX_WECOM_BOT_ID 不是合法 UUID，企业微信消息事件将被拒绝")
+        if sender is not None:
+            self._sender = sender
+        elif self._corp_id and secret and self._agent_id:
+            self._sender = WeComBotSender(
+                corp_id=self._corp_id,
+                secret=secret,
+                agent_id=self._agent_id,
+                api_base=api_base,
+            )
+        else:
+            self._sender = None
+        self._background: set[asyncio.Task[Any]] = set()
+        #: 同一对话任务同一时刻只挂一张出站审批卡，与飞书频道同口径。
+        self._approval_lock = asyncio.Lock()
+        self._turn_wait_seconds = max(1.0, float(turn_wait_seconds))
+
+    # --- 回调入口 ---
+
+    @property
+    def configured(self) -> bool:
+        """token 与 EncodingAESKey 缺一不可；未配置时拒绝一切回调。"""
+        return self._token is not None and self._encoding_aes_key is not None
+
+    async def handle_get(self, query: Mapping[str, str]) -> WeComCallbackResult:
+        """校验 URL（VerifyURL）：验签 → 解密 echostr → 原样返回明文。"""
+        if not self.configured:
+            logger.warning("企业微信回调未配置 token / EncodingAESKey，已拒绝校验请求")
+            return WeComCallbackResult(400, "未配置企业微信回调 token 或 EncodingAESKey，拒绝处理")
+
+        signature = _query(query, "msg_signature")
+        timestamp = _query(query, "timestamp")
+        nonce = _query(query, "nonce")
+        echostr = _query(query, "echostr")
+        if not signature or not timestamp or not nonce or not echostr:
+            logger.warning("企业微信校验请求缺少 msg_signature / timestamp / nonce / echostr")
+            return WeComCallbackResult(403, "企业微信回调签名参数不完整")
+
+        if not verify_signature(
+            token=self._token,
+            timestamp=timestamp,
+            nonce=nonce,
+            encrypted=echostr,
+            signature=signature,
+        ):
+            logger.warning("企业微信校验请求签名不匹配，已拒绝")
+            return WeComCallbackResult(403, "企业微信回调签名校验失败")
+
+        try:
+            plaintext, _receiveid = decrypt_message(
+                self._encoding_aes_key or "",
+                echostr,
+                expected_receiveid=self._corp_id,
+            )
+        except WeComCryptoError as exc:
+            logger.warning("企业微信 echostr 解密失败：%s", exc)
+            return WeComCallbackResult(400, "企业微信 echostr 解密失败")
+        logger.info("wecom.verify ok chars=%s", len(plaintext))
+        return WeComCallbackResult(200, plaintext)
+
+    async def handle_post(self, body: bytes, query: Mapping[str, str]) -> WeComCallbackResult:
+        """接收消息与事件：验签/解密后同步建 turn，立即回 success。"""
+        if not self.configured:
+            logger.warning("企业微信回调未配置 token / EncodingAESKey，已拒绝消息回调")
+            return WeComCallbackResult(400, "未配置企业微信回调 token 或 EncodingAESKey，拒绝处理")
+
+        raw = body or b""
+        if len(raw) > _MAX_BODY_BYTES:
+            return WeComCallbackResult(400, "企业微信回调体过大")
+        outer = _parse_xml(raw)
+        if outer is None:
+            return WeComCallbackResult(400, "企业微信回调不是合法 XML")
+        encrypted = _xml_text(outer, "Encrypt")
+        if not encrypted:
+            return WeComCallbackResult(400, "企业微信回调缺少 Encrypt 字段")
+
+        signature = _query(query, "msg_signature")
+        timestamp = _query(query, "timestamp")
+        nonce = _query(query, "nonce")
+        if not signature or not timestamp or not nonce:
+            logger.warning("企业微信消息回调缺少签名参数")
+            return WeComCallbackResult(403, "企业微信回调签名参数不完整")
+        if not verify_signature(
+            token=self._token,
+            timestamp=timestamp,
+            nonce=nonce,
+            encrypted=encrypted,
+            signature=signature,
+        ):
+            logger.warning("企业微信消息回调签名不匹配，已拒绝")
+            return WeComCallbackResult(403, "企业微信回调签名校验失败")
+
+        try:
+            plaintext, _receiveid = decrypt_message(
+                self._encoding_aes_key or "",
+                encrypted,
+                expected_receiveid=self._corp_id,
+            )
+        except WeComCryptoError as exc:
+            logger.warning("企业微信消息回调解密失败：%s", exc)
+            return WeComCallbackResult(400, "企业微信消息回调解密失败")
+
+        message = _parse_xml(plaintext.encode("utf-8"))
+        if message is None:
+            return WeComCallbackResult(400, "企业微信消息明文不是合法 XML")
+
+        msg_type = _xml_text(message, "MsgType")
+        if msg_type != "text":
+            logger.info("wecom.inbound.ignored type=%s", msg_type or "unknown")
+            return WeComCallbackResult(200, _SUCCESS_BODY)
+
+        message_id = _xml_text(message, "MsgId")
+        from_user = _xml_text(message, "FromUserName")
+        text = _xml_text(message, "Content")
+        if not message_id or not from_user:
+            return WeComCallbackResult(400, "企业微信消息缺少 MsgId / FromUserName")
+        if not text:
+            logger.info("wecom.inbound.ignored type=text reason=empty")
+            return WeComCallbackResult(200, _SUCCESS_BODY)
+
+        # 以下都要知道这条频道归属哪个 Bot，否则 fail-closed。
+        bot_id = self._bot_id
+        if bot_id is None:
+            return WeComCallbackResult(
+                400, "未配置合法的 FLUX_WECOM_BOT_ID，拒绝处理企业微信消息事件"
+            )
+
+        try:
+            bot = await self._container.bots.get(bot_id)
+        except NotFoundError:
+            logger.warning("企业微信回调指向的 Bot 不存在 bot=%s", bot_id)
+            return WeComCallbackResult(404, "FLUX_WECOM_BOT_ID 指向的 Bot 不存在")
+
+        try:
+            turn, created = await self._container.bot_conversation.create_turn(
+                bot, content=text, client_turn_id=message_id
+            )
+        except AIOSError as exc:
+            logger.warning(
+                "企业微信入站建 turn 失败 bot=%s message=%s code=%s",
+                bot_id,
+                message_id,
+                exc.code,
+            )
+            return WeComCallbackResult(exc.http_status, f"{exc.message}（{exc.code}）")
+
+        if created:
+            self._schedule_tracking(bot=bot, turn=turn, touser=from_user, message_id=message_id)
+        logger.info(
+            "wecom.inbound bot=%s message=%s turn=%s created=%s",
+            bot_id,
+            message_id,
+            turn.id,
+            created,
+        )
+        return WeComCallbackResult(200, _SUCCESS_BODY)
+
+    # --- 审批结果 ---
+
+    async def on_approval_resolved(self, event: str, payload: dict[str, Any]) -> None:
+        """审批结果监听：只有「允许」才发送，且同一条草稿最多发送一次。"""
+        if event != Events.APPROVAL_RESOLVED:
+            return
+        if payload.get("kind") != WECOM_OUTBOUND_KIND:
+            return
+
+        meta = payload.get("meta")
+        meta = meta if isinstance(meta, dict) else {}
+        raw_draft_id = str(meta.get("draft_id") or "").strip()
+        if not raw_draft_id:
+            logger.warning("企业微信出站审批缺少 draft_id，已跳过")
+            return
+        try:
+            draft_id = uuid.UUID(raw_draft_id)
+        except ValueError:
+            logger.warning("企业微信出站审批的 draft_id 非法，已跳过 draft=%s", raw_draft_id)
+            return
+
+        service = getattr(self._container, "outbound_drafts", None)
+        if service is None:  # pragma: no cover - 装配错误，按 fail-closed 跳过
+            logger.error("出站草稿服务未装配，审批结果已忽略 draft=%s", raw_draft_id)
+            return
+
+        if payload.get("result") != "allowed" or payload.get("chosen") != APPROVAL_ALLOW:
+            await service.mark_denied(draft_id)
+            logger.info(
+                "wecom.outbound.skip decision=%s result=%s draft=%s",
+                payload.get("decision_id"),
+                payload.get("result"),
+                raw_draft_id,
+            )
+            return
+
+        draft = await service.claim(draft_id)
+        if draft is None:
+            logger.info("企业微信出站草稿不存在或已被处理 draft=%s", raw_draft_id)
+            return
+        dest = draft.dest if isinstance(draft.dest, dict) else {}
+        touser = str(dest.get("touser") or "").strip()
+        chatid = str(dest.get("chatid") or "").strip()
+        if draft.channel != "wecom" or not (touser or chatid):
+            await service.mark_failed(draft.id, "channel_or_dest_mismatch")
+            logger.error(
+                "企业微信出站草稿的频道或目标不匹配 draft=%s channel=%s dest_keys=%s",
+                draft.id,
+                draft.channel,
+                sorted(dest),
+            )
+            return
+        sender = self._sender
+        if sender is None:
+            # 不是「取走即丢」：标 failed 并保留正文，配置好凭据后仍可看到。
+            await service.mark_failed(draft.id, "sender_not_configured")
+            logger.error(
+                "未配置企业微信应用凭据，审批通过的草稿无法发送 draft=%s dest_keys=%s",
+                draft.id,
+                sorted(dest),
+            )
+            return
+        try:
+            await sender.send_text(dest, draft.body)
+        except Exception as exc:  # noqa: BLE001 - 发送失败只记录，不能拖垮决策接口
+            await service.mark_failed(draft.id, exc)
+            logger.exception(
+                "企业微信出站发送失败 draft=%s dest_keys=%s hash=%s chars=%s",
+                draft.id,
+                sorted(dest),
+                draft.body_hash,
+                len(draft.body or ""),
+            )
+            return
+        await service.mark_sent(draft.id)
+        logger.info(
+            "企业微信出站已发送 draft=%s dest_keys=%s hash=%s chars=%s",
+            draft.id,
+            sorted(dest),
+            draft.body_hash,
+            len(draft.body or ""),
+        )
+
+    async def aclose(self) -> None:
+        tasks = [task for task in self._background if not task.done()]
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
+        self._background.clear()
+        close = getattr(self._sender, "aclose", None)
+        if close is not None:
+            await close()
+
+    # --- 内部 ---
+
+    def _schedule_tracking(self, *, bot: Any, turn: Any, touser: str, message_id: str) -> None:
+        task = asyncio.create_task(
+            self._track_turn(bot=bot, turn=turn, touser=touser, message_id=message_id),
+            name="flux-wecom-turn",
+        )
+        self._background.add(task)
+
+        def _cleanup(done: asyncio.Task[Any]) -> None:
+            self._background.discard(done)
+
+        task.add_done_callback(_cleanup)
+
+    async def _track_turn(self, *, bot: Any, turn: Any, touser: str, message_id: str) -> None:
+        """等这一轮结束；有回复就生成草稿并挂审批，绝不直接发送。"""
+        try:
+            final = await self._container.bot_conversation.wait_for_turn(
+                bot.id, turn.id, wait_seconds=self._turn_wait_seconds
+            )
+            if final.status != "completed" or final.reply_message_id is None:
+                logger.info(
+                    "企业微信 turn 未产生可发送回复 turn=%s status=%s", turn.id, final.status
+                )
+                return
+            async with self._approval_lock:
+                task = await self._container.task_repo.get(final.task_id)
+                if task.pending_decision() is not None:
+                    logger.info(
+                        "对话里已有待决策项，跳过新增企业微信出站审批 turn=%s task=%s",
+                        turn.id,
+                        final.task_id,
+                    )
+                    return
+                reply = await self._container.task_repo.get_message(
+                    final.task_id, final.reply_message_id
+                )
+                text = (reply.content or "").strip() if reply is not None else ""
+                if not text:
+                    logger.info("企业微信 turn 回复为空，不生成出站草稿 turn=%s", turn.id)
+                    return
+
+                service = self._container.outbound_drafts
+                decision_id = uuid.uuid4().hex
+                draft = await service.create(
+                    channel="wecom",
+                    body=text,
+                    dest={"touser": touser, "message_id": message_id},
+                    bot_id=bot.id,
+                    task_id=final.task_id,
+                    turn_id=final.id,
+                    decision_id=decision_id,
+                )
+                await raise_approval(
+                    self._container,
+                    task_id=final.task_id,
+                    run_id=None,
+                    kind=WECOM_OUTBOUND_KIND,
+                    decision_id=decision_id,
+                    title="企业微信回复等待你确认",
+                    detail=(
+                        f"准备发送到企业微信成员 {touser}（消息 {message_id}）：\n\n"
+                        f"{_excerpt(text)}"
+                    ),
+                    meta={
+                        "channel": "wecom",
+                        "draft_id": str(draft.id),
+                        "touser": touser,
+                        "message_id": message_id,
+                        "bot_id": str(bot.id),
+                        "turn_id": str(final.id),
+                        "text_hash": draft.body_hash,
+                        "chars": len(text),
+                    },
+                )
+                logger.info(
+                    "企业微信出站审批已创建 draft=%s turn=%s task=%s hash=%s chars=%s",
+                    draft.id,
+                    final.id,
+                    final.task_id,
+                    draft.body_hash,
+                    len(text),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 后台跟踪失败只记录 id，不影响回调
+            logger.exception("企业微信 turn 跟踪失败 turn=%s", getattr(turn, "id", "?"))
+
+
+def _query(query: Mapping[str, str], name: str) -> str:
+    value = query.get(name)
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _parse_uuid(value: str | None) -> uuid.UUID | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        return uuid.UUID(raw)
+    except ValueError:
+        return None
+
+
+def _parse_xml(raw: bytes) -> ET.Element | None:
+    """解析回调 XML；拒绝 DTD / 实体声明，避免实体膨胀消耗。"""
+    lowered = raw.lower()
+    if b"<!doctype" in lowered or b"<!entity" in lowered:
+        return None
+    try:
+        return ET.fromstring(raw)
+    except (ET.ParseError, ValueError, LookupError):
+        return None
+
+
+def _xml_text(root: ET.Element, tag: str) -> str:
+    value = root.findtext(tag)
+    if not isinstance(value, str):
+        return ""
+    # 企业微信 XML 常用 CDATA；ElementTree 已还原为文本，这里只去首尾空白。
+    return value.strip()
+
+
+def _clip_text(text: str, max_bytes: int) -> str:
+    """按 UTF-8 字节数截断，且不把多字节字符切成半个。"""
+    raw = text.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return text
+    return raw[:max_bytes].decode("utf-8", "ignore")
+
+
+def _excerpt(text: str) -> str:
+    if len(text) <= _DETAIL_TEXT_CHARS:
+        return text
+    return text[:_DETAIL_TEXT_CHARS] + "…"

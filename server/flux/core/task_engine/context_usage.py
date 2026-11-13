@@ -32,6 +32,8 @@ CONTEXT_MESSAGE_KINDS: tuple[str, ...] = (
     "handoff",
     "secure_input",
     "secure_input_result",
+    # 后台子任务的开始/完成/失败/取消回执：后续轮次必须知道「刚才那件长活做完了没」。
+    "subtask",
 )
 
 #: 达到这个占用比例就提醒「上下文快满了，要不要新建对话」。

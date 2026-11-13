@@ -88,7 +88,7 @@ def test_parse_decision_treats_pass_as_silence() -> None:
 
 async def test_admin_wave_hands_off_by_mention(container: Container) -> None:
     """有群主时：没点名 → 群主先说；群主 @ 同伴 → 同伴接棒；没人再接就结束。"""
-    admin = await _make_bot(container, "群主", model="deepseek-v4-flash")
+    admin = await _make_bot(container, "群主", model="claude-sonnet-5-5")
     helper = await _make_bot(container, "发布")
     group_id = await _make_group(container, "运营群", [admin, helper], admin=admin)
     epoch_id = await _start_epoch(container, group_id, "今天的数据怎么样？")
@@ -104,7 +104,7 @@ async def test_admin_wave_hands_off_by_mention(container: Container) -> None:
 
     assert router.called == ["群主", "发布"]
     # per-bot 模型：群主的 model 覆盖透传给路由器
-    assert router.kwargs[0]["model"] == "deepseek-v4-flash"
+    assert router.kwargs[0]["model"] == "claude-sonnet-5-5"
     assert "model" not in router.kwargs[1]
 
     messages, _ = await container.group_repo.list_messages(group_id)
