@@ -89,7 +89,7 @@ def _headers(account: str) -> dict[str, str]:
 
 
 def _register_fake_api_key_connector(client: TestClient, connector_id: str = "acme") -> None:
-    """测试内注册一个 api_key 类定义；生产目录仍然只有 GitHub。"""
+    """测试内注册一个假的 api_key 类定义，避免依赖生产目录里的具体连接器。"""
     from flux.core.connectors.framework import ConnectorDefinition
 
     client.app.state.container.connector_framework.register(
@@ -106,21 +106,27 @@ def _register_fake_api_key_connector(client: TestClient, connector_id: str = "ac
 # --- catalog ---
 
 
-def test_catalog_lists_only_github_by_default(settings: Settings, db_schema: None) -> None:
+def test_catalog_lists_github_and_calendar_by_default(settings: Settings, db_schema: None) -> None:
     with _client(settings, db_schema) as client:
         response = client.get(f"{PREFIX}/connectors/catalog")
 
     assert response.status_code == 200, response.text
     entries = response.json()["data"]
-    assert entries == [
-        {
-            "id": "github",
-            "name": "GitHub",
-            "description": "代码仓库、Issue、PR 与 Actions",
-            "auth_types": ["oauth"],
-            "scopes": ["repo", "read:user"],
-        }
-    ]
+    assert entries[0] == {
+        "id": "github",
+        "name": "GitHub",
+        "description": "代码仓库、Issue、PR 与 Actions",
+        "auth_types": ["oauth"],
+        "scopes": ["repo", "read:user"],
+    }
+    assert entries[1] == {
+        "id": "calendar",
+        "name": "Calendar (CalDAV / ICS)",
+        "description": "读取已发布的 ICS 订阅或 CalDAV 日历，查看事件并在 CalDAV 上新建事件",
+        "auth_types": ["api_key"],
+        "scopes": ["calendar.read", "calendar.write"],
+    }
+    assert len(entries) == 2
 
 
 def test_catalog_does_not_include_account_data(settings: Settings, db_schema: None) -> None:
@@ -130,9 +136,10 @@ def test_catalog_does_not_include_account_data(settings: Settings, db_schema: No
             "data"
         ]
 
-    assert entries[0]["id"] == "github"
-    assert "account" not in entries[0]
-    assert "connected" not in entries[0]
+    assert [entry["id"] for entry in entries] == ["github", "calendar"]
+    for entry in entries:
+        assert "account" not in entry
+        assert "connected" not in entry
 
 
 # --- GitHub 既有流程 ---
@@ -158,14 +165,15 @@ def test_github_login_flow_and_list_shape(settings: Settings, db_schema: None) -
         listed = client.get(f"{PREFIX}/connectors", headers=_headers(ACCOUNT_A))
         assert listed.status_code == 200, listed.text
         rows = listed.json()["data"]
-        assert len(rows) == 1
-        row = rows[0]
+        row = next(item for item in rows if item["id"] == "github")
         assert set(row) >= GITHUB_ROW_KEYS
-        assert row["id"] == "github"
         assert row["connected"] is True
         assert row["account"] == "octocat"
         assert row["display_name"] == "The Octocat"
         assert row["scopes"] == ["repo", "read:user"]
+        calendar_row = next(item for item in rows if item["id"] == "calendar")
+        assert calendar_row["connected"] is False
+        assert calendar_row["account"] == ""
         # 令牌绝不出现在响应里
         assert "gho_super_secret_token" not in listed.text
 
@@ -180,12 +188,10 @@ def test_github_state_is_isolated_between_accounts(settings: Settings, db_schema
         ).json()["data"]["flow_id"]
         client.get(f"{PREFIX}/connectors/github/login/{flow_id}", headers=_headers(ACCOUNT_A))
 
-        connected_a = client.get(f"{PREFIX}/connectors", headers=_headers(ACCOUNT_A)).json()[
-            "data"
-        ][0]
-        connected_b = client.get(f"{PREFIX}/connectors", headers=_headers(ACCOUNT_B)).json()[
-            "data"
-        ][0]
+        rows_a = client.get(f"{PREFIX}/connectors", headers=_headers(ACCOUNT_A)).json()["data"]
+        rows_b = client.get(f"{PREFIX}/connectors", headers=_headers(ACCOUNT_B)).json()["data"]
+        connected_a = next(item for item in rows_a if item["id"] == "github")
+        connected_b = next(item for item in rows_b if item["id"] == "github")
         assert connected_a["connected"] is True
         assert connected_b["connected"] is False
         assert connected_b["account"] == ""
@@ -194,7 +200,8 @@ def test_github_state_is_isolated_between_accounts(settings: Settings, db_schema
         removed_b = client.delete(f"{PREFIX}/connectors/github", headers=_headers(ACCOUNT_B))
         assert removed_b.status_code == 200
         assert removed_b.json()["data"]["connected"] is False
-        still_a = client.get(f"{PREFIX}/connectors", headers=_headers(ACCOUNT_A)).json()["data"][0]
+        rows_a = client.get(f"{PREFIX}/connectors", headers=_headers(ACCOUNT_A)).json()["data"]
+        still_a = next(item for item in rows_a if item["id"] == "github")
         assert still_a["connected"] is True
         assert still_a["account"] == "octocat"
 
@@ -211,12 +218,9 @@ def test_github_uninstall_via_generic_route_is_isolated(
         removed = client.delete(f"{PREFIX}/connectors/github", headers=_headers(ACCOUNT_A))
         assert removed.status_code == 200
         assert removed.json()["data"]["connected"] is False
-        assert (
-            client.get(f"{PREFIX}/connectors", headers=_headers(ACCOUNT_A)).json()["data"][0][
-                "connected"
-            ]
-            is False
-        )
+        rows = client.get(f"{PREFIX}/connectors", headers=_headers(ACCOUNT_A)).json()["data"]
+        github_row = next(item for item in rows if item["id"] == "github")
+        assert github_row["connected"] is False
         # 卸载是幂等的
         again = client.delete(f"{PREFIX}/connectors/github", headers=_headers(ACCOUNT_A))
         assert again.status_code == 200

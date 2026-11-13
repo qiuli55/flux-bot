@@ -560,6 +560,19 @@ class ConnectorInstallRequest(BaseModel):
     api_key: str | None = Field(default=None, max_length=4096)
     #: 不传时使用 catalog 定义里的默认 scopes。
     scopes: list[str] | None = Field(default=None, max_length=64)
+    #: 连接器专属配置（日历：mode / url / username / password / timeout）。
+    #: 密码也可以放在 api_key；接口响应与日志都不会回显这里的内容。
+    settings: dict[str, Any] | None = Field(default=None)
+
+
+class CalendarEventCreateRequest(BaseModel):
+    """在 CalDAV 日历上新建事件（ICS 订阅只读）。"""
+
+    title: str = Field(min_length=1, max_length=500)
+    start: str = Field(min_length=1, max_length=64)
+    end: str = Field(min_length=1, max_length=64)
+    description: str | None = Field(default=None, max_length=20000)
+    location: str | None = Field(default=None, max_length=1000)
 
 
 class GitPathsRequest(BaseModel):
