@@ -248,6 +248,12 @@ class Settings(BaseSettings):
     mcp_agent_id: str = "flux-builtin"
     # 单次工具调用超时（毫秒）
     mcp_tool_timeout_ms: int = 60000
+    # Claude Code 内核的扩展 MCP server（运维扩展点，JSON 对象字符串，形状同
+    # Claude Code 的 mcpServers）。只接受 http / sse 型远程 server：stdio / command
+    # 会在容器内拉起任意进程，一律拒绝；"flux" 是保留名。解析与校验见
+    # flux.core.agent_runtime.extra_mcp。示例：
+    # {"browser": {"type": "http", "url": "http://playwright-mcp:8931/mcp"}}
+    claude_extra_mcp_servers: str = ""
 
     # --- 外部 CLI Agent：Codex 的模型通道（P2-1 §6.2 续，2026-10-06）---
     # codex 把「鉴权方式」当全局状态，Flux 只能给它一个隔离的 CODEX_HOME（顺便注入 MCP），
