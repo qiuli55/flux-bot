@@ -46,6 +46,7 @@ from flux.core.agent_runtime.codex_account import (
     codex_proxy_env,
     sync_account_auth,
 )
+from flux.core.agent_runtime.extra_mcp import parse_extra_mcp_servers
 from flux.core.agent_runtime.model_catalog import PROVIDER_TITLES
 from flux.core.agent_runtime.platforms import kill_group, secure_file, signal_group_graceful
 from flux.core.agent_runtime.protocol import build_runtime_env, compose_instruction
@@ -338,6 +339,11 @@ _SPECS: dict[str, _CliSpec] = {
 
 #: Flux 权限模式 → Claude Code `--permission-mode`：
 #: plan 只读、normal 默认逐次询问、unattended/full 不再打断（Flux 侧令牌与审批仍生效）。
+#: 额外注入的 MCP server（claude_extra_mcp_servers）共用这张映射，不单独放行。
+#: 注意 headless 语义：`claude -p` 下 default 模式无人可应答审批，需要授权的工具调用
+#: （MCP 工具、Bash、编辑）会被直接拒绝，所以 normal 实际是"未预授权即拒绝"而非逐次
+#: 询问；扩展 server 的工具在 normal 下同样不可用，需要时用 unattended / full 或
+#: --allowedTools 预放行（后续可把 --permission-prompt-tool 接到 Flux 审批卡）。
 _CLAUDE_PERMISSION_MODES: dict[str, str] = {
     PermissionMode.PLAN.value: "plan",
     PermissionMode.NORMAL.value: "default",
@@ -1285,6 +1291,23 @@ class CliRuntime:
             else:
                 headers["X-Flux-Run-Id"] = run_id
             servers["flux"] = {"type": "http", "url": url, "headers": headers}
+        # 运维扩展点：合并 FLUX_CLAUDE_EXTRA_MCP_SERVERS 里的额外 MCP server（解析阶段
+        # 只放行 http / sse 远程型，详见 extra_mcp.py）。Flux 的 "flux" 条目恒胜：解析
+        # 阶段已丢弃同名项，这里再用 setdefault 兜第二道，绝不覆盖真实端点。
+        # 权限：这里不做任何额外放行——plan / normal 模式下扩展 server 的工具与 flux
+        # 工具一样受 --permission-mode 约束。Bot 以 `claude -p`（headless）运行，
+        # default 模式无人可应答审批，未预授权的工具调用会被直接拒绝，因此 normal
+        # 下扩展 server（如 browser）的工具实际不可用，而不是逐次询问；只有
+        # unattended / full 才整体放行（映射见 _CLAUDE_PERMISSION_MODES）。需要浏览器
+        # 时用 unattended / full，或后续把 --permission-prompt-tool 接到 Flux 审批卡。
+        extra_servers = parse_extra_mcp_servers(
+            getattr(self._settings, "claude_extra_mcp_servers", "")
+        )
+        if extra_servers:
+            for name, spec in extra_servers.items():
+                servers.setdefault(name, spec)
+            # 只记名字：headers 里可能有令牌。
+            logger.info("Claude 本轮注入扩展 MCP server：%s", ", ".join(extra_servers))
         mcp_file = config_dir / "mcp.json"
         mcp_file.write_text(
             json.dumps({"mcpServers": servers}, ensure_ascii=False, indent=2) + "\n",
