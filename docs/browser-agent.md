@@ -247,6 +247,12 @@ docker compose -f docker-compose.yml -f docker-compose.browser.yml exec flux-bot
 docker compose -f docker-compose.yml -f docker-compose.browser.yml exec playwright-mcp \
   sh -c 'mkdir -p /home/node/output /home/node/profiles/default && \
          touch /home/node/output/.probe && echo writable'
+
+# 6) 用只读状态接口让服务端替你探活（要求 FLUX_AUTH_TOKEN；2 秒超时，结果缓存 30 秒）
+curl -H "Authorization: Bearer $FLUX_AUTH_TOKEN" \
+  http://127.0.0.1:8600/api/v1/browser/status
+# configured=false 表示 FLUX_CLAUDE_EXTRA_MCP_SERVERS 里没有 browser 条目（不会探活）；
+# configured=true 时看 ok / status_code / latency_ms / error / cached。
 ```
 
 ##### 验证登录态确实能持久化（手工 / 集成验证）

@@ -405,8 +405,14 @@ class WeComBotChannel:
                 message_id,
                 exc.code,
             )
+            activity = getattr(self._container, "channel_activity", None)
+            if activity is not None:
+                activity.record_error("wecom", exc.code, exc.message)
             return WeComCallbackResult(exc.http_status, f"{exc.message}（{exc.code}）")
 
+        activity = getattr(self._container, "channel_activity", None)
+        if activity is not None:
+            activity.record_receive("wecom")
         if created:
             self._schedule_tracking(bot=bot, turn=turn, touser=from_user, message_id=message_id)
         logger.info(

@@ -62,6 +62,21 @@ FLUX_BIND_ADDR=0.0.0.0    # 此时必须同时设置 FLUX_AUTH_TOKEN
 旧的无鉴权行为只能显式开启：`FLUX_ALLOW_NO_AUTH=true`。它仅适用于完全可信的内网，
 启动时会打印 WARNING；不要与公网暴露一起使用。
 
+### 只读状态接口
+
+排查频道与浏览器 sidecar 时有两个只读接口（都要求 `FLUX_AUTH_TOKEN`；只返回环境变量
+**名字**、收发时间与错误摘要，不返回任何密钥）：
+
+```bash
+curl -H "Authorization: Bearer $FLUX_AUTH_TOKEN" http://127.0.0.1:8600/api/v1/channels/status
+curl -H "Authorization: Bearer $FLUX_AUTH_TOKEN" http://127.0.0.1:8600/api/v1/browser/status
+```
+
+- `channels/status`：配置缺失只列 `FLUX_*` 变量名；最近发送来自 `outbound_drafts`，
+  最近接收 / 入站错误是进程内登记（重启清空）。
+- `browser/status`：未配置 `browser` MCP 时不发网络请求；配置后 2 秒超时探活，
+  成功与失败都缓存 30 秒。
+
 ### 接入 Claude Code
 
 镜像里已经装好 `@anthropic-ai/claude-code`，但 Claude Code 的接入状态还需要登记为
