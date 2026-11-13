@@ -5,6 +5,10 @@
 
 `key` 只有平台维护的 Environment 条目使用（同一 key 幂等更新，平台升级时刷新内容）；
 User 条目的 key 恒为 NULL——同一唯一约束下多个 NULL 互相不冲突，两类写入共用一张表。
+
+Phase 2 起 User 层按人隔离：`cloud_user_id` 记录这条记忆属于哪个 Flux 云用户。
+Environment 层是平台规则，保持全局，该列留 NULL；历史 User 行的 NULL 归
+`FLUX_OWNER_CLOUD_USER_ID` 配置的主用户（见 `flux.core.user_scope`）。
 """
 
 from __future__ import annotations
@@ -28,6 +32,8 @@ class MemoryEntry(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     layer: Mapped[str] = mapped_column(String(16), index=True)
     # 平台维护条目的稳定标识（如 runtime.proposal_required）；User 条目为 NULL
     key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: User 记忆的归属人（Flux 云用户 id）；Environment 恒为 NULL
+    cloud_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     content: Mapped[str] = mapped_column(Text)
     # 来源记录：这条记忆是"谁以什么方式"写的（user / platform），便于审计与清理
     source: Mapped[str] = mapped_column(String(64), default="", server_default="")
@@ -42,6 +48,7 @@ class MemoryEntry(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "id": str(self.id),
             "layer": self.layer,
             "key": self.key,
+            "cloud_user_id": self.cloud_user_id,
             "content": self.content,
             "source": self.source,
             "metadata": self.meta or {},

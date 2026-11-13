@@ -1,6 +1,7 @@
 """三层长期记忆 API（批次② §4.2 / §4.3）。
 
-- User Memory：跨 Workspace，用户确认后经本组接口写入，可查可删；
+- User Memory：跨 Workspace，用户确认后经本组接口写入，可查可删；Phase 2 起按
+  Flux 云用户隔离（当前登录人）——看不到、也改不了别人的条目；
 - Environment Memory：全局平台运行规则，由平台代码维护——本组接口只读；
 - Project Memory：底座是 Project Brain，读写走 `/projects/{id}/memory`，本组接口只读。
 
@@ -14,6 +15,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, Query
 
+from flux.api.auth import get_current_cloud_user_id
 from flux.api.deps import get_container
 from flux.api.response import ok
 from flux.container import Container
@@ -30,9 +32,13 @@ async def recall_memory(
         default=None, description="项目 UUID；带上时在两层之上拼入该项目的 Project Memory"
     ),
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
-    """三层统一读取口：Environment → User →（可选）Project，按优先级排序并附来源。"""
-    data = await container.memory.recall(project_id=project_id)
+    """三层统一读取口：Environment → User →（可选）Project，按优先级排序并附来源。
+
+    Environment 全局可见；User 层只返回当前登录人的条目。
+    """
+    data = await container.memory.recall(project_id=project_id, cloud_user_id=cloud_user_id)
     return ok(data, metadata={"layers": len(data["layers"])})
 
 
@@ -85,19 +91,28 @@ async def list_memory_entries(
         default=None, description="按层过滤；缺省返回 Environment + User 两层"
     ),
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """列出未过期条目。Project 层请走 `GET /projects/{project_id}/memory`。"""
-    entries = await container.memory.list_entries(layer=layer)
+    entries = await container.memory.list_entries(layer=layer, cloud_user_id=cloud_user_id)
     return ok([entry.to_dict() for entry in entries], metadata={"count": len(entries)})
 
 
 @router.post("/entries")
 async def write_memory_entry(
-    payload: UserMemoryWriteRequest, container: Container = Depends(get_container)
+    payload: UserMemoryWriteRequest,
+    container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
-    """写一条 User Memory（跨 Workspace）。敏感信息（密钥/令牌/凭证）一律拒收。"""
+    """写一条 User Memory（跨 Workspace）。敏感信息（密钥/令牌/凭证）一律拒收。
+
+    无法确定登录人时返回 403 `cloud_login_required`，不再写入公共池。
+    """
     entry = await container.memory.write_user(
-        content=payload.content, source=payload.source, meta=payload.metadata or None
+        content=payload.content,
+        source=payload.source,
+        meta=payload.metadata or None,
+        cloud_user_id=cloud_user_id,
     )
     return ok(entry.to_dict())
 
@@ -107,16 +122,21 @@ async def update_memory_entry(
     entry_id: uuid.UUID,
     payload: UserMemoryWriteRequest,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
-    """手动修改一条 User Memory（手机端编辑）；云端会同步更新。"""
-    entry = await container.memory.update_user(entry_id, content=payload.content)
+    """手动修改一条 User Memory（手机端编辑）；别人的条目按不存在处理（404）。"""
+    entry = await container.memory.update_user(
+        entry_id, content=payload.content, cloud_user_id=cloud_user_id
+    )
     return ok(entry.to_dict())
 
 
 @router.delete("/entries/{entry_id}")
 async def delete_memory_entry(
-    entry_id: uuid.UUID, container: Container = Depends(get_container)
+    entry_id: uuid.UUID,
+    container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """删除一条 User Memory；Environment / Project 层不可经此删除。"""
-    await container.memory.delete(entry_id)
+    await container.memory.delete(entry_id, cloud_user_id=cloud_user_id)
     return ok({"deleted": str(entry_id)})

@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from flux.core.user_scope import normalize_cloud_user_id, owned_clause
 from flux.models.task import Task
 from flux.models.usage import UsageRecord, UsageSnapshot
 
@@ -44,6 +45,7 @@ class BillingRepository:
         model: str,
         plan_key: str | None,
         account_key: str = "",
+        cloud_user_id: str | None = None,
         input_tokens: int = 0,
         output_tokens: int = 0,
         cache_read_tokens: int = 0,
@@ -60,6 +62,7 @@ class BillingRepository:
             model=model[:128],
             plan_key=plan_key,
             account_key=(account_key or "")[:16],
+            cloud_user_id=normalize_cloud_user_id(cloud_user_id),
             input_tokens=int(input_tokens),
             output_tokens=int(output_tokens),
             cache_read_tokens=int(cache_read_tokens),
@@ -81,10 +84,13 @@ class BillingRepository:
         plan_key: str | None,
         since: datetime,
         account_key: str | None = None,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
     ) -> dict[str, float]:
         """某套餐（可选某账号）自 `since` 起的本地用量合计。
 
-        `account_key=None` 表示不按账号过滤（整套餐合计）。
+        `account_key=None` 表示不按账号指纹过滤（整套餐合计）；
+        `cloud_user_id` 非空时再按「人」过滤（历史 NULL/空串归主用户）。
         """
         statement = select(
             func.count(UsageRecord.id),
@@ -99,6 +105,11 @@ class BillingRepository:
             statement = statement.where(UsageRecord.plan_key == plan_key)
         if account_key is not None:
             statement = statement.where(UsageRecord.account_key == account_key)
+        user = normalize_cloud_user_id(cloud_user_id)
+        if user is not None:
+            statement = statement.where(
+                owned_clause(UsageRecord.cloud_user_id, user, owner_cloud_user_id)
+            )
         async with self._session_factory() as session:
             row = (await session.execute(statement)).one()
         return {
@@ -133,6 +144,8 @@ class BillingRepository:
         plan_key: str | None,
         since: datetime,
         account_key: str | None = None,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
     ) -> list[datetime]:
         """某套餐自 `since` 起的调用时刻（只取时间，用于判断区间内 Flux 是否在跑）。"""
         statement = select(UsageRecord.occurred_at).where(UsageRecord.occurred_at >= since)
@@ -140,12 +153,24 @@ class BillingRepository:
             statement = statement.where(UsageRecord.plan_key == plan_key)
         if account_key is not None:
             statement = statement.where(UsageRecord.account_key == account_key)
+        user = normalize_cloud_user_id(cloud_user_id)
+        if user is not None:
+            statement = statement.where(
+                owned_clause(UsageRecord.cloud_user_id, user, owner_cloud_user_id)
+            )
         statement = statement.order_by(UsageRecord.occurred_at)
         async with self._session_factory() as session:
             return list(await session.scalars(statement))
 
-    async def record_accounts(self, *, plan_key: str, since: datetime) -> list[str]:
-        """某套餐自 `since` 起出现过的账号指纹（账本口径）。"""
+    async def record_accounts(
+        self,
+        *,
+        plan_key: str,
+        since: datetime,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
+    ) -> list[str]:
+        """某套餐自 `since` 起出现过的账号指纹（账本口径，可按人过滤）。"""
         statement = (
             select(UsageRecord.account_key)
             .where(
@@ -155,16 +180,33 @@ class BillingRepository:
             )
             .distinct()
         )
+        user = normalize_cloud_user_id(cloud_user_id)
+        if user is not None:
+            statement = statement.where(
+                owned_clause(UsageRecord.cloud_user_id, user, owner_cloud_user_id)
+            )
         async with self._session_factory() as session:
             return [str(value) for value in await session.scalars(statement)]
 
-    async def records_by_run(self, run_id: str, *, limit: int = 200) -> list[UsageRecord]:
+    async def records_by_run(
+        self,
+        run_id: str,
+        *,
+        limit: int = 200,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
+    ) -> list[UsageRecord]:
         statement = (
             select(UsageRecord)
             .where(UsageRecord.run_id == run_id)
             .order_by(UsageRecord.occurred_at)
             .limit(max(limit, 1))
         )
+        user = normalize_cloud_user_id(cloud_user_id)
+        if user is not None:
+            statement = statement.where(
+                owned_clause(UsageRecord.cloud_user_id, user, owner_cloud_user_id)
+            )
         async with self._session_factory() as session:
             return list(await session.scalars(statement))
 
@@ -188,6 +230,7 @@ class BillingRepository:
         *,
         plan_key: str,
         account_key: str = "",
+        cloud_user_id: str | None = None,
         window_key: str,
         used: float | None = None,
         quota: float | None = None,
@@ -202,6 +245,7 @@ class BillingRepository:
         row = UsageSnapshot(
             plan_key=plan_key,
             account_key=(account_key or "")[:16],
+            cloud_user_id=normalize_cloud_user_id(cloud_user_id),
             window_key=window_key,
             used=used,
             quota=quota,
@@ -224,6 +268,8 @@ class BillingRepository:
         window_key: str,
         since: datetime,
         account_key: str | None = None,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
     ) -> list[dict]:
         """某窗口自 `since` 起的成功快照（按采集时刻正序），用于外部消耗差分。"""
         statement = select(UsageSnapshot).where(
@@ -235,12 +281,18 @@ class BillingRepository:
         )
         if account_key is not None:
             statement = statement.where(UsageSnapshot.account_key == account_key)
+        user = normalize_cloud_user_id(cloud_user_id)
+        if user is not None:
+            statement = statement.where(
+                owned_clause(UsageSnapshot.cloud_user_id, user, owner_cloud_user_id)
+            )
         statement = statement.order_by(UsageSnapshot.fetched_at)
         async with self._session_factory() as session:
             rows = list(await session.scalars(statement))
         return [
             {
                 "account_key": row.account_key,
+                "cloud_user_id": row.cloud_user_id,
                 "percent": float(row.percent or 0.0),
                 "fetched_at": row.fetched_at,
                 "resets_at": row.resets_at,
@@ -248,7 +300,14 @@ class BillingRepository:
             for row in rows
         ]
 
-    async def latest_snapshots(self, plan_key: str, *, lookback_days: int = 2) -> list[dict]:
+    async def latest_snapshots(
+        self,
+        plan_key: str,
+        *,
+        lookback_days: int = 2,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
+    ) -> list[dict]:
         """每个「账号 × 窗口」取最新一条（按 fetched_at 倒序去重）。"""
         since = _utcnow() - timedelta(days=max(lookback_days, 1))
         statement = (
@@ -256,6 +315,11 @@ class BillingRepository:
             .where(UsageSnapshot.plan_key == plan_key, UsageSnapshot.fetched_at >= since)
             .order_by(UsageSnapshot.fetched_at.desc())
         )
+        user = normalize_cloud_user_id(cloud_user_id)
+        if user is not None:
+            statement = statement.where(
+                owned_clause(UsageSnapshot.cloud_user_id, user, owner_cloud_user_id)
+            )
         async with self._session_factory() as session:
             rows = list(await session.scalars(statement))
         latest: dict[tuple[str, str], dict] = {}

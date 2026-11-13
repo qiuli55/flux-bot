@@ -242,8 +242,11 @@ def test_probe_endpoint_uses_vault_key(client: TestClient, monkeypatch: pytest.M
     created = _create_key(client)
     calls: dict[str, object] = {}
 
-    async def fake_probe(vault: object, key_id: str) -> dict[str, object]:
+    async def fake_probe(
+        vault: object, key_id: str, *, cloud_user_id: str | None = None
+    ) -> dict[str, object]:
         calls["key_id"] = key_id
+        calls["cloud_user_id"] = cloud_user_id
         return {"ok": True, "skipped": False, "latency_ms": 12, "error": ""}
 
     monkeypatch.setattr("flux.api.v1.keys.probe_vault_key", fake_probe)
@@ -255,6 +258,8 @@ def test_probe_endpoint_uses_vault_key(client: TestClient, monkeypatch: pytest.M
     assert data["ok"] is True
     assert data["latency_ms"] == 12
     assert calls["key_id"] == created["id"]
+    # Phase 2：探测也按当前用户校验，不能借 key_id 探测别人的密钥。
+    assert calls["cloud_user_id"] == "1"
 
 
 def test_probe_disabled_key_is_skipped(client: TestClient) -> None:

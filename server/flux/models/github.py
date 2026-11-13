@@ -3,9 +3,10 @@
 一个本地账号最多绑定一个 GitHub 身份；`account_key` 唯一，令牌用密钥库的
 `SecretBox` 信封加密后落库，接口与日志都不出现明文。
 
-为什么按 `account_key` 隔离：App 当前的「账号」是本地账号（还没有服务端登录体系），
-所以账号标识由客户端以 `X-Flux-Account` 声明、服务端只做格式校验。将来接入真实登录后，
-把这里换成令牌里的 subject 即可，表结构不用动。
+为什么按 `account_key` 隔离：Phase 2 起账号标识就是登录人（云 JWT 的 `sub`，或
+`FLUX_OWNER_CLOUD_USER_ID` 主用户），不再信任客户端自报的 `X-Flux-Account`。
+历史行的 `account_key='default'` 只对配置的主用户可见（查找时等价映射，见
+`flux.core.github.service`）；表结构不需要改。
 """
 
 from __future__ import annotations

@@ -389,9 +389,10 @@ class BotConversationService:
 
         github_kwargs: dict[str, Any] = {}
         if include_github:
-            # 外部连接器按本地账号隔离：请求头声明账号，只在这个账号真的连了 GitHub 时
-            # 才把工具交给模型；没连时明确要求它引导用户去账户页连接，禁止编造仓库数据。
-            normalized = normalize_account_key(account_key)
+            # 外部连接器按人隔离：REST 调用点传当前登录人；Bot 后台线程没有逐请求
+            # principal，回退到部署主用户（与记忆 / 密钥的内部口径一致）。
+            effective_account = account_key or (self._container.settings.owner_cloud_user_id or "")
+            normalized = normalize_account_key(effective_account)
             github_connected = await container.github.is_connected(normalized)
 
             async def _run_github(name: str, arguments: dict[str, Any]) -> Any:

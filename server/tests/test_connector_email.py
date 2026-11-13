@@ -21,9 +21,9 @@ from sqlalchemy import select
 
 from flux.config import Settings
 from flux.container import Container
-from flux.core.github.service import ACCOUNT_HEADER
 from flux.main import create_app
 from flux.models.connector_installation import ConnectorInstallation
+from tests.cloud_jwt import mint_cloud_token
 
 PREFIX = "/api/v1"
 ACCOUNT_A = "account-a"
@@ -55,7 +55,8 @@ class _CaptureHandler(logging.Handler):
 
 
 def _headers(account: str = ACCOUNT_A) -> dict[str, str]:
-    return {ACCOUNT_HEADER: account}
+    """Phase 2：账号身份来自云 JWT（sub），不再用客户端自报的请求头。"""
+    return {"Authorization": f"Bearer {mint_cloud_token(account)}"}
 
 
 def _client(settings: Settings, db_schema: None) -> TestClient:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
 
+from flux.api.auth import get_current_cloud_user_id
 from flux.api.deps import get_container
 from flux.api.response import ok
 from flux.container import Container
@@ -22,8 +23,9 @@ router = APIRouter(prefix="/billing", tags=["billing"])
 async def list_plans(
     refresh: bool = Query(False, description="是否立即拉取官方额度"),
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
-    return ok(await container.billing.overview(refresh=refresh))
+    return ok(await container.billing.overview(refresh=refresh, cloud_user_id=cloud_user_id))
 
 
 @router.get("/usage")
@@ -31,11 +33,15 @@ async def plan_usage(
     plan: str = Query("", description="套餐 key：opencode-go / agent-plan / opencode"),
     refresh: bool = Query(False, description="是否立即拉取官方额度"),
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     # 空 plan 时返回全量概览，省掉前端一次分支判断
     if not plan:
-        return ok(await container.billing.overview(refresh=refresh))
-    return ok(await container.billing.plan_view(plan, refresh=refresh), metadata={"plan": plan})
+        return ok(await container.billing.overview(refresh=refresh, cloud_user_id=cloud_user_id))
+    return ok(
+        await container.billing.plan_view(plan, refresh=refresh, cloud_user_id=cloud_user_id),
+        metadata={"plan": plan},
+    )
 
 
 @router.get("/prices")
@@ -50,8 +56,12 @@ async def list_prices(
 async def run_usage(
     run_id: str,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
-    return ok(await container.billing.run_usage(run_id), metadata={"run_id": run_id})
+    return ok(
+        await container.billing.run_usage(run_id, cloud_user_id=cloud_user_id),
+        metadata={"run_id": run_id},
+    )
 
 
 @router.post("/refresh")

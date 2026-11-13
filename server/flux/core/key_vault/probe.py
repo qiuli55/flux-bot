@@ -171,14 +171,19 @@ async def probe_vault_key(
     vault: KeyVaultService,
     key_id: str,
     *,
+    cloud_user_id: str | None = None,
     timeout: float = PROBE_TIMEOUT,
     client: httpx.AsyncClient | None = None,
 ) -> dict[str, Any]:
     """按 key 库条目探测（用该 key 登记的第一个模型）。
 
     停用 / 没有模型的条目直接返回 `skipped=True`，不发起网络请求。
+    传入 `cloud_user_id` 时只允许探测当前用户的 key（别人的 key 按 404）。
     """
-    row = await vault.get(key_id)
+    if cloud_user_id is not None:
+        row = await vault.get_for_user(key_id, cloud_user_id)
+    else:
+        row = await vault.get(key_id)
     models = [str(item).strip() for item in (row.models or []) if str(item).strip()]
     wanted = models[0] if models else ""
     result = _blank_result(row.provider, wanted, row.base_url)

@@ -37,7 +37,14 @@ from flux.core.agent_runtime.model_catalog import (
 from flux.core.agent_runtime.platforms import secure_file
 from flux.core.agent_runtime.runtimes.base import ModelChannel
 from flux.core.context.secretbox import SecretBox
-from flux.errors import BadRequestError, ConfigurationError, ConflictError, NotFoundError
+from flux.core.user_scope import normalize_cloud_user_id, owned_clause, owns
+from flux.errors import (
+    BadRequestError,
+    ConfigurationError,
+    ConflictError,
+    NotFoundError,
+    PermissionDeniedError,
+)
 from flux.logging import get_logger
 from flux.models.api_key import ApiKey
 from flux.models.bot import Bot
@@ -48,6 +55,9 @@ logger = get_logger(__name__)
 #: 一次最多登记多少个模型，避免把整份模型目录塞进一条 key
 _MAX_MODELS = 64
 _MAX_MODEL_LENGTH = 128
+
+#: 无法确定"这是谁"时的稳定错误码（与 devices / memory 保持一致）。
+CLOUD_LOGIN_REQUIRED = "cloud_login_required"
 
 _UNSET: object = object()
 
@@ -65,23 +75,89 @@ class KeyVaultService:
         self._box: SecretBox | None = None
         self._box_lock = threading.Lock()
 
+    # --- 按人隔离 ---
+
+    @property
+    def owner_cloud_user_id(self) -> str | None:
+        return normalize_cloud_user_id(self._settings.owner_cloud_user_id)
+
+    def _resolve_user(self, cloud_user_id: str | None) -> str | None:
+        """显式传入优先；内部运行路径（任务 / Bot）回退到主用户。"""
+        return normalize_cloud_user_id(cloud_user_id) or self.owner_cloud_user_id
+
+    def _require_user(self, cloud_user_id: str | None) -> str:
+        owner = self._resolve_user(cloud_user_id)
+        if owner is None:
+            raise PermissionDeniedError(
+                "该操作需要 Flux 账号登录（或由部署方设置 FLUX_OWNER_CLOUD_USER_ID）",
+                code=CLOUD_LOGIN_REQUIRED,
+                details={
+                    "hint": "请先登录账号云；本机 CLI / 主用户可配置 FLUX_OWNER_CLOUD_USER_ID"
+                },
+            )
+        return owner
+
+    def _scope(self, stmt: object, user: str | None) -> object:
+        if user is None:
+            return stmt
+        return stmt.where(owned_clause(ApiKey.cloud_user_id, user, self.owner_cloud_user_id))
+
+    async def _get_owned_row(self, session: AsyncSession, key_uuid: uuid.UUID, user: str) -> ApiKey:
+        stmt = self._scope(select(ApiKey).where(ApiKey.id == key_uuid), user)
+        row = await session.scalar(stmt)
+        if row is None:
+            raise NotFoundError(f"密钥 {key_uuid} 不存在", details={"key_id": str(key_uuid)})
+        return row
+
+    async def _assert_name_free(
+        self,
+        session: AsyncSession,
+        user: str,
+        name: str,
+        *,
+        exclude_id: uuid.UUID | None = None,
+    ) -> None:
+        """同一用户内名字唯一；不同用户可以重名。
+
+        历史 NULL 行归主用户，所以主用户新增同名 key 时也要把老行算进来。
+        """
+        stmt = self._scope(select(ApiKey.id).where(ApiKey.name == name), user)
+        if exclude_id is not None:
+            stmt = stmt.where(ApiKey.id != exclude_id)
+        if await session.scalar(stmt) is not None:
+            raise ConflictError(f"密钥名称 {name!r} 已存在", details={"name": name})
+
     # --- 查询 ---
 
-    async def list_entries(self, *, enabled_only: bool = False) -> list[ApiKey]:
+    async def list_entries(
+        self, *, enabled_only: bool = False, cloud_user_id: str | None = None
+    ) -> list[ApiKey]:
+        """列出当前用户的密钥。
+
+        `cloud_user_id` 缺省时回退到主用户；两者都没有（完全没接账号体系）时沿用
+        旧的整表口径，保证单机部署可用。显式传入 None 与缺省相同，无法区分——
+        因此 API 层要用 `get_for_user` 做 fail-closed 的按 id 访问。
+        """
+        user = self._resolve_user(cloud_user_id)
         async with self._session_factory() as session:
             stmt = select(ApiKey).order_by(ApiKey.created_at.asc(), ApiKey.name.asc())
             if enabled_only:
                 stmt = stmt.where(ApiKey.enabled.is_(True))
+            stmt = self._scope(stmt, user)  # type: ignore[assignment]
             rows = (await session.scalars(stmt)).all()
             return list(rows)
 
-    async def list_public(self, *, enabled_only: bool = False) -> list[dict[str, object]]:
-        rows = await self.list_entries(enabled_only=enabled_only)
+    async def list_public(
+        self, *, enabled_only: bool = False, cloud_user_id: str | None = None
+    ) -> list[dict[str, object]]:
+        rows = await self.list_entries(enabled_only=enabled_only, cloud_user_id=cloud_user_id)
         return [row.to_dict() for row in rows]
 
-    async def catalog_entries(self, *, enabled_only: bool = True) -> list[KeyEntry]:
+    async def catalog_entries(
+        self, *, enabled_only: bool = True, cloud_user_id: str | None = None
+    ) -> list[KeyEntry]:
         """给模型目录用的安全投影（id 为字符串，含 models / provider / enabled）。"""
-        rows = await self.list_entries(enabled_only=enabled_only)
+        rows = await self.list_entries(enabled_only=enabled_only, cloud_user_id=cloud_user_id)
         return [_entry_of(row) for row in rows]
 
     async def resolve_selection(
@@ -90,6 +166,7 @@ class KeyVaultService:
         runtime: str | None,
         model: str,
         key_id: str | None,
+        cloud_user_id: str | None = None,
     ) -> tuple[str | None, uuid.UUID | None]:
         """校验任务级模型选择，返回 (模型 id, key 库 UUID)。
 
@@ -109,7 +186,9 @@ class KeyVaultService:
                     details={"model": wanted, "allowed": allowed},
                 )
             return wanted, None
-        row = await self.get(key_id)
+        # 点名要一条 key，却不知道是谁：fail-closed，不能去试别人的密钥。
+        user = self._resolve_user(cloud_user_id) or self._require_user(cloud_user_id)
+        row = await self.get_for_user(key_id, user)
         if not row.enabled:
             raise BadRequestError(f"密钥 {row.name!r} 已停用", details={"key_id": str(row.id)})
         if not supports_provider(runtime, row.provider):
@@ -134,9 +213,29 @@ class KeyVaultService:
         return wanted, row.id
 
     async def get(self, key_id: str | uuid.UUID) -> ApiKey:
+        """按 id 取密钥（内部可信路径：id 来自任务 / Bot 的已校验引用）。
+
+        内部运行路径没有逐请求 principal，按主用户口径过滤；完全没配置账号体系时
+        （owner 为空）沿用旧的整表口径。用户面访问必须用 `get_for_user`。
+        """
         key_uuid = _parse_uuid(key_id)
+        user = self.owner_cloud_user_id
         async with self._session_factory() as session:
             row = await session.get(ApiKey, key_uuid)
+            if row is not None and user is not None and not owns(row.cloud_user_id, user, user):
+                row = None
+            if row is None:
+                raise NotFoundError(f"密钥 {key_id} 不存在", details={"key_id": str(key_id)})
+            return row
+
+    async def get_for_user(self, key_id: str | uuid.UUID, cloud_user_id: str) -> ApiKey:
+        """用户面取密钥：只允许当前用户（主用户含历史 NULL）访问，别人的按 404。"""
+        key_uuid = _parse_uuid(key_id)
+        user = self._require_user(cloud_user_id)
+        async with self._session_factory() as session:
+            stmt = select(ApiKey).where(ApiKey.id == key_uuid)
+            stmt = self._scope(stmt, user)  # type: ignore[assignment]
+            row = await session.scalar(stmt)
             if row is None:
                 raise NotFoundError(f"密钥 {key_id} 不存在", details={"key_id": str(key_id)})
             return row
@@ -153,7 +252,9 @@ class KeyVaultService:
         models: Iterable[str] = (),
         wire_api: str = "",
         enabled: bool = True,
+        cloud_user_id: str | None = None,
     ) -> ApiKey:
+        user = self._require_user(cloud_user_id)
         clean_name = _require_name(name)
         clean_provider = _require_provider(provider)
         clean_base_url = _normalize_base_url(clean_provider, base_url)
@@ -162,6 +263,7 @@ class KeyVaultService:
         secret = _require_api_key(api_key)
         row = ApiKey(
             name=clean_name,
+            cloud_user_id=user,
             provider=clean_provider,
             base_url=clean_base_url,
             wire_api=clean_wire_api,
@@ -171,6 +273,7 @@ class KeyVaultService:
             enabled=bool(enabled),
         )
         async with self._session_factory() as session:
+            await self._assert_name_free(session, user, clean_name)
             session.add(row)
             try:
                 await session.commit()
@@ -200,14 +303,15 @@ class KeyVaultService:
         models: object = _UNSET,
         wire_api: object = _UNSET,
         enabled: object = _UNSET,
+        cloud_user_id: str | None = None,
     ) -> ApiKey:
         key_uuid = _parse_uuid(key_id)
+        user = self._require_user(cloud_user_id)
         async with self._session_factory() as session:
-            row = await session.get(ApiKey, key_uuid)
-            if row is None:
-                raise NotFoundError(f"密钥 {key_id} 不存在", details={"key_id": str(key_id)})
+            row = await self._get_owned_row(session, key_uuid, user)
             if name is not _UNSET:
                 row.name = _require_name(str(name))
+                await self._assert_name_free(session, user, row.name, exclude_id=key_uuid)
             if provider is not _UNSET:
                 row.provider = _require_provider(str(provider))
             if base_url is not _UNSET:
@@ -241,12 +345,11 @@ class KeyVaultService:
             )
             return row
 
-    async def delete(self, key_id: str | uuid.UUID) -> None:
+    async def delete(self, key_id: str | uuid.UUID, *, cloud_user_id: str | None = None) -> None:
         key_uuid = _parse_uuid(key_id)
+        user = self._require_user(cloud_user_id)
         async with self._session_factory() as session:
-            row = await session.get(ApiKey, key_uuid)
-            if row is None:
-                raise NotFoundError(f"密钥 {key_id} 不存在", details={"key_id": str(key_id)})
+            row = await self._get_owned_row(session, key_uuid, user)
             # fail-safe：引用该 key 的任务回到 Agent 默认模型，避免下一次 Run 用不存在的凭据
             await session.execute(
                 update(Task).where(Task.api_key_id == key_uuid).values(model=None, api_key_id=None)

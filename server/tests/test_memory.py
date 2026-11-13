@@ -185,6 +185,7 @@ def _small_user_service(container: Container, *, max_entries: int) -> MemoryServ
         container.memory_repo,
         policies={MemoryLayer.USER: MemoryPolicy(max_entries=max_entries, ttl=None)},
         environment_seed=(),
+        settings=container.settings,
     )
 
 
@@ -207,6 +208,7 @@ def test_environment_layer_respects_capacity(container: Container) -> None:
         container.memory_repo,
         policies={MemoryLayer.ENVIRONMENT: MemoryPolicy(max_entries=2)},
         environment_seed=(),
+        settings=container.settings,
     )
     for index in range(3):
         asyncio.run(service.write_environment(key=f"runtime.k{index}", content=f"平台规则 {index}"))
@@ -235,6 +237,7 @@ def test_expired_entries_are_hidden_and_swept_on_next_write(container: Container
         container.memory_repo,
         policies={MemoryLayer.USER: MemoryPolicy(max_entries=200, ttl=timedelta(seconds=0))},
         environment_seed=(),
+        settings=container.settings,
     )
     first = asyncio.run(service.write_user(content="很快过期的偏好 A"))
     # 库里有原始行，但读取路径已把它排除

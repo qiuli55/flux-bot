@@ -18,6 +18,7 @@ from flux.db.session import create_engine
 from flux.enums import Capability
 from flux.main import create_app
 from flux.models import Base
+from tests.cloud_jwt import CLOUD_TEST_SECRET
 
 
 def python_command(code: str) -> str:
@@ -103,7 +104,10 @@ def settings(tmp_path) -> Settings:
         codex_account_home=str(tmp_path / "codex-account"),
         # 附件默认落到临时目录：测试绝不能往真实 /opt/flux/uploads 写文件
         uploads_dir=str(tmp_path / "uploads"),
-        cloud_secret_key=None,
+        # Phase 2：测试统一以「主用户 1」运行，云 JWT 用测试假密钥验签。
+        # 需要验证「没有登录人」的用例显式传 owner_cloud_user_id=None。
+        owner_cloud_user_id="1",
+        cloud_secret_key=CLOUD_TEST_SECRET,
         cloud_login_required=False,
     )
 

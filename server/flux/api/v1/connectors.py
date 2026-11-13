@@ -5,9 +5,10 @@
 - `github/*`：用户把自己的 GitHub 账号接到当前本地账号上（设备码 OAuth）；
 - `catalog` / `{id}/install` / `{id}`：账号侧连接器框架（目录、安装、卸载）。
 
-账号隔离：App 每个请求带 `X-Flux-Account: <本地账号 id>`，服务端校验格式后作为
-`account_key`；连接记录按它唯一隔离。当前 App 的账号是本地账号，所以这是客户端声明；
-将来接真实登录后换成令牌 subject，接口形状不变。
+账号隔离：Phase 2 起账号标识就是登录人（云 JWT 的 `sub`，或
+`FLUX_OWNER_CLOUD_USER_ID` 主用户），由 `account_key_for_request` 统一解析；
+客户端自报的 `X-Flux-Account` 不再作为身份依据。分不清是谁时 fail-closed
+（403 `cloud_login_required`），不会写 `'default'` 公共记录。
 
 注意：`execute` 走的是 Agent 执行侧注册表（`Container.connectors`），而
 catalog / install / uninstall 走账号侧框架（`Container.connector_framework`），
@@ -18,10 +19,10 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query, Request
 
+from flux.api.account_scope import account_key_for_request
 from flux.api.deps import get_container
 from flux.api.response import ok
 from flux.container import Container
-from flux.core.github.service import ACCOUNT_HEADER, normalize_account_key
 from flux.enums import Capability
 from flux.schemas.api import (
     ConnectorExecuteRequest,
@@ -32,8 +33,9 @@ from flux.schemas.api import (
 router = APIRouter(prefix="/connectors", tags=["connectors"])
 
 
-def _account_key(request: Request) -> str:
-    return normalize_account_key(request.headers.get(ACCOUNT_HEADER))
+def _account_key(request: Request, container: Container) -> str:
+    """账号标识 = 当前登录人；不再读客户端自报的 X-Flux-Account。"""
+    return account_key_for_request(request, container.settings)
 
 
 @router.get("")
@@ -41,7 +43,7 @@ async def list_connectors(
     request: Request, container: Container = Depends(get_container)
 ) -> dict[str, object]:
     """连接器列表。以后新增的外部连接器都从这里挂，App 只渲染这一份清单。"""
-    account_key = _account_key(request)
+    account_key = _account_key(request, container)
     return ok(await container.connector_framework.list_states(account_key))
 
 
@@ -57,7 +59,7 @@ async def list_connector_catalog(
 async def start_github_login(
     request: Request, container: Container = Depends(get_container)
 ) -> dict[str, object]:
-    account_key = _account_key(request)
+    account_key = _account_key(request, container)
     return ok(await container.github.start_login(account_key))
 
 
@@ -65,7 +67,7 @@ async def start_github_login(
 async def poll_github_login(
     flow_id: str, request: Request, container: Container = Depends(get_container)
 ) -> dict[str, object]:
-    account_key = _account_key(request)
+    account_key = _account_key(request, container)
     return ok(await container.github.poll_login(flow_id, account_key))
 
 
@@ -73,7 +75,7 @@ async def poll_github_login(
 async def disconnect_github(
     request: Request, container: Container = Depends(get_container)
 ) -> dict[str, object]:
-    account_key = _account_key(request)
+    account_key = _account_key(request, container)
     return ok(await container.github.disconnect(account_key))
 
 
@@ -90,7 +92,7 @@ async def list_email_messages(
     container: Container = Depends(get_container),
 ) -> dict[str, object]:
     """列出邮件头（不含正文），最新的在前。"""
-    account_key = _account_key(request)
+    account_key = _account_key(request, container)
     messages = await container.email.list_messages(account_key, mailbox=mailbox, limit=limit)
     return ok({"messages": messages, "mailbox": mailbox, "count": len(messages)})
 
@@ -103,7 +105,7 @@ async def get_email_message(
     container: Container = Depends(get_container),
 ) -> dict[str, object]:
     """读取一封邮件；优先 text/plain，只有 HTML 时返回 HTML 正文。"""
-    account_key = _account_key(request)
+    account_key = _account_key(request, container)
     message = await container.email.get_message(account_key, message_id, mailbox=mailbox)
     return ok(message)
 
@@ -115,7 +117,7 @@ async def send_email_message(
     container: Container = Depends(get_container),
 ) -> dict[str, object]:
     """通过 SMTP 发送一封邮件（不会自动发送，也不会创建草稿）。"""
-    account_key = _account_key(request)
+    account_key = _account_key(request, container)
     result = await container.email.send_message(
         account_key,
         to=payload.to,
@@ -133,7 +135,7 @@ async def test_email_connection(
     container: Container = Depends(get_container),
 ) -> dict[str, object]:
     """分别验证 IMAP / SMTP 连接与登录，不发送真实邮件。"""
-    account_key = _account_key(request)
+    account_key = _account_key(request, container)
     return ok(await container.email.test_connection(account_key))
 
 
@@ -147,7 +149,7 @@ async def poll_email_messages(
     只发布新邮件对应的 email.received 事件，不发送任何邮件；响应里不含正文与密码。
     后台轮询由 main.py lifespan 按 FLUX_EMAIL_TRIGGER_* 配置自动起停。
     """
-    account_key = _account_key(request)
+    account_key = _account_key(request, container)
     return ok(await container.email_trigger.poll_account(account_key))
 
 
@@ -159,7 +161,7 @@ async def install_connector(
     container: Container = Depends(get_container),
 ) -> dict[str, object]:
     """安装一个账号侧连接器；凭据只进加密存储，响应里不出现明文。"""
-    account_key = _account_key(request)
+    account_key = _account_key(request, container)
     state = await container.connector_framework.install(
         account_key,
         connector_id,
@@ -178,7 +180,7 @@ async def uninstall_connector(
     container: Container = Depends(get_container),
 ) -> dict[str, object]:
     """卸载连接器；只删除当前账号的安装与凭据（`/github` 是它的兼容别名）。"""
-    account_key = _account_key(request)
+    account_key = _account_key(request, container)
     return ok(await container.connector_framework.uninstall(account_key, connector_id))
 
 

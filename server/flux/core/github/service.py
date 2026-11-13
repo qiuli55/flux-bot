@@ -29,10 +29,11 @@ from flux.models.github import GithubConnection
 
 logger = get_logger(__name__)
 
-#: 客户端声明本地账号的请求头。App 目前是本地账号体系，服务端只校验格式；
-#: 将来接真实登录后换成令牌 subject，连接表与接口形状不用变。
+#: 历史请求头。Phase 2 起只作为兼容常量保留，**不再作为身份来源**：
+#: 账号标识统一由登录态（`flux.api.account_scope.account_key_for_request`）推导。
 ACCOUNT_HEADER = "X-Flux-Account"
 _ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+#: Phase 1 之前客户端不带头时写入的历史账号；只对配置的主用户可见。
 DEFAULT_ACCOUNT = "default"
 
 #: 设备码流程在内存里保留多久（GitHub 自己也会过期，这里只是兜底清理）
@@ -42,14 +43,18 @@ _DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 
 
 def normalize_account_key(raw: str | None) -> str:
-    """把请求头里的账号标识规整成 `account_key`；非法值直接 400，不做静默降级。"""
+    """规整账号标识：只做格式校验，**不再把空值降级成 `'default'`**。
+
+    Phase 2 起身份来自登录态；本函数仅用于校验/清洗已解析出的用户 id，
+    空值返回空串（调用方应拒绝），非法值直接 400，不做静默降级。
+    """
     value = (raw or "").strip()
     if not value:
-        return DEFAULT_ACCOUNT
+        return ""
     if not _ACCOUNT_RE.fullmatch(value):
         raise BadRequestError(
             "账号标识不合法：只允许字母、数字、下划线与短横线（1~64 位）",
-            details={"header": ACCOUNT_HEADER},
+            details={"account": value},
         )
     return value
 
@@ -91,13 +96,34 @@ class GitHubConnectorService:
 
     # --- 查询 ---
 
+    def _account_candidates(self, account_key: str) -> list[str]:
+        """当前账号 + （仅主用户）历史 `'default'` 行。
+
+        老版本不带头时写入 `account_key='default'`；Phase 2 之后它只属于配置的
+        主用户，别的用户不能看到、也不能断开这条连接。
+        """
+        key = normalize_account_key(account_key)
+        owner = (self._settings.owner_cloud_user_id or "").strip()
+        if key and owner and key == owner:
+            return [key, DEFAULT_ACCOUNT]
+        return [key]
+
     async def get_row(self, account_key: str) -> GithubConnection | None:
+        candidates = self._account_candidates(account_key)
+        if not candidates:
+            return None
         async with self._session_factory() as session:
-            return (
+            rows = list(
                 await session.scalars(
-                    select(GithubConnection).where(GithubConnection.account_key == account_key)
+                    select(GithubConnection).where(GithubConnection.account_key.in_(candidates))
                 )
-            ).first()
+            )
+        # 当前账号优先于历史 default 行
+        by_key = {row.account_key: row for row in rows}
+        for key in candidates:
+            if key in by_key:
+                return by_key[key]
+        return None
 
     async def is_connected(self, account_key: str) -> bool:
         return await self.get_row(account_key) is not None
@@ -236,16 +262,18 @@ class GitHubConnectorService:
         return {"status": "success", "connector": await self.public_state(account_key)}
 
     async def disconnect(self, account_key: str) -> dict[str, Any]:
+        candidates = self._account_candidates(account_key)
         async with self._session_factory() as session:
-            row = (
+            rows = list(
                 await session.scalars(
-                    select(GithubConnection).where(GithubConnection.account_key == account_key)
+                    select(GithubConnection).where(GithubConnection.account_key.in_(candidates))
                 )
-            ).first()
-            if row is not None:
-                await session.delete(row)
+            )
+            if rows:
+                for row in rows:
+                    await session.delete(row)
                 await session.commit()
-                logger.info("github.disconnect account=%s login=%s", account_key, row.login)
+                logger.info("github.disconnect account=%s rows=%s", account_key, len(rows))
         for flow_id in [f.flow_id for f in self._flows.values() if f.account_key == account_key]:
             self._flows.pop(flow_id, None)
         return await self.public_state(account_key)
@@ -261,15 +289,24 @@ class GitHubConnectorService:
         scopes: str,
         token_kind: str,
     ) -> None:
+        candidates = self._account_candidates(account_key)
         async with self._session_factory() as session:
-            row = (
+            rows = list(
                 await session.scalars(
-                    select(GithubConnection).where(GithubConnection.account_key == account_key)
+                    select(GithubConnection).where(GithubConnection.account_key.in_(candidates))
                 )
-            ).first()
+            )
+            row = next(
+                (item for item in rows if item.account_key == account_key),
+                rows[0] if rows else None,
+            )
             if row is None:
                 row = GithubConnection(account_key=account_key)
                 session.add(row)
+            elif row.account_key != account_key:
+                # 历史 default 行在主人重新登录后改挂到真实用户 id 上，
+                # 避免同一用户被拆成两行。
+                row.account_key = account_key
             row.login = login[:128]
             row.name = name[:256]
             row.avatar_url = avatar_url[:512]

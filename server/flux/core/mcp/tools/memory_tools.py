@@ -70,7 +70,11 @@ async def memory_recall(ctx: ToolContext, params: dict[str, Any]) -> dict[str, A
 
 
 async def memory_remember(ctx: ToolContext, params: dict[str, Any]) -> dict[str, Any]:
-    """写一条 User Memory；重复内容直接返回 duplicate，不新增条目。"""
+    """写一条 User Memory；重复内容直接返回 duplicate，不新增条目。
+
+    MCP 面没有逐请求的登录态：记忆归属由 MemoryService 按
+    `FLUX_OWNER_CLOUD_USER_ID`（部署主用户）解析，与 REST 面同一套隔离规则。
+    """
     reject_unknown(params, {"content"})
     content = require_str(params, "content")
     if len(content) > MAX_REMEMBER_CHARS:
