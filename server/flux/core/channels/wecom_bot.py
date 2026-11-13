@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from flux.core.channels.binding_flow import resolve_media_inbound, resolve_text_inbound
 from flux.core.channels.inbound_media import (
     DownloadedMedia,
     Transcriber,
@@ -457,10 +458,30 @@ class WeComBotChannel:
             logger.warning("企业微信回调指向的 Bot 不存在 bot=%s", bot_id)
             return WeComCallbackResult(404, "FLUX_WECOM_BOT_ID 指向的 Bot 不存在")
 
+        async def _system_reply(text: str) -> None:
+            await self._send_system_message(from_user, text)
+
         if parsed.kind == "text":
+            cloud_user_id = await resolve_text_inbound(
+                self._container,
+                channel="wecom",
+                external_user_id=parsed.from_user,
+                text=parsed.text,
+                reply=_system_reply,
+            )
+            if cloud_user_id is None:
+                return WeComCallbackResult(200, _SUCCESS_BODY)
             files: list[Any] = []
             content = parsed.text
         else:
+            cloud_user_id = await resolve_media_inbound(
+                self._container,
+                channel="wecom",
+                external_user_id=parsed.from_user,
+                reply=_system_reply,
+            )
+            if cloud_user_id is None:
+                return WeComCallbackResult(200, _SUCCESS_BODY)
             # 重推：turn 已存在就直接回 success，绝不再次下载媒体。
             existing = await self._existing_turn(bot, message_id)
             if existing is not None:
@@ -492,7 +513,11 @@ class WeComBotChannel:
 
         try:
             turn, created = await self._container.bot_conversation.create_turn(
-                bot, content=content, files=files, client_turn_id=message_id
+                bot,
+                content=content,
+                files=files,
+                client_turn_id=message_id,
+                cloud_user_id=cloud_user_id,
             )
         except AIOSError as exc:
             logger.warning(
@@ -633,6 +658,14 @@ class WeComBotChannel:
             return None
         return await finder(bot, client_turn_id)
 
+    async def _send_system_message(self, from_user: str, text: str) -> None:
+        """绑定提示 / 成功确认等系统消息：直接发送，不走出站审批草稿。"""
+        sender = self._sender
+        if sender is None:
+            logger.warning("企业微信系统消息未发送：未配置应用凭据 user=%s", from_user)
+            return
+        await sender.send_text({"touser": from_user}, text)
+
     async def _load_media(self, parsed: _InboundMessage) -> tuple[list[Any], str]:
         """下载一条图片/语音/文件并落盘；缺凭据时给中文说明而不是静默忽略。"""
         label = _KIND_LABELS[parsed.kind]
@@ -716,6 +749,7 @@ class WeComBotChannel:
                     bot_id=bot.id,
                     task_id=final.task_id,
                     turn_id=final.id,
+                    cloud_user_id=getattr(final, "cloud_user_id", None),
                 )
                 logger.info(
                     "企业微信出站回复已入队 draft=%s turn=%s task=%s hash=%s chars=%s",

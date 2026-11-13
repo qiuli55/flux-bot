@@ -18,6 +18,8 @@ from typing import Any
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from flux.config import Settings
+from flux.core.user_scope import UNSET, normalize_cloud_user_id, owned_clause, owns
 from flux.enums import OutboundDraftStatus
 from flux.errors import BadRequestError, ConflictError, NotFoundError
 from flux.logging import get_logger
@@ -58,8 +60,16 @@ def _error_text(error: object) -> str:
 class OutboundDraftService:
     """`outbound_drafts` 的创建、查询与状态迁移入口。"""
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        settings: Settings | None = None,
+    ) -> None:
         self._session_factory = session_factory
+        self._settings = settings
+
+    def _owner(self) -> str | None:
+        return normalize_cloud_user_id(getattr(self._settings, "owner_cloud_user_id", None))
 
     async def create(
         self,
@@ -71,6 +81,7 @@ class OutboundDraftService:
         task_id: uuid.UUID | None = None,
         turn_id: uuid.UUID | None = None,
         decision_id: str | None = None,
+        cloud_user_id: str | None = None,
     ) -> OutboundDraft:
         """新建 pending 草稿；这里只落库，绝不触发发送。"""
         normalized_channel = (channel or "").strip()
@@ -88,6 +99,7 @@ class OutboundDraftService:
             task_id=task_id,
             turn_id=turn_id,
             decision_id=decision_id,
+            cloud_user_id=normalize_cloud_user_id(cloud_user_id),
             error=None,
             sent_at=None,
             resolved_at=None,
@@ -109,10 +121,17 @@ class OutboundDraftService:
         )
         return row
 
-    async def get(self, draft_id: uuid.UUID) -> OutboundDraft:
+    async def get(self, draft_id: uuid.UUID, *, cloud_user_id: str | None = None) -> OutboundDraft:
         async with self._session_factory() as session:
             row = await session.get(OutboundDraft, draft_id)
             if row is None:
+                raise NotFoundError(
+                    f"出站草稿 {draft_id} 不存在", details={"draft_id": str(draft_id)}
+                )
+            if cloud_user_id is not None and not owns(
+                row.cloud_user_id, cloud_user_id, self._owner()
+            ):
+                # 别人的草稿按不存在处理，不泄露 id 与正文。
                 raise NotFoundError(
                     f"出站草稿 {draft_id} 不存在", details={"draft_id": str(draft_id)}
                 )
@@ -129,9 +148,21 @@ class OutboundDraftService:
         channel: str | None = None,
         status: str | None = None,
         limit: int = 100,
+        cloud_user_id: object = UNSET,
     ) -> list[OutboundDraft]:
-        """按 Bot / 频道 / 状态过滤，最新在前。"""
+        """按 Bot / 频道 / 状态过滤，最新在前。
+
+        `cloud_user_id` 缺省（UNSET）表示内部调用不做按人过滤（频道状态页只看
+        聚合结果）；REST 面显式传入当前登录人，只能看到自己 + 主用户的历史 NULL。
+        """
         statement = select(OutboundDraft)
+        if cloud_user_id is not UNSET:
+            user = normalize_cloud_user_id(cloud_user_id)
+            if user is None:
+                return []
+            statement = statement.where(
+                owned_clause(OutboundDraft.cloud_user_id, user, self._owner())
+            )
         if bot_id is not None:
             statement = statement.where(OutboundDraft.bot_id == bot_id)
         if channel:
@@ -352,8 +383,15 @@ class OutboundDraftService:
             logger.info("outbound_draft.denied id=%s", draft_id)
         return result.rowcount == 1
 
-    async def cancel(self, draft_id: uuid.UUID) -> OutboundDraft:
-        """用户主动取消：只有 pending 可以取消，其余状态返回 409。"""
+    async def cancel(
+        self, draft_id: uuid.UUID, *, cloud_user_id: str | None = None
+    ) -> OutboundDraft:
+        """用户主动取消：只有 pending 可以取消，其余状态返回 409。
+
+        `cloud_user_id` 非空时先做归属校验：别人的草稿按不存在处理（404）。
+        """
+        if cloud_user_id is not None:
+            await self.get(draft_id, cloud_user_id=cloud_user_id)
         now = _utcnow()
         async with self._session_factory() as session:
             result = await session.execute(

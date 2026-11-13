@@ -350,6 +350,7 @@ class BotService:
         run_at: datetime | str | None = None,
         enabled: bool = True,
         event_triggers: list[str] | None = None,
+        cloud_user_id: str | None = None,
     ) -> BotRoutine:
         """新建例程：cron 重复、run_at 一次性、event_triggers 事件触发可组合。
 
@@ -387,6 +388,7 @@ class BotService:
             next_run_at=next_run_at,
             enabled=enabled,
             event_triggers=events,
+            cloud_user_id=cloud_user_id,
         )
         await self._refresh_triggers()
         return routine
@@ -1027,6 +1029,9 @@ class BotService:
             avatar_color=bot.avatar_color,
             bot_id=bot.id,
             workspace=workspace,
+            # 例程带着创建者的人格开工；主定时（routine=None）保持 NULL，
+            # 读取时按主用户兜底（Phase 2 的历史口径）。
+            cloud_user_id=routine.cloud_user_id if routine is not None else None,
         )
         # 先推进 next_run_at 再起 Run：起 Run 期间调度器再扫到也不会重复开工。
         # 例程触发时 Bot 主定时的 next_run_at 不动，只更新最近开工信息。

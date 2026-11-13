@@ -103,6 +103,8 @@ class Settings(BaseSettings):
     device_token_ttl_days: int = 90
     # 一次性配对码有效期（秒）。
     pairing_code_ttl_seconds: int = 600
+    # IM 频道绑定码有效期（秒）。用户在 Flux Bot 生成、在飞书/企微/钉钉里发一次即绑定。
+    channel_bind_code_ttl_seconds: int = 600
     # 主用户（第一个用户）的 Flux 云账号 user id（FLUX_OWNER_CLOUD_USER_ID）。
     # 历史设备与配对码的 cloud_user_id 为 NULL 时按这个 id 归属；本机 CLI 没有
     # 云登录态，也用它代表"这台机器的主人"。留空 = 不启用旧数据回退：此时设备

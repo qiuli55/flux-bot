@@ -36,6 +36,8 @@ MEMORY_POLICIES: dict[MemoryLayer, MemoryPolicy] = {
     MemoryLayer.USER: MemoryPolicy(max_entries=200, ttl=timedelta(days=180)),
     MemoryLayer.PROJECT: MemoryPolicy(max_entries=PROJECT_SECTION_MAX_ENTRIES, ttl=None),
     MemoryLayer.ENVIRONMENT: MemoryPolicy(max_entries=50, ttl=None),
+    #: Shared 空间记忆由成员主动维护，不因时间失效；容量按空间计。
+    MemoryLayer.SHARED: MemoryPolicy(max_entries=200, ttl=None),
 }
 
 #: 平台维护的 Environment Memory 真源：(key, content)。

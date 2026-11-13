@@ -32,6 +32,7 @@ from urllib.parse import quote
 
 import httpx
 
+from flux.core.channels.binding_flow import resolve_media_inbound, resolve_text_inbound
 from flux.core.channels.feishu_crypto import FeishuCryptoError, decrypt_payload, verify_signature
 from flux.core.channels.inbound_media import (
     DownloadedMedia,
@@ -92,7 +93,9 @@ class _InboundMessage:
 
     message_id: str
     chat_id: str
-    kind: str  # text / image / file / audio
+    #: 发送者的稳定 id（open_id → user_id → union_id）；空串 = 解析失败，按未绑定处理。
+    sender_id: str = ""
+    kind: str = ""  # text / image / file / audio
     text: str = ""
     resource_key: str = ""
     file_name: str = ""
@@ -353,10 +356,32 @@ class FeishuBotChannel:
             logger.warning("飞书回调指向的 Bot 不存在 bot=%s", bot_id)
             return FeishuCallbackResult(404, {"error": "FLUX_FEISHU_BOT_ID 指向的 Bot 不存在"})
 
+        async def _system_reply(text: str) -> None:
+            await self._send_system_message(chat_id, text)
+
         if parsed.kind == "text":
+            cloud_user_id = await resolve_text_inbound(
+                self._container,
+                channel="feishu",
+                external_user_id=parsed.sender_id,
+                text=parsed.text,
+                reply=_system_reply,
+            )
+            if cloud_user_id is None:
+                # 绑定码 / 未绑定提示 / 缺发送者：都只回系统消息，不建 turn。
+                return FeishuCallbackResult(200, {"created": False, "bound": False})
             files: list[Any] = []
             content = parsed.text
         else:
+            cloud_user_id = await resolve_media_inbound(
+                self._container,
+                channel="feishu",
+                external_user_id=parsed.sender_id,
+                reply=_system_reply,
+            )
+            if cloud_user_id is None:
+                # 未绑定：不下载媒体、不落盘、不建 turn。
+                return FeishuCallbackResult(200, {"created": False, "bound": False})
             # 重推：turn 已存在就直接确认，绝不再次下载媒体。
             existing = await self._existing_turn(bot, message_id)
             if existing is not None:
@@ -389,7 +414,11 @@ class FeishuBotChannel:
 
         try:
             turn, created = await self._container.bot_conversation.create_turn(
-                bot, content=content, files=files, client_turn_id=message_id
+                bot,
+                content=content,
+                files=files,
+                client_turn_id=message_id,
+                cloud_user_id=cloud_user_id,
             )
         except AIOSError as exc:
             logger.warning(
@@ -543,6 +572,14 @@ class FeishuBotChannel:
             return None
         return await finder(bot, client_turn_id)
 
+    async def _send_system_message(self, chat_id: str, text: str) -> None:
+        """绑定提示 / 成功确认等系统消息：直接发送，不走出站审批草稿。"""
+        sender = self._sender
+        if sender is None:
+            logger.warning("飞书系统消息未发送：未配置应用凭据 chat=%s", chat_id)
+            return
+        await sender.send_text(chat_id, text)
+
     async def _load_media(self, parsed: _InboundMessage) -> tuple[list[Any], str]:
         """下载一条图片/文件/语音并落盘；没有应用凭据时给中文说明而不是静默忽略。"""
         label = _KIND_LABELS[parsed.kind]
@@ -642,6 +679,7 @@ class FeishuBotChannel:
                     bot_id=bot.id,
                     task_id=final.task_id,
                     turn_id=final.id,
+                    cloud_user_id=getattr(final, "cloud_user_id", None),
                 )
                 logger.info(
                     "飞书出站回复已入队 draft=%s turn=%s task=%s hash=%s chars=%s",
@@ -766,6 +804,14 @@ def _parse_message(payload: dict[str, Any]) -> _InboundMessage | FeishuCallbackR
     event = event if isinstance(event, dict) else {}
     message = event.get("message")
     message = message if isinstance(message, dict) else {}
+    # 发送者身份：优先 open_id（应用内稳定），其次 user_id / union_id。
+    sender = event.get("sender")
+    sender = sender if isinstance(sender, dict) else {}
+    sender_ids = sender.get("sender_id")
+    sender_ids = sender_ids if isinstance(sender_ids, dict) else {}
+    sender_id = str(
+        sender_ids.get("open_id") or sender_ids.get("user_id") or sender_ids.get("union_id") or ""
+    ).strip()
 
     message_type = str(message.get("message_type") or "").strip().lower()
     # 其余类型（表情、位置、链接、视频等）保持 200 忽略，与既有行为一致。
@@ -784,7 +830,13 @@ def _parse_message(payload: dict[str, Any]) -> _InboundMessage | FeishuCallbackR
         text = _text_content(content)
         if not text:
             return FeishuCallbackResult(200, {"ignored": True, "reason": "空文本消息"})
-        return _InboundMessage(message_id=message_id, chat_id=chat_id, kind="text", text=text)
+        return _InboundMessage(
+            message_id=message_id,
+            chat_id=chat_id,
+            sender_id=sender_id,
+            kind="text",
+            text=text,
+        )
 
     if message_type == "image":
         image_key = str(content.get("image_key") or "").strip()
@@ -793,6 +845,7 @@ def _parse_message(payload: dict[str, Any]) -> _InboundMessage | FeishuCallbackR
         return _InboundMessage(
             message_id=message_id,
             chat_id=chat_id,
+            sender_id=sender_id,
             kind="image",
             resource_key=image_key,
         )
@@ -805,6 +858,7 @@ def _parse_message(payload: dict[str, Any]) -> _InboundMessage | FeishuCallbackR
         return _InboundMessage(
             message_id=message_id,
             chat_id=chat_id,
+            sender_id=sender_id,
             kind="file",
             resource_key=file_key,
             file_name=file_name,
@@ -817,6 +871,7 @@ def _parse_message(payload: dict[str, Any]) -> _InboundMessage | FeishuCallbackR
     return _InboundMessage(
         message_id=message_id,
         chat_id=chat_id,
+        sender_id=sender_id,
         kind="audio",
         resource_key=file_key,
         file_name=file_name,

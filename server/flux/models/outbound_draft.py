@@ -51,6 +51,9 @@ class OutboundDraft(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     turn_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True, index=True)
     #: 审批记录 id（tasks.decisions 里的那条），创建后回填。
     decision_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    #: 这条回复代表哪个 Flux 云用户（绑定的 IM 发送者 / 该用户的例程）。
+    #: NULL = Phase 3 之前的草稿，只属于配置的主用户。
+    cloud_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     #: 失败原因（截断）。只放异常类型与短消息，不写正文、不回显任何令牌。
     error: Mapped[str | None] = mapped_column(String(256), nullable=True)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -68,6 +71,7 @@ class OutboundDraft(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "task_id": str(self.task_id) if self.task_id is not None else None,
             "turn_id": str(self.turn_id) if self.turn_id is not None else None,
             "decision_id": self.decision_id,
+            "cloud_user_id": self.cloud_user_id,
             "error": self.error,
             "sent_at": _iso(self.sent_at),
             "resolved_at": _iso(self.resolved_at),

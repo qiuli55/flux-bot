@@ -150,6 +150,11 @@ SPEC_TABLES = {
     "bot_skills",
     # 统一出站草稿（迁移 e2c9b7a4d1f3）：各频道待审批出站正文的持久化真相源。
     "outbound_drafts",
+    # Phase 3（迁移 b9f3c1d8a4e2）：IM 账号绑定 / 一次性绑定码，以及共享空间与成员。
+    "channel_user_bindings",
+    "channel_bind_codes",
+    "spaces",
+    "space_members",
     # 手机设备配对（迁移 f9d2e4a7b1c8）：devices 存长期设备令牌哈希，
     # pairing_codes 存一次性配对码哈希；两者都不落明文。
     "devices",

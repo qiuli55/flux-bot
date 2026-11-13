@@ -37,6 +37,7 @@ from flux.core.capability_import.repository import ImportedCapabilityRepository
 from flux.core.capability_import.scanners import AgentScanner
 from flux.core.capability_import.service import CapabilityImportService
 from flux.core.channels.activity import ChannelActivityRegistry
+from flux.core.channels.bindings import ChannelBindingService
 from flux.core.channels.dingtalk_bot import DingTalkBotChannel
 from flux.core.channels.feishu_bot import FeishuBotChannel
 from flux.core.channels.outbound_drafts import OutboundDraftService
@@ -95,6 +96,8 @@ from flux.core.project_files.explorer import WorkspaceFileExplorer
 from flux.core.project_scanner.scanner import ProjectScanner
 from flux.core.skills.repository import SkillLibraryRepository
 from flux.core.skills.service import SkillLibraryService
+from flux.core.spaces.repository import SpaceRepository
+from flux.core.spaces.service import SpaceService
 from flux.core.supervisor import (
     FeishuChannel,
     FeishuWebhook,
@@ -144,6 +147,8 @@ class Container:
     engine: AsyncEngine = field(init=False)
     #: 手机设备配对码与长期设备令牌（鉴权依赖直接从这里取缓存）。
     devices: DeviceService = field(init=False)
+    #: IM 频道 ↔ Flux Cloud 账号绑定与一次性绑定码（Phase 3）。
+    channel_bindings: ChannelBindingService = field(init=False)
     agents: AgentManager = field(init=False)
     router: ModelRouter = field(init=False)
     scheduler: TaskScheduler = field(init=False)
@@ -164,6 +169,8 @@ class Container:
     brain_refresher: BrainRefresher = field(init=False)
     memory_repo: MemoryRepository = field(init=False)
     memory: MemoryService = field(init=False)
+    #: 共享空间（Phase 3）：spaces / space_members + shared 记忆的访问闸门。
+    spaces: SpaceService = field(init=False)
     task_repo: TaskRepository = field(init=False)
     key_vault: KeyVaultService = field(init=False)
     #: 用户保险库（站点登录 / 支付卡 / 联系人），密文复用密钥库同一把主密钥
@@ -283,6 +290,11 @@ class Container:
         self.engine = create_engine(self.settings.database_url)
         self.session_factory = create_session_factory(self.engine)  # type: ignore[attr-defined]
         self.devices = DeviceService(self.session_factory, self.settings)  # type: ignore[attr-defined]
+        # IM 绑定：频道回调在创建 turn 前先过这道闸门（未绑定不按任何人处理）。
+        self.channel_bindings = ChannelBindingService(
+            self.session_factory,  # type: ignore[attr-defined]
+            self.settings,
+        )
         #: 内建 CLI Agent Adapter 集合：installation 状态机与 P2-1 的 CLI runtime 共用同一批实例
         cli_adapters = build_default_adapters()
         self.task_repo = TaskRepository(self.session_factory)  # type: ignore[attr-defined]
@@ -446,6 +458,9 @@ class Container:
         # 写入必须走受控路径（用户 REST / 平台代码），Agent 面只有只读的 memory.recall
         self.memory_repo = MemoryRepository(self.session_factory)  # type: ignore[attr-defined]
         self.memory = MemoryService(self.memory_repo, brain=self.brain, settings=self.settings)
+        # 共享空间：先装配空间与成员，再把访问闸门交给记忆服务（shared 层按成员过滤）。
+        self.spaces = SpaceService(SpaceRepository(self.session_factory))  # type: ignore[attr-defined]
+        self.memory.attach_spaces(self.spaces)
         # 账号级用户记忆：本地只做缓存，云端是权威存储；同步失败不影响本地读写
         self.memory_prefs = MemoryPrefsStore(
             self.settings.memory_prefs_path,
@@ -563,7 +578,10 @@ class Container:
         # Bot 对话：一轮落一条 bot_turns，后台按 Bot 串行调用同一个助手逻辑。
         self.bot_conversation = BotConversationService(self)
         # 统一出站草稿：飞书等频道把待发送正文落库，审批结果只做状态迁移。
-        self.outbound_drafts = OutboundDraftService(self.session_factory)  # type: ignore[attr-defined]
+        self.outbound_drafts = OutboundDraftService(
+            self.session_factory,  # type: ignore[attr-defined]
+            self.settings,
+        )
         # 出站审批卡串行闸门：飞书 / 企业微信 / 钉钉共用一把锁，避免同一对话
         # 同时挂出多张卡（`pending_decision()` 只认最后一张）。
         self.outbound_approval_lock = asyncio.Lock()

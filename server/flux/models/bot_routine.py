@@ -40,6 +40,9 @@ class BotRoutine(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
     #: 可触发本例程的事件名（webhook.* / github.* 或 Events 常量）；NULL/空 = 只按 cron 跑
     event_triggers: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    #: 创建者是哪个 Flux 云用户；到点开工时按这个人的记忆 / 密钥 / 连接器运行。
+    #: NULL = Phase 3 之前或未解析出人的例程，读取时按主用户兜底。
+    cloud_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     next_run_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
     )
@@ -54,6 +57,7 @@ class BotRoutine(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "schedule": self.schedule,
             "enabled": bool(self.enabled),
             "event_triggers": list(self.event_triggers or []),
+            "cloud_user_id": self.cloud_user_id,
             "next_run_at": _iso(self.next_run_at),
             "last_run_at": _iso(self.last_run_at),
             "created_at": _iso(self.created_at),

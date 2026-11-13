@@ -50,6 +50,9 @@ class BotTurn(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     #: 客户端幂等键（同一 Bot 内唯一）；重试同一条消息返回原来的 turn。
     client_turn_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    #: 这一轮代表哪个 Flux 云用户（绑定的 IM 发送者 / API 登录人）。
+    #: NULL = Phase 3 之前的轮次或无法解析的人；读取时按主用户兜底。
+    cloud_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     def to_dict(self) -> dict[str, Any]:
@@ -67,6 +70,7 @@ class BotTurn(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "error": self.error,
             "error_code": self.error_code,
             "client_turn_id": self.client_turn_id,
+            "cloud_user_id": self.cloud_user_id,
             "created_at": (self.created_at.isoformat() if self.created_at is not None else None),
             "updated_at": (self.updated_at.isoformat() if self.updated_at is not None else None),
             "completed_at": (

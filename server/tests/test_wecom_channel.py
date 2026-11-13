@@ -87,6 +87,7 @@ class _FakeConversation:
         content: str,
         files: list[Any] | None = None,
         client_turn_id: str | None = None,
+        cloud_user_id: str | None = None,
     ) -> tuple[Any, bool]:
         self.calls.append(
             {
@@ -94,6 +95,7 @@ class _FakeConversation:
                 "content": content,
                 "files": list(files or ()),
                 "client_turn_id": client_turn_id,
+                "cloud_user_id": cloud_user_id,
             }
         )
         if client_turn_id is not None and client_turn_id in self.by_client_id:
@@ -112,6 +114,26 @@ class _FakeConversation:
 
     async def wait_for_turn(self, bot_id: uuid.UUID, turn_id: uuid.UUID, *, wait_seconds: float):
         return SimpleNamespace(id=turn_id, status="failed", reply_message_id=None)
+
+
+class _FakeBindings:
+    """单元测试用的绑定服务：默认把测试发送者绑到主用户 1。"""
+
+    def __init__(self, cloud_user_id: str | None = "1") -> None:
+        self.cloud_user_id = cloud_user_id
+        self.redeemed: list[str] = []
+
+    async def get_binding(self, channel: str, external_user_id: str) -> Any | None:
+        if self.cloud_user_id is None:
+            return None
+        return SimpleNamespace(cloud_user_id=self.cloud_user_id)
+
+    async def redeem_code(self, code: str) -> str | None:
+        self.redeemed.append(code)
+        return None
+
+    async def bind(self, **kwargs: Any) -> Any:
+        return SimpleNamespace(cloud_user_id=kwargs.get("cloud_user_id"))
 
 
 async def _chunks(*parts: bytes):
@@ -255,6 +277,7 @@ def _unit_channel(
     container = SimpleNamespace(
         bots=_FakeBots(bot),
         bot_conversation=_FakeConversation(),
+        channel_bindings=_FakeBindings(),
         settings=settings,
     )
     kwargs.setdefault("bot_id", str(bot.id))
@@ -327,6 +350,11 @@ def _callback_client(settings: Settings) -> Iterator[tuple[TestClient, Container
         wecom_token=TOKEN,
         wecom_encoding_aes_key=ENCODING_AES_KEY,
     ) as (client, container):
+        asyncio.run(
+            container.channel_bindings.bind(
+                channel="wecom", external_user_id=USER_ID, cloud_user_id="1"
+            )
+        )
         container.assistant = _FakeAssistant()  # type: ignore[assignment]
         created = client.post(f"{PREFIX}/bots", json={"name": "企微小助", "description": "接企微"})
         assert created.status_code == 200, created.text

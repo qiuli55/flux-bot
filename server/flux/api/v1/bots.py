@@ -15,6 +15,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
+from flux.api.auth import get_current_cloud_user_id
 from flux.api.deps import get_container
 from flux.api.response import ok
 from flux.container import Container
@@ -260,6 +261,7 @@ async def create_bot_routine(
     bot_id: str,
     payload: BotRoutineCreateRequest,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """新增例程：自带指令与 cron，到点由后台调度器开工。"""
     row = await container.bots.create_routine(
@@ -270,6 +272,7 @@ async def create_bot_routine(
         run_at=payload.run_at,
         enabled=payload.enabled,
         event_triggers=payload.event_triggers,
+        cloud_user_id=cloud_user_id,
     )
     return ok(row.to_dict())
 
@@ -393,6 +396,7 @@ async def create_bot_turn(
     payload: BotTurnCreateRequest,
     response: Response,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """给 Bot 发一条对话消息：入队后立即返回 202（重放 client_turn_id 返回 200）。
 
@@ -406,6 +410,7 @@ async def create_bot_turn(
         content=payload.content,
         files=files,
         client_turn_id=payload.client_turn_id,
+        cloud_user_id=cloud_user_id,
     )
     response.status_code = 202 if created else 200
     return ok({"turn": await container.bot_conversation.turn_payload(turn)})

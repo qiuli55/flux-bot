@@ -35,6 +35,7 @@ class BotRoutineRepository:
         next_run_at: datetime | None,
         enabled: bool = True,
         event_triggers: list[str] | None = None,
+        cloud_user_id: str | None = None,
     ) -> BotRoutine:
         async with self._session_factory() as session:
             row = BotRoutine(
@@ -46,6 +47,7 @@ class BotRoutineRepository:
                 next_run_at=next_run_at,
                 enabled=enabled,
                 event_triggers=event_triggers,
+                cloud_user_id=(cloud_user_id or "").strip() or None,
             )
             session.add(row)
             await self._commit(session)

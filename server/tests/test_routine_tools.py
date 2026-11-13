@@ -158,6 +158,7 @@ async def test_create_cron_routine_binds_current_bot() -> None:
         "run_at": None,
         "event_triggers": None,
         "enabled": True,
+        "cloud_user_id": None,
     }
 
 

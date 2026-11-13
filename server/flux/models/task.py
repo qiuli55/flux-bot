@@ -92,6 +92,9 @@ class Task(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # 本轮执行的工作目录快照。Bot 每次开工时把它的独立目录写进来，
     # CLI runtime 据此把子进程 cwd 放到 bots/<id>/workspace，而不是全局工作区。
     workspace: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # 这一轮代表哪个 Flux 云用户（Phase 3）。例程开工时从 bot_routines 带下来，
+    # Agent 执行期的记忆 / 连接器按它取人；NULL = 旧任务，按主用户兜底。
+    cloud_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
     def pending_decision(self) -> dict | None:
         """当前正等用户选择的那条决策点记录；没有则返回 None。"""
@@ -134,6 +137,7 @@ class Task(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "parent_task_id": (
                 str(self.parent_task_id) if self.parent_task_id is not None else None
             ),
+            "cloud_user_id": self.cloud_user_id,
         }
 
 

@@ -38,6 +38,7 @@ class BotTurnRepository:
         bot_id: uuid.UUID,
         task_id: uuid.UUID,
         client_turn_id: str | None = None,
+        cloud_user_id: str | None = None,
     ) -> tuple[BotTurn, bool]:
         """写入一条 queued turn，返回 (行, 是否新建)。
 
@@ -51,6 +52,7 @@ class BotTurnRepository:
             task_id=task_id,
             status="queued",
             client_turn_id=(client_turn_id or "").strip() or None,
+            cloud_user_id=(cloud_user_id or "").strip() or None,
             created_at=now,
             updated_at=now,
         )

@@ -238,6 +238,25 @@ async def _require_bot_id(ctx: ToolContext) -> uuid.UUID:
     return bot_id if isinstance(bot_id, uuid.UUID) else uuid.UUID(str(bot_id))
 
 
+async def _cloud_user_for_run(ctx: ToolContext) -> str | None:
+    """本次 Run 代表哪个 Flux 云用户：run → task → tasks.cloud_user_id。
+
+    MCP 请求本身没有登录态；任务行是 Agent 执行期唯一可靠的归属来源。
+    解析不到时返回 None，让下游按历史口径回退主用户。
+    """
+    run_id = ctx.identity.run_id
+    if not run_id:
+        return None
+    run = await ctx.container.run_repo.get(run_id)
+    if run is None or run.task_id is None:
+        return None
+    try:
+        task = await ctx.container.task_repo.get(run.task_id)
+    except NotFoundError:
+        return None
+    return getattr(task, "cloud_user_id", None)
+
+
 def _routine_id(value: str) -> uuid.UUID:
     try:
         return uuid.UUID(value)
@@ -250,7 +269,11 @@ def _routine_id(value: str) -> uuid.UUID:
 async def routine_create(ctx: ToolContext, params: dict[str, Any]) -> dict[str, Any]:
     kwargs = _create_kwargs(params)
     bot_id = await _require_bot_id(ctx)
-    routine = await ctx.container.bots.create_routine(bot_id, **kwargs)
+    routine = await ctx.container.bots.create_routine(
+        bot_id,
+        **kwargs,
+        cloud_user_id=await _cloud_user_for_run(ctx),
+    )
     return routine.to_dict()
 
 
@@ -436,11 +459,19 @@ async def run_routine_tool(
     bot: Any,
     name: str,
     arguments: dict[str, Any],
+    *,
+    cloud_user_id: str | None = None,
 ) -> Any:
-    """执行一个对话侧例程工具；调用与 MCP 相同的 `BotService`。"""
+    """执行一个对话侧例程工具；调用与 MCP 相同的 `BotService`。
+
+    `cloud_user_id` 是本轮对话的人格：从绑定 IM / 登录 API 带进来，创建例程时
+    落库，之后到点开工就按这个人运行。
+    """
     args = arguments or {}
     if name == "routine_create":
-        routine = await service.create_routine(bot.id, **_create_kwargs(args))
+        routine = await service.create_routine(
+            bot.id, **_create_kwargs(args), cloud_user_id=cloud_user_id
+        )
         return routine.to_dict()
     if name == "routine_list":
         reject_unknown(args, set())

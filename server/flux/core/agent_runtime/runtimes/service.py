@@ -95,7 +95,9 @@ class TaskRunService:
         # 跨轮记忆：最近对话轨迹 + 上一轮工作记忆卡，两者都进本轮指令
         messages, _ = await container.task_repo.list_messages(task_uuid, limit=_HISTORY_LIMIT)
         memory = await _latest_memory(container, task_uuid)
-        user_memory = await _user_memory_instruction(container)
+        user_memory = await _user_memory_instruction(
+            container, getattr(task, "cloud_user_id", None)
+        )
         bot_memory = await _bot_memory_instruction(container, task)
         instruction = _execution_instruction(
             task,
@@ -163,7 +165,9 @@ class TaskRunService:
             attachments = await _latest_attachments(container, task.id)
             messages, _ = await container.task_repo.list_messages(task.id, limit=_HISTORY_LIMIT)
             memory = await _latest_memory(container, task.id)
-            user_memory = await _user_memory_instruction(container)
+            user_memory = await _user_memory_instruction(
+                container, getattr(task, "cloud_user_id", None)
+            )
             bot_memory = await _bot_memory_instruction(container, task)
             runtime_id = _runtime_of_task(task, self._agent(task))
             resumed = await _has_session(container, task.id, runtime_id, task.agent_id)
@@ -317,8 +321,12 @@ _REMEMBER_HINT = (
 )
 
 
-async def _user_memory_instruction(container: Container) -> str:
-    """把账号级用户记忆压成一段背景（最近 8 条 / 1200 字），并附上记录提示。"""
+async def _user_memory_instruction(container: Container, cloud_user_id: str | None = None) -> str:
+    """把当前人格的三层记忆压成背景（User 最近 8 条 / 1200 字 + 共享空间）。
+
+    `cloud_user_id` 来自任务行（例程创建者 / 绑定的 IM 用户）；None 时沿用
+    MemoryService 的主用户回退口径，兼容历史任务。
+    """
     blocks: list[str] = []
     prefs = getattr(container, "memory_prefs", None)
     if prefs is None or prefs.auto_capture():
@@ -327,10 +335,17 @@ async def _user_memory_instruction(container: Container) -> str:
     if memory is None:
         return "\n\n".join(blocks)
     try:
-        entries = await memory.list_entries(layer=MemoryLayer.USER)
+        entries = await memory.list_entries(layer=MemoryLayer.USER, cloud_user_id=cloud_user_id)
     except Exception:  # noqa: BLE001 - 记忆读取失败不能挡住任务启动
         logger.warning("读取用户长期记忆失败", exc_info=True)
-        return "\n\n".join(blocks)
+        entries = []
+    try:
+        shared = await memory.render_shared_block(cloud_user_id)
+    except Exception:  # noqa: BLE001 - 共享空间失败不能挡住任务启动
+        logger.warning("读取共享空间记忆失败", exc_info=True)
+        shared = ""
+    if shared:
+        blocks.append(shared.rstrip())
     if entries:
         picked = entries[-_USER_MEMORY_MAX_ENTRIES:]
         lines: list[str] = []

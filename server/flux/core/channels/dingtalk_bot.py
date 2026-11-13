@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from flux.core.channels.binding_flow import resolve_media_inbound, resolve_text_inbound
 from flux.core.channels.dingtalk_crypto import (
     DingTalkCryptoError,
     build_encrypted_response,
@@ -399,10 +400,34 @@ class DingTalkBotChannel:
             logger.warning("钉钉回调指向的 Bot 不存在 bot=%s", bot_id)
             return DingTalkCallbackResult(404, {"error": "FLUX_DINGTALK_BOT_ID 指向的 Bot 不存在"})
 
+        # 外部用户 id 用 senderStaffId，而不是 conversationId：群聊里同一个人
+        # 在不同会话中的 staff_id 不变，绑定才不会随群迁移失效。
+        external_user_id = str(dest.get("staff_id") or "").strip()
+
+        async def _system_reply(text: str) -> None:
+            await self._send_system_message(dest, text)
+
         if parsed.kind == "text":
+            cloud_user_id = await resolve_text_inbound(
+                self._container,
+                channel="dingtalk",
+                external_user_id=external_user_id,
+                text=parsed.text,
+                reply=_system_reply,
+            )
+            if cloud_user_id is None:
+                return self._success()
             files: list[Any] = []
             content = parsed.text
         else:
+            cloud_user_id = await resolve_media_inbound(
+                self._container,
+                channel="dingtalk",
+                external_user_id=external_user_id,
+                reply=_system_reply,
+            )
+            if cloud_user_id is None:
+                return self._success()
             # 重推：turn 已存在就直接回加密 success，绝不再次下载媒体。
             existing = await self._existing_turn(bot, message_id)
             if existing is not None:
@@ -434,7 +459,11 @@ class DingTalkBotChannel:
 
         try:
             turn, created = await self._container.bot_conversation.create_turn(
-                bot, content=content, files=files, client_turn_id=message_id
+                bot,
+                content=content,
+                files=files,
+                client_turn_id=message_id,
+                cloud_user_id=cloud_user_id,
             )
         except AIOSError as exc:
             logger.warning(
@@ -585,6 +614,14 @@ class DingTalkBotChannel:
             return None
         return await finder(bot, client_turn_id)
 
+    async def _send_system_message(self, dest: dict[str, str], text: str) -> None:
+        """绑定提示 / 成功确认等系统消息：直接发送，不走出站审批草稿。"""
+        sender = self._sender
+        if sender is None:
+            logger.warning("钉钉系统消息未发送：未配置应用凭据 dest_keys=%s", sorted(dest))
+            return
+        await sender.send_text(dict(dest), text)
+
     async def _load_media(self, parsed: _InboundMessage) -> tuple[list[Any], str]:
         """下载一条图片/语音/文件并落盘；缺凭据时给中文说明而不是静默忽略。"""
         label = _KIND_LABELS[parsed.kind]
@@ -722,6 +759,7 @@ class DingTalkBotChannel:
                     bot_id=bot.id,
                     task_id=final.task_id,
                     turn_id=final.id,
+                    cloud_user_id=getattr(final, "cloud_user_id", None),
                 )
                 logger.info(
                     "钉钉出站回复已入队 draft=%s turn=%s task=%s hash=%s chars=%s",

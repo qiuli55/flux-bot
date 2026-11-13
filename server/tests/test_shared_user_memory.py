@@ -179,11 +179,20 @@ def test_combined_view(client: TestClient) -> None:
 # --- 注入 ---
 
 
-def test_turn_context_contains_shared_and_bot_memory(client: TestClient) -> None:
+def test_turn_context_contains_shared_space_and_bot_memory(client: TestClient) -> None:
     fake = _fake(client)
     bot = _create_bot(client, name="小方", description="负责巡检")
+    # 全局共享画像 / 日志不再注入 Bot 对话（它们没有按人隔离）。
     client.put(f"{MEMORY_PREFIX}/profile", json={"name": "张三", "notes": "偏好中文汇报"})
     _append_journal(client, "用户对磁盘告警很敏感")
+
+    space = client.post(f"{PREFIX}/spaces", json={"name": "我们俩"}).json()["data"]
+    shared = client.post(
+        f"{PREFIX}/spaces/{space['id']}/memories",
+        json={"content": "周末一起整理磁盘"},
+    )
+    assert shared.status_code == 200, shared.text
+
     remembered = client.post(
         f"{PREFIX}/bots/{bot['id']}/memories", json={"content": "我负责每天检查磁盘"}
     )
@@ -197,11 +206,12 @@ def test_turn_context_contains_shared_and_bot_memory(client: TestClient) -> None
     context = fake.calls[-1]["context"] or ""
     # 每 Bot 记忆仍然在（没有被共享层替换）
     assert "我负责每天检查磁盘" in context
-    # 共享画像与共享日志也被叠加进来
-    assert "张三" in context
-    assert "偏好中文汇报" in context
-    assert "用户对磁盘告警很敏感" in context
-    assert "用户共享记忆" in context
+    # 共享空间记忆按成员身份注入
+    assert "共享空间「我们俩」" in context
+    assert "周末一起整理磁盘" in context
+    # 未按人隔离的全局画像 / 日志不再出现
+    assert "偏好中文汇报" not in context
+    assert "用户对磁盘告警很敏感" not in context
 
 
 def test_shared_memory_failure_does_not_fail_turn(
@@ -213,10 +223,10 @@ def test_shared_memory_failure_does_not_fail_turn(
 
     container = client.app.state.container  # type: ignore[attr-defined]
 
-    async def boom(*_args: Any, **_kwargs: Any) -> str:
+    async def boom(*_args: Any, **_kwargs: Any) -> list[Any]:
         raise RuntimeError("shared memory unavailable")
 
-    monkeypatch.setattr(container.shared_user_memory, "render_block", boom)
+    monkeypatch.setattr(container.spaces, "memberships", boom)
 
     created = client.post(f"{PREFIX}/bots/{bot['id']}/turns", json={"content": "在吗"})
     turn_id = created.json()["data"]["turn"]["id"]

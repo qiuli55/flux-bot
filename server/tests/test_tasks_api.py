@@ -38,6 +38,8 @@ _RESPONSE_KEYS = {
     "permission_mode",
     # 执行中切换 Agent 的排队目标（本轮 Run 收尾后生效）
     "pending_agent_id",
+    # Phase 3：任务代表哪个 Flux 云用户（例程按人运行）
+    "cloud_user_id",
     # 对话来源（chat = 首页普通对话 / assistant = 助理对话）
     "origin",
     # Bot 档案（对话即 bot：名称 + 形状 × 颜色头像）

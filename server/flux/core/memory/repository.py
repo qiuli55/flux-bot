@@ -52,6 +52,7 @@ class MemoryRepository:
         meta: dict | None = None,
         expires_at: datetime | None = None,
         cloud_user_id: str | None = None,
+        space_id: uuid.UUID | None = None,
     ) -> MemoryEntry:
         now = _utcnow()
         entry = MemoryEntry(
@@ -59,6 +60,7 @@ class MemoryRepository:
             layer=layer.value,
             key=key,
             cloud_user_id=cloud_user_id,
+            space_id=space_id,
             content=content,
             source=source,
             meta=meta or {},
@@ -145,6 +147,57 @@ class MemoryRepository:
             statement = statement.where(_owner_clause(cloud_user_id, owner_cloud_user_id))
         async with self._session_factory() as session:
             return list(await session.scalars(statement))
+
+    async def list_shared(
+        self,
+        *,
+        space_id: uuid.UUID,
+    ) -> list[MemoryEntry]:
+        """列出某个共享空间的全部 Shared 层条目（过期过滤交给服务层）。"""
+        statement = (
+            select(MemoryEntry)
+            .where(
+                MemoryEntry.layer == MemoryLayer.SHARED.value,
+                MemoryEntry.space_id == space_id,
+            )
+            .order_by(MemoryEntry.created_at, MemoryEntry.id)
+        )
+        async with self._session_factory() as session:
+            return list(await session.scalars(statement))
+
+    async def list_shared_in_spaces(self, space_ids: Sequence[uuid.UUID]) -> list[MemoryEntry]:
+        """列出多个共享空间的 Shared 条目；调用方必须已校验成员身份。"""
+        if not space_ids:
+            return []
+        statement = (
+            select(MemoryEntry)
+            .where(
+                MemoryEntry.layer == MemoryLayer.SHARED.value,
+                MemoryEntry.space_id.in_(list(space_ids)),
+            )
+            .order_by(MemoryEntry.created_at, MemoryEntry.id)
+        )
+        async with self._session_factory() as session:
+            return list(await session.scalars(statement))
+
+    async def prune_shared(self, space_id: uuid.UUID, *, keep: int) -> int:
+        """Shared 层容量清理：每个空间只保留最新 keep 条。"""
+        statement = (
+            select(MemoryEntry.id)
+            .where(
+                MemoryEntry.layer == MemoryLayer.SHARED.value,
+                MemoryEntry.space_id == space_id,
+            )
+            .order_by(MemoryEntry.created_at.desc(), MemoryEntry.id.desc())
+            .offset(keep)
+        )
+        async with self._session_factory() as session:
+            stale = list(await session.scalars(statement))
+            if not stale:
+                return 0
+            await session.execute(delete(MemoryEntry).where(MemoryEntry.id.in_(stale)))
+            await session.commit()
+            return len(stale)
 
     async def delete(self, entry_id: str | uuid.UUID) -> None:
         """删除一条；不存在即报错（fail-closed，避免"删了个寂寞"静默通过）。"""

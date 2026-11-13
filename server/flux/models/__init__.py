@@ -16,6 +16,7 @@ from flux.models.bot_memory import BotMemory, BotMemoryChunk
 from flux.models.bot_notification import BotNotification
 from flux.models.bot_routine import BotRoutine
 from flux.models.bot_turn import BotTurn
+from flux.models.channel_binding import ChannelBindCode, ChannelUserBinding
 from flux.models.connector import ConnectorConfig, ConnectorLog
 from flux.models.connector_installation import ConnectorInstallation
 from flux.models.context import ContextBlob, ContextStep, ContextStepToken
@@ -39,6 +40,7 @@ from flux.models.run_trace import RunTraceItem
 from flux.models.runtime_session import TaskRuntimeSession
 from flux.models.shared_user_memory import UserJournalEntry, UserProfileEntry
 from flux.models.skill_package import BotSkill, SkillPackage
+from flux.models.space import Space, SpaceMember
 from flux.models.supervisor import (
     SupervisorAssignment,
     SupervisorDigest,
@@ -88,6 +90,8 @@ __all__ = [
     "ChatGroupMemberState",
     "ChatGroupMemory",
     "ChatGroupMessage",
+    "ChannelBindCode",
+    "ChannelUserBinding",
     "ConnectorConfig",
     "ConnectorInstallation",
     "ConnectorLog",
@@ -110,6 +114,8 @@ __all__ = [
     "ProviderAccount",
     "RunTraceItem",
     "SkillPackage",
+    "Space",
+    "SpaceMember",
     "SupervisorAssignment",
     "SupervisorDigest",
     "SupervisorEval",
