@@ -35,9 +35,9 @@ class AgentCreateRequest(BaseModel):
     skills: list[str] = Field(default_factory=list)
     tools: list[str] = Field(default_factory=list)
     permissions: list[Capability] = Field(default_factory=list)
-    #: 执行该 Agent 的 runtime（P2-1 §6.2）：内置 DSH 默认，或本机 CLI（codex / opencode）。
+    #: 执行该 Agent 的 runtime（P2-1 §6.2）：默认 Claude Code，或本机 CLI（codex / opencode）。
     #: 取值在边界即校验（非法 → 422），并由 AgentManager 再校验一次（内部调用方同样受约束）。
-    runtime: Literal["dsh", "codex", "opencode"] = "dsh"
+    runtime: Literal["claude-code", "codex", "opencode"] = "claude-code"
 
 
 class DevicePairRequest(BaseModel):
@@ -107,7 +107,7 @@ class BotCreateRequest(BaseModel):
     #: 无人值守是 Bot 的常态；需要人工把关时显式改成 normal / plan / full
     permission_mode: PermissionMode = PermissionMode.UNATTENDED
     decision_mode: DecisionMode = DecisionMode.AUTO
-    #: 独立工作目录（绝对路径）；留空 = <dsh_home>/bots/<id>/workspace
+    #: 独立工作目录（绝对路径）；留空 = <runtime_home>/bots/<id>/workspace
     workspace: str | None = Field(default=None, max_length=512)
     schedule: str | None = Field(default=None, max_length=64)
     #: 该 Bot 的 IANA 时区；留空 = 继承 FLUX_TIMEZONE
@@ -215,6 +215,17 @@ class BotTurnCreateRequest(BaseModel):
     content: str = Field(min_length=1, max_length=20_000)
     attachment_ids: list[str] = Field(default_factory=list, max_length=5)
     client_turn_id: str | None = Field(default=None, max_length=128)
+
+
+class BotSubtaskCreateRequest(BaseModel):
+    """给 Bot 派一条后台子任务。
+
+    子任务独立于对话轮次运行：接口立即返回子任务任务体，用户随后仍可继续聊天；
+    开始/完成/失败/取消都会以 kind=subtask 的消息追加到父对话。
+    """
+
+    instruction: str = Field(min_length=1, max_length=8000)
+    title: str | None = Field(default=None, max_length=200)
 
 
 class TaskMessageCreateRequest(BaseModel):
@@ -728,3 +739,71 @@ class GroupMessageCreateRequest(BaseModel):
     """在群里发一条消息；会打断正在进行的 epoch 并开启新一轮。"""
 
     content: str = Field(min_length=1, max_length=8000)
+
+
+# --- 用户保险库（站点登录 / 支付卡 / 联系人）---
+
+
+class VaultLoginCreateRequest(BaseModel):
+    """新增一条站点登录；`password` 只进请求体，落库即加密。"""
+
+    site: str = Field(min_length=1, max_length=512)
+    username: str = Field(min_length=1, max_length=256)
+    password: str = Field(min_length=1, max_length=4096)
+    notes: str = Field(default="", max_length=4000)
+
+
+class VaultLoginUpdateRequest(BaseModel):
+    """局部更新登录条目；字段未出现或为 null 表示不改，`password` 留空也不改。"""
+
+    site: str | None = Field(default=None, min_length=1, max_length=512)
+    username: str | None = Field(default=None, min_length=1, max_length=256)
+    password: str | None = Field(default=None, max_length=4096)
+    notes: str | None = Field(default=None, max_length=4000)
+
+
+class VaultCardCreateRequest(BaseModel):
+    """新增一张支付卡。
+
+    `pan` / `cvv` 只用于生成密文与 last4，明文立即丢弃；也可以只给 `last4`。
+    """
+
+    label: str = Field(default="", max_length=128)
+    brand: str = Field(default="", max_length=32)
+    pan: str | None = Field(default=None, max_length=32)
+    cvv: str | None = Field(default=None, max_length=4)
+    last4: str | None = Field(default=None, max_length=4)
+    exp_month: int | None = Field(default=None, ge=1, le=12)
+    exp_year: int | None = Field(default=None, ge=2000, le=2100)
+    notes: str = Field(default="", max_length=4000)
+
+
+class VaultCardUpdateRequest(BaseModel):
+    """局部更新支付卡；未出现或为 null 的字段保持不变。没有任何 reveal 接口。"""
+
+    label: str | None = Field(default=None, max_length=128)
+    brand: str | None = Field(default=None, max_length=32)
+    pan: str | None = Field(default=None, max_length=32)
+    cvv: str | None = Field(default=None, max_length=4)
+    last4: str | None = Field(default=None, max_length=4)
+    exp_month: int | None = Field(default=None, ge=1, le=12)
+    exp_year: int | None = Field(default=None, ge=2000, le=2100)
+    notes: str | None = Field(default=None, max_length=4000)
+
+
+class VaultContactCreateRequest(BaseModel):
+    """新增一个联系人；电话 / 邮箱是字符串数组，服务层再做条数与长度校验。"""
+
+    name: str = Field(min_length=1, max_length=128)
+    phones: list[str] = Field(default_factory=list, max_length=20)
+    emails: list[str] = Field(default_factory=list, max_length=20)
+    notes: str = Field(default="", max_length=4000)
+
+
+class VaultContactUpdateRequest(BaseModel):
+    """局部更新联系人；未出现或为 null 的字段保持不变。"""
+
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    phones: list[str] | None = Field(default=None, max_length=20)
+    emails: list[str] | None = Field(default=None, max_length=20)
+    notes: str | None = Field(default=None, max_length=4000)

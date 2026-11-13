@@ -33,6 +33,8 @@ logger = get_logger(__name__)
 
 APPROVAL_KIND_HIGH_RISK = "high_risk_command"
 APPROVAL_KIND_PROTECTED = "protected_access"
+#: Claude Code `--permission-prompt-tool` 转来的工具级审批（正常模式的无头运行）
+APPROVAL_KIND_TOOL_PROMPT = "tool_permission_prompt"
 
 #: 审批卡上的两个选项（label 就是回传给 choose 接口的值）
 APPROVAL_ALLOW = "允许"
@@ -85,8 +87,13 @@ async def raise_approval(
     title: str,
     detail: str,
     meta: dict[str, Any],
+    decision_id: str | None = None,
 ) -> dict[str, Any]:
-    """把一条审批请求写成强制 pending 的决策记录 + 对话消息，返回记录本身。"""
+    """把一条审批请求写成强制 pending 的决策记录 + 对话消息，返回记录本身。
+
+    `decision_id` 可选：调用方需要提前把审批 id 写进关联记录（如出站草稿）时，
+    先自行生成并传入，保证两边在审批卡可见前就指向同一个 id。
+    """
     record = build_decision(
         question=title,
         options=[
@@ -110,6 +117,7 @@ async def raise_approval(
     )
     record = {
         **record,
+        "id": decision_id or record["id"],
         "kind": kind,
         "meta": {**meta, "task_id": str(task_id), "run_id": run_id},
     }
@@ -257,6 +265,7 @@ __all__ = [
     "APPROVAL_DENY",
     "APPROVAL_KIND_HIGH_RISK",
     "APPROVAL_KIND_PROTECTED",
+    "APPROVAL_KIND_TOOL_PROMPT",
     "APPROVAL_TIMEOUT_SECONDS",
     "ApprovalCancelledError",
     "ApprovalDeniedError",

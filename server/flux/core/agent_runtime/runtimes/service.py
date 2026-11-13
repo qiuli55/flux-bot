@@ -2,8 +2,8 @@
 
 把原先散在 `api/v1/tasks.py` 里的启动编排（确认卡合并 → 计划/指令拼装 → 预登记 run_id →
 起 Run → 广播 run_started）抽到这里，按 `agent.config["runtime"]` 分发到对应
-`AgentRuntime`。开始执行不再往对话里落消息（执行过程由流事件呈现）：DSH 路径返回的
-Run 快照仍是 `FluxDshClient` 的原物，CLI 路径返回同形快照。
+`AgentRuntime`。开始执行不再往对话里落消息（执行过程由流事件呈现）：所有 runtime
+（Claude Code / Codex / OpenCode）都走 CLI 路径，返回同形 Run 快照。
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ from flux.core.agent_runtime.runtimes.base import (
     AgentRuntime,
 )
 from flux.core.agent_runtime.runtimes.cli import build_cli_runtime
-from flux.core.agent_runtime.runtimes.dsh_runtime import DshRuntime
 from flux.core.context.budget import history_message_limit
 from flux.core.permissions.modes import normalize_mode
 from flux.core.task_engine.assistant import validate_confirmation_items
@@ -83,7 +82,7 @@ class TaskRunService:
             task = await container.task_repo.set_confirmation(task_uuid, confirmation)
 
         agent = self._agent(task)
-        runtime_id = _runtime_of(agent)
+        runtime_id = _runtime_of_task(task, agent)
         await self._require_ready(runtime_id)
         # 会话是否已在该 Agent + runtime 上存在：决定要不要省掉「原任务背景」（会话里本来就有）
         resumed = await _has_session(container, task_uuid, runtime_id, task.agent_id)
@@ -166,7 +165,7 @@ class TaskRunService:
             memory = await _latest_memory(container, task.id)
             user_memory = await _user_memory_instruction(container)
             bot_memory = await _bot_memory_instruction(container, task)
-            runtime_id = _runtime_of(self._agent(task))
+            runtime_id = _runtime_of_task(task, self._agent(task))
             resumed = await _has_session(container, task.id, runtime_id, task.agent_id)
             return _execution_instruction(
                 task,
@@ -201,13 +200,11 @@ class TaskRunService:
 
     def _runtime(self, runtime_id: str) -> AgentRuntime:
         container = self._container
-        if runtime_id == DEFAULT_RUNTIME:
-            return DshRuntime(container.dsh, workspace=container.settings.dsh_workspace)
         return build_cli_runtime(
             runtime_id=runtime_id,
             adapters=self._cli_adapters,
             settings=container.settings,
-            supervisor=container.dsh.supervisor,
+            supervisor=container.run_supervisor,
             bus=container.bus,
             token_service=container.agent_tokens,
             container=container,
@@ -228,12 +225,19 @@ class TaskRunService:
 
 
 def _runtime_of(agent: Any) -> str:
-    """从 Agent 档案取 runtime（默认 dsh）。"""
+    """从 Agent 档案取 runtime（默认 claude-code）。"""
     if agent is None:
         return DEFAULT_RUNTIME
     spec = getattr(agent, "spec", None)
     runtime = getattr(spec, "runtime", None) or DEFAULT_RUNTIME
     return str(runtime)
+
+
+def _runtime_of_task(task: Task, agent: Any) -> str:
+    """Bot 触发的一律跑 Claude Code 底座（新老 Bot 同口径），其余按 Agent 档案。"""
+    if getattr(task, "bot_id", None) is not None:
+        return DEFAULT_RUNTIME
+    return _runtime_of(agent)
 
 
 async def _latest_plan(container: Container, task_uuid: uuid.UUID) -> list[str]:
@@ -496,7 +500,7 @@ def _execution_instruction(
         ]
         if background:
             # 会话已复用（opencode/codex 续聊）时，最初的需求就在会话历史里，不再重复；
-            # 没复用（DSH / 新建会话）时仍要给背景，并明确「不要重做」。
+            # 没复用（新建会话）时仍要给背景，并明确「不要重做」。
             lines += [
                 "",
                 "## 原任务背景（对话最初的目标，此前已处理；"

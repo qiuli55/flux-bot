@@ -485,7 +485,14 @@ def test_routine_event_trigger_launches_through_event_bus(
 
             refreshed = await container.bots.get(bot.id)
             assert refreshed.last_task_id == task_id
+            # last_task_id 与 last_run_at 是先后两次提交：任务可见时例程的 last_run_at
+            # 可能还没落库，这里等到它写进去再断言。
             routines = await container.bots.list_routines(bot.id)
+            for _ in range(200):
+                if routines[0].last_run_at is not None:
+                    break
+                await asyncio.sleep(0.01)
+                routines = await container.bots.list_routines(bot.id)
             assert routines[0].last_run_at is not None
             assert routine.event_triggers == ["webhook.deploy"]
         finally:

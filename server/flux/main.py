@@ -12,13 +12,21 @@ from fastapi import Depends, FastAPI
 
 from flux.api.auth import require_rest_auth
 from flux.api.errors import register_exception_handlers
-from flux.api.internal_tap import router as llm_tap_router
-from flux.api.v1 import api_v1_router, channels_feishu, hooks, ide, supervisor_webhook, terminal
+from flux.api.v1 import (
+    api_v1_router,
+    channels_dingtalk,
+    channels_feishu,
+    channels_wecom,
+    hooks,
+    ide,
+    public_pages,
+    supervisor_webhook,
+    terminal,
+)
 from flux.api.v1 import cloud as cloud_api
 from flux.cloud.uploader import upload_previous_run
 from flux.config import Settings, get_settings
 from flux.container import Container
-from flux.core.agent_runtime.llm_stream_tap import llm_stream_tap
 from flux.core.mcp.server import router as mcp_router
 from flux.logging import configure_logging
 from flux.version import VERSION
@@ -49,18 +57,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # FINDING-2：上一进程被 SIGKILL 后，命令进程组 id 还留在库里——据此核实并回收
         # 遗留的孤儿命令进程（比对 /proc cmdline 才动手，避免误杀复用 id 的无关进程）。
         await container.terminal.recover_orphan_commands()
-        if app_settings.dsh_enabled:
-            # P2-15 §2.7：对账上一轮遗留的非终态 Run（属主已死的孤儿进程一并清理），
-            # 再拉起心跳/对账循环——否则重启后卡死的 Run 永远停在 running。
-            recovered_runs = await container.dsh.supervisor.startup_recovery()
-            # FINDING-1：对账出来的终态 Run 名下若有派生终端会话，一并收摊（幂等；事件订阅
-            # 也会触发一次，这里显式补一遍以覆盖订阅时序边界）。
-            for run_id in recovered_runs:
-                await container.terminal.stop_run_sessions(run_id)
-            # P2-04 / TC-502：Run 对完账后收尾"没有活 Run 支撑的 running 任务"，
-            # 崩溃遗留的僵尸任务在重启后立刻退回待执行或落终态，不再永久 running。
-            await container.task_runs.reconcile_orphan_tasks()
-            container.dsh.supervisor.ensure_background()
+        # P2-15 §2.7：对账上一轮遗留的非终态 Run（属主已死的孤儿进程一并清理），
+        # 再拉起心跳/对账循环——否则重启后卡死的 Run 永远停在 running。
+        recovered_runs = await container.run_supervisor.startup_recovery()
+        # FINDING-1：对账出来的终态 Run 名下若有派生终端会话，一并收摊（幂等；事件订阅
+        # 也会触发一次，这里显式补一遍以覆盖订阅时序边界）。
+        for run_id in recovered_runs:
+            await container.terminal.stop_run_sessions(run_id)
+        # P2-04 / TC-502：Run 对完账后收尾"没有活 Run 支撑的 running 任务"，
+        # 崩溃遗留的僵尸任务在重启后立刻退回待执行或落终态，不再永久 running。
+        await container.task_runs.reconcile_orphan_tasks()
+        container.run_supervisor.ensure_background()
         # 自动上传「上一轮运行日志」到账号云：后台跑，不阻塞启动，失败只记日志。
         # log_dir 未配置时整体关闭（测试与本地零配置不触发）。
         if app_settings.log_dir_path is not None:
@@ -106,8 +113,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await container.bots.stop()
         # Container.dispose() owns service shutdown ordering, including Human PTY.
         await container.dispose()
-        # 内部旁路的上游连接池随应用一起关闭
-        await llm_stream_tap.aclose()
 
     app = FastAPI(
         title=app_settings.app_name,
@@ -136,6 +141,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 正式 Bot 飞书频道：平台回调同样免本机 REST 令牌，靠 verification token /
     # Encrypt Key 签名 / 解密把关；出站仍由审批卡控制。
     app.include_router(channels_feishu.router, prefix=app_settings.api_v1_prefix)
+    # 制品页面公开读取：分享链接给没有本机登录态的人，免 REST 鉴权；
+    # 安全性由不可猜测的 share_token 与「仅 published 可读」共同把关。
+    app.include_router(public_pages.router, prefix=app_settings.api_v1_prefix)
+    # 正式 Bot 钉钉频道：HTTP 事件订阅同样免本机 REST 令牌，靠签名 token /
+    # EncodingAESKey 验签解密把关；出站仍由审批卡控制。
+    app.include_router(channels_dingtalk.router, prefix=app_settings.api_v1_prefix)
+    # 正式 Bot 企业微信频道：同样免本机 REST 令牌，靠回调 token / EncodingAESKey
+    # 签名与解密把关；出站仍由审批卡控制。
+    app.include_router(channels_wecom.router, prefix=app_settings.api_v1_prefix)
     # WebSocket 不能复用 Request + HTTPBearer 的 REST 依赖；Human PTY 自己执行
     # same-origin + token/cookie 鉴权，并单独挂到应用，避免依赖注入在 WS 上失效。
     app.include_router(
@@ -151,8 +165,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # MCP 能力面（目标架构 §3.1）：与 REST 同进程同生命周期，但不挂在 /api/v1 下——
     # 它是给 agent 用的协议端点，不是给前端用的业务接口。
     app.include_router(mcp_router)
-    # 内置 Agent 的 token 流式旁路：只给本机 DSH 子进程用，无 REST 鉴权（回环 + 一次性 token）
-    app.include_router(llm_tap_router)
     return app
 
 
