@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import uuid
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -17,6 +18,7 @@ from fastapi.testclient import TestClient
 from flux.config import Settings
 from flux.container import Container
 from flux.core.channels.outbound_drafts import OutboundDraftService
+from flux.core.task_engine.approvals import raise_approval
 from flux.db.session import create_engine, create_session_factory
 from flux.errors import ConflictError, NotFoundError
 
@@ -198,6 +200,89 @@ def test_send_failure_marks_failed_and_retains_body(settings: Settings, db_schem
             assert await service.claim(draft.id) is None
         finally:
             await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_queue_order_claim_and_release(settings: Settings, db_schema: None) -> None:
+    """排队草稿按 created_at 出队；认领是原子的，失败可退回队列。"""
+
+    async def scenario() -> None:
+        engine, service = _service(settings)
+        try:
+            task_id = uuid.uuid4()
+            first = await _create(service, body="先入队", task_id=task_id)
+            second = await _create(service, body="后入队", task_id=task_id)
+
+            head = await service.next_queued(channel="feishu", task_id=task_id)
+            assert head is not None and head.id == first.id
+            claimed = await service.claim_for_approval(first.id, "decision-1")
+            assert claimed is not None and claimed.decision_id == "decision-1"
+            # 同一张草稿不能被两次认领（并发下只有一个处理器能挂卡）
+            assert await service.claim_for_approval(first.id, "decision-2") is None
+            # 已挂卡的草稿不再出现在队列头部
+            head = await service.next_queued(channel="feishu", task_id=task_id)
+            assert head is not None and head.id == second.id
+
+            # 挂卡失败退回队列后仍按原顺序出队
+            assert await service.release_approval(first.id, "decision-1") is True
+            head = await service.next_queued(channel="feishu", task_id=task_id)
+            assert head is not None and head.id == first.id
+            # 只撤自己写入的那次绑定
+            assert await service.release_approval(first.id, "other-decision") is False
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+# --- 审批文案 ---
+
+
+def test_command_approval_keeps_terminal_wording() -> None:
+    """BUG-I：命令审批卡必须保持原有终端文案，不能被出站文案替换。"""
+
+    class _Repo:
+        def __init__(self) -> None:
+            self.records: list[dict[str, Any]] = []
+            self.statuses: list[Any] = []
+
+        async def raise_decision(self, task_id: uuid.UUID, record: dict[str, Any]) -> Any:
+            self.records.append(record)
+            return record
+
+        async def set_status(self, task_id: uuid.UUID, status: Any) -> Any:
+            self.statuses.append(status)
+            return SimpleNamespace(status=str(status))
+
+        async def add_messages(self, task_id: uuid.UUID, messages: list[Any]) -> list[Any]:
+            return [SimpleNamespace(to_dict=lambda: {"id": "message"})]
+
+    class _Bus:
+        async def publish(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+    async def scenario() -> None:
+        repo = _Repo()
+        container = SimpleNamespace(
+            task_repo=repo,
+            task_stream=_Bus(),
+            bus=_Bus(),
+        )
+        record = await raise_approval(
+            container,
+            task_id=uuid.uuid4(),
+            run_id=None,
+            kind="high_risk_command",
+            title="执行命令",
+            detail="rm -rf /tmp/x",
+            meta={},
+        )
+        allow, deny = record["options"]
+        assert allow["description"] == "仅本次有效，执行完即失效"
+        assert allow["impact"] == "允许后该命令会立刻在终端会话中执行"
+        assert deny["description"] == "默认建议：先拒绝，让 Agent 说明为什么非做不可"
+        assert deny["impact"] == "拒绝后命令不会执行，Agent 会收到明确错误"
 
     asyncio.run(scenario())
 

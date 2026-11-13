@@ -195,6 +195,37 @@ def _wait_pending_decision(client: TestClient, task_id: str, timeout: float = 8.
     raise AssertionError("等待飞书出站审批超时")
 
 
+def _wait_queued_drafts(
+    client: TestClient, task_id: str, count: int, timeout: float = 8.0
+) -> list[dict]:
+    """等该对话出现指定数量的「已落库、尚未挂卡」草稿，并按入队顺序返回。"""
+    deadline = time.monotonic() + timeout
+    rows: list[dict] = []
+    while time.monotonic() < deadline:
+        data = client.get(
+            f"{PREFIX}/outbound-drafts", params={"channel": "feishu", "status": "pending"}
+        ).json()["data"]
+        rows = [row for row in data if row["task_id"] == task_id and row["decision_id"] is None]
+        if len(rows) >= count:
+            return sorted(rows, key=lambda row: row["created_at"])
+        time.sleep(0.02)
+    raise AssertionError(f"等待飞书排队草稿超时：期望 {count}，实际 {len(rows)}")
+
+
+def _wait_next_pending(
+    client: TestClient, task_id: str, previous_id: str, timeout: float = 8.0
+) -> dict:
+    """等上一张卡被解决后新挂出的那张卡。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        body = client.get(f"{PREFIX}/tasks/{task_id}").json()["data"]
+        pending = body.get("pending_decision")
+        if pending is not None and pending["id"] != previous_id:
+            return pending
+        time.sleep(0.02)
+    raise AssertionError("等待飞书下一张出站审批卡超时")
+
+
 @contextmanager
 def _callback_client(settings: Settings) -> Iterator[tuple[TestClient, Container, dict]]:
     """起 app、建一个 Bot、把频道指向它，并替换掉真实模型与发送端。"""
@@ -434,6 +465,104 @@ def test_allow_sends_once_and_deny_does_not_send(settings: Settings, db_schema: 
         )
         assert again.status_code == 409
         assert context["sender"].messages == [(CHAT_ID, "echo: 你好")]
+
+
+def test_pending_decision_queues_replies_and_drains_in_order(
+    settings: Settings, db_schema: None
+) -> None:
+    """BUG-H：已有待决策项时不丢回复，排队后按顺序逐条挂卡。"""
+    with _callback_client(settings) as (client, _container, context):
+        assert (
+            client.post(WEBHOOK, json=_plain_body(message_id="om_q1", text="第一条")).status_code
+            == 200
+        )
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        task_id = bot["chat_task_id"]
+        card_a = _wait_pending_decision(client, task_id)
+
+        # 第二、三条回复在 A 卡未解决时到达：不能被丢弃，而是排队等卡。
+        assert (
+            client.post(WEBHOOK, json=_plain_body(message_id="om_q2", text="第二条")).status_code
+            == 200
+        )
+        assert (
+            client.post(WEBHOOK, json=_plain_body(message_id="om_q3", text="第三条")).status_code
+            == 200
+        )
+        queued = _wait_queued_drafts(client, task_id, 2)
+        assert [row["body"] for row in queued] == ["echo: 第二条", "echo: 第三条"]
+
+        # 仍然只有 A 一张卡，排队草稿没有任何 decision_id
+        task = client.get(f"{PREFIX}/tasks/{task_id}").json()["data"]
+        assert task["pending_decision"]["id"] == card_a["id"]
+        assert all(row["status"] == "pending" for row in queued)
+
+        # 允许 A：先发第一条，再自动挂出 B
+        allowed = client.post(
+            f"{PREFIX}/tasks/{task_id}/decisions/choose",
+            json={"decision_id": card_a["id"], "action": "choose", "option": "允许"},
+        )
+        assert allowed.status_code == 200, allowed.text
+        card_b = _wait_next_pending(client, task_id, card_a["id"])
+        assert card_b["meta"]["draft_id"] == queued[0]["id"]
+        assert card_b["kind"] == FEISHU_OUTBOUND_KIND
+        assert card_b["meta"]["message_id"] == "om_q2"
+        assert context["sender"].messages == [(CHAT_ID, "echo: 第一条")]
+
+        # 拒绝 B：不发送，继续挂出 C
+        denied = client.post(
+            f"{PREFIX}/tasks/{task_id}/decisions/choose",
+            json={"decision_id": card_b["id"], "action": "choose", "option": "拒绝"},
+        )
+        assert denied.status_code == 200, denied.text
+        card_c = _wait_next_pending(client, task_id, card_b["id"])
+        assert card_c["meta"]["draft_id"] == queued[1]["id"]
+        assert card_c["meta"]["message_id"] == "om_q3"
+        assert context["sender"].messages == [(CHAT_ID, "echo: 第一条")]
+
+        # 允许 C：第二条排队回复最终发出，队列清空
+        allowed_c = client.post(
+            f"{PREFIX}/tasks/{task_id}/decisions/choose",
+            json={"decision_id": card_c["id"], "action": "choose", "option": "允许"},
+        )
+        assert allowed_c.status_code == 200, allowed_c.text
+        assert context["sender"].messages == [
+            (CHAT_ID, "echo: 第一条"),
+            (CHAT_ID, "echo: 第三条"),
+        ]
+        task = client.get(f"{PREFIX}/tasks/{task_id}").json()["data"]
+        assert task["pending_decision"] is None
+
+        drafts = client.get(f"{PREFIX}/outbound-drafts", params={"channel": "feishu"}).json()[
+            "data"
+        ]
+        assert [row["status"] for row in sorted(drafts, key=lambda row: row["created_at"])] == [
+            "sent",
+            "denied",
+            "sent",
+        ]
+
+
+def test_outbound_option_text_is_about_sending_not_commands(
+    settings: Settings, db_schema: None
+) -> None:
+    """BUG-I：出站卡片的描述/影响只谈发送，不复用终端命令文案。"""
+    with _callback_client(settings) as (client, _container, context):
+        assert client.post(WEBHOOK, json=_plain_body()).status_code == 200
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        pending = _wait_pending_decision(client, bot["chat_task_id"])
+
+        assert [option["label"] for option in pending["options"]] == ["允许", "拒绝"]
+        allow, deny = pending["options"]
+        for option in (allow, deny):
+            text = f"{option['description']} {option['impact']}"
+            assert "命令" not in text
+            assert "终端" not in text
+            assert "执行" not in text
+        assert "发送" in allow["impact"]
+        assert "无法撤回" in allow["impact"]
+        assert "不会发送" in deny["impact"]
+        assert "草稿" in deny["impact"]
 
 
 def test_feishu_pending_draft_survives_process_restart(settings: Settings, db_schema: None) -> None:
