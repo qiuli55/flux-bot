@@ -24,6 +24,7 @@ from flux.api.v1 import (
     models,
     outbound_drafts,
     projects,
+    skills,
     supervisor,
     tasks,
     terminal,
@@ -58,6 +59,8 @@ api_v1_router.include_router(designs.router)
 api_v1_router.include_router(deliveries.router)
 api_v1_router.include_router(uploads.router)
 api_v1_router.include_router(user_memory.router)
+api_v1_router.include_router(skills.router)
+api_v1_router.include_router(skills.bot_router)
 api_v1_router.include_router(codex_account.router)
 api_v1_router.include_router(supervisor.router)
 

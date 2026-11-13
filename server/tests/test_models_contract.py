@@ -140,6 +140,9 @@ SPEC_TABLES = {
     # 与 bot_memories（每 Bot 记忆）和 memories（三层记忆）分开存储。
     "user_profile_entries",
     "user_journal_entries",
+    # 技能包库（迁移 a7c1e9d4b2f6）：可 CRUD 的技能正文 + 每 Bot 启用/排序分配。
+    "skill_packages",
+    "bot_skills",
     # 统一出站草稿（迁移 e2c9b7a4d1f3）：各频道待审批出站正文的持久化真相源。
     "outbound_drafts",
     # 手机设备配对（迁移 f9d2e4a7b1c8）：devices 存长期设备令牌哈希，
