@@ -457,7 +457,11 @@ def test_argv_tolerates_missing_or_broken_mcp_json(tmp_path: Any) -> None:
 def test_normal_mode_raises_the_mcp_tool_timeout(tmp_path: Any) -> None:
     runtime = SimpleNamespace(
         runtime_id=RUNTIME_CLAUDE,
-        _settings=SimpleNamespace(anthropic_api_key=None, anthropic_base_url=None),
+        _settings=SimpleNamespace(
+            anthropic_api_key=None,
+            anthropic_base_url=None,
+            anthropic_auth_mode="auto",
+        ),
         _secure=lambda path: True,
         _inject_claude_credentials=lambda config_dir: None,
     )
