@@ -79,10 +79,11 @@ overlay 的关键配置：
 - `--headless --browser chromium --no-sandbox`：容器内无显示器，必须 headless；
   `--no-sandbox` 沿用官方 README 的容器示例（容器内 Chromium 沙箱常不可用）。
   注意镜像默认以 `node`（uid 1000）运行，不是 root。
-- `--isolated`：浏览器 profile 放在内存里，容器重建即清空，不残留登录态。**代价**
-  是每次重启都是全新 profile；若确实需要持久化登录态，改成 `--user-data-dir
-  /home/node/profile`，并把命名卷挂到 `/home/node`（挂到镜像里不存在的路径会
-  变成 `root:root`，见下面的「两个已知坑」），不要复用宿主机的真实浏览器 profile。
+- `--user-data-dir /home/node/profiles/${FLUX_BROWSER_PROFILE_ID:-default}`：浏览器
+  profile（cookies、localStorage、IndexedDB 等）持久化到 `playwright-home` 卷上，
+  浏览器进程重启（包括 MCP 空闲超时后重新拉起）与容器重建后登录态都还在。
+  **不要同时使用 `--isolated`**：它与 `--user-data-dir` 互斥，且会把 profile 只
+  放在内存里。配置、重置与多用户约定见下面的「Profile 持久化」。
 - `--allowed-hosts playwright-mcp,playwright-mcp:8931`：该服务默认只接受
   `localhost` / 回环地址和 `--host` 取值作为 Host 头。**必须同时列出带端口的
   `host:port` 形式**，原因见下面的「两个已知坑」。
@@ -95,6 +96,94 @@ overlay 的关键配置：
   的 64MB；`init` 负责回收僵尸进程。
 - 基础编排里的 `flux-bot` 保留 `default` 网络（宿主机 8600 端口发布照常工作），
   额外加入 `browser` 网络，从而能按服务名解析到 `playwright-mcp`。
+
+#### Profile 持久化（默认）
+
+浏览器登录态默认是**持久化**的，不再使用 `--isolated`。
+
+- **放在哪里。** `--user-data-dir` 指向命名卷 `playwright-home`（挂载在
+  `/home/node`）里的 `/home/node/profiles/<profile id>`。这里用的是完整的
+  Chromium user-data-dir，而不是 `--storage-state`：cookies、localStorage、
+  IndexedDB、已登录会话等都会一起保留。
+- **能扛住什么。** 浏览器进程重启（包括 Playwright MCP 空闲超时后的 relaunch）、
+  `docker compose stop/start playwright-mcp`、`docker compose down` 后再 `up`，
+  只要 `playwright-home` 命名卷不被删除，profile 就还在。删除卷（例如
+  `docker compose down -v`）或手工清空 profile 目录才会丢登录态。
+- **为什么不用 /data。** profile 目录与输出目录共用 `/home/node` 这一个 node
+  可写的 home 卷：`/home/node/profiles/<id>` 放 profile，`/home/node/output`
+  放截图 / 下载。不要把 profile 放到镜像里不存在的 `/data/...`，那会被 Docker
+  建成 `root:root`，node 写不进去（见下面的「两个已知坑」）。
+- **不要复用真实浏览器 profile。** 只持久化 sidecar 自己这份专用 profile；
+  不要把宿主机上人的 Chrome / Edge profile 或 Cookie 挂进来。
+
+##### 配置 profile id
+
+profile 目录按 id 分层，默认 id 是 `default`：
+
+```bash
+# 默认：/home/node/profiles/default
+docker compose -f docker-compose.yml -f docker-compose.browser.yml up -d
+
+# 指定 id（compose 从 shell 环境或项目根的 .env 插值）：
+FLUX_BROWSER_PROFILE_ID=alice \
+  docker compose -f docker-compose.yml -f docker-compose.browser.yml up -d
+# 对应 /home/node/profiles/alice
+```
+
+也可以把 `FLUX_BROWSER_PROFILE_ID=alice` 写进项目根的 `.env`（见
+`.env.example`）。注意：
+
+- `${FLUX_BROWSER_PROFILE_ID:-default}` 是 **docker compose 的插值**，不是容器内
+  的环境变量；变量必须在执行 `docker compose` 的 shell 或项目 `.env` 里设置。
+- 需要字面量 `$` 时写成 `$$`。
+- 换一个 id 会得到一份全新的空 profile（相当于新登录）；同一个 id 重复启动会
+  继续使用已有登录态。
+- **多用户隔离（后续方向）**：目录布局已经按 id 分层。等到接入多账号 / 多用户
+  路由时，把 `FLUX_BROWSER_PROFILE_ID`（或等价的 per-account 配置）设为账号 /
+  用户 id，让每个人有自己的 `/home/node/profiles/<id>`。**不要**让多个用户共享
+  同一个 profile 目录，否则 cookie / 登录态会串号。本 PR 只约定目录布局，不实现
+  账号管理服务或真正的 per-user 路由。
+
+##### 重置 profile
+
+需要清掉 cookies / 登录态时，只删除 profile 子目录即可；同一个卷里的
+`/home/node/output` 会保留。仓库提供了一个简单脚本（需要本机有 docker）：
+
+```bash
+# 清空默认 profile，然后重新拉起 sidecar
+scripts/reset-browser-profile.sh
+
+# 清空指定 profile id
+FLUX_BROWSER_PROFILE_ID=alice scripts/reset-browser-profile.sh
+```
+
+手工等价步骤（在仓库根目录执行）：
+
+```bash
+COMPOSE="docker compose -f docker-compose.yml -f docker-compose.browser.yml"
+$COMPOSE stop playwright-mcp
+$COMPOSE run --rm --no-deps --entrypoint sh playwright-mcp \
+  -c "rm -rf '/home/node/profiles/default'"
+$COMPOSE up -d playwright-mcp
+```
+
+不要用 `docker compose down -v` 或删除 `playwright-home` 卷来重置 profile：
+那会同时删掉 `/home/node/output` 里的截图与下载产物。
+
+##### 临时使用全新会话（可选）
+
+想要一次性干净会话时，最省事的做法是用一个临时 profile id：
+
+```bash
+FLUX_BROWSER_PROFILE_ID=scratch \
+  docker compose -f docker-compose.yml -f docker-compose.browser.yml up -d
+# 用完清掉
+FLUX_BROWSER_PROFILE_ID=scratch scripts/reset-browser-profile.sh
+```
+
+如果确实要回到官方的 `--isolated` 内存模式，必须同时**移除**
+`--user-data-dir` 两个参数（二者互斥），再临时加上 `--isolated`；这属于手工改
+overlay 的一次性操作，不作为默认配置。
 
 #### 两个已知坑（2026-11-13 实机验证）
 
@@ -113,8 +202,9 @@ overlay 的关键配置：
    容器以 `node`（uid 1000）运行，于是 `browser_navigate` 在写页面快照时报
    `EACCES: permission denied, open /data/output/page-....yml`。改为把卷挂到镜像
    内已存在且属于 `node` 的 `/home/node`（空命名卷首次挂载会继承该目录属主），
-   输出目录用 `/home/node/output`，node 就能正常写入。`--isolated` 仍然保证
-   profile 只在内存里，不因挂载家目录而持久化登录态。
+   输出目录用 `/home/node/output`，node 就能正常写入。挂载家目录后 profile 也确实
+   落在该卷的 `/home/node/profiles/<id>` 下——这是默认的持久化行为，不是意外残留；
+   重置方式见上面的「Profile 持久化」。
 
 #### 出站网络：为什么不用 `internal: true`
 
@@ -152,10 +242,44 @@ docker compose -f docker-compose.yml -f docker-compose.browser.yml logs playwrig
 docker compose -f docker-compose.yml -f docker-compose.browser.yml exec flux-bot \
   curl -sS -o /dev/null -w '%{http_code}\n' http://playwright-mcp:8931/mcp
 
-# 5) 确认输出目录对容器内的 node 用户可写（EACCES 说明卷挂载点属主不对）
+# 5) 确认输出目录与 profile 目录都对容器内的 node 用户可写
+#    （EACCES 说明卷挂载点属主不对）
 docker compose -f docker-compose.yml -f docker-compose.browser.yml exec playwright-mcp \
-  sh -c 'mkdir -p /home/node/output && touch /home/node/output/.probe && echo writable'
+  sh -c 'mkdir -p /home/node/output /home/node/profiles/default && \
+         touch /home/node/output/.probe && echo writable'
 ```
+
+##### 验证登录态确实能持久化（手工 / 集成验证）
+
+自动化测试只做静态 YAML / 文档检查，**不会启动 Docker**，因此下面的持久化验证
+必须在有 Docker 的机器上手工执行：
+
+```bash
+COMPOSE="docker compose -f docker-compose.yml -f docker-compose.browser.yml"
+
+# 1) 起 sidecar
+$COMPOSE up -d playwright-mcp
+
+# 2) 通过 MCP 或一个测试页面写入可识别的 cookie / 完成一次测试登录。
+#    例如用 MCP 客户端执行 browser_navigate 打开一个测试站点并登录，
+#    或调用 browser_evaluate 写入 cookie：
+#      document.cookie = "flux_persist_probe=1; max-age=86400; path=/"
+
+# 3) 只重启浏览器进程 / 容器（不删卷）
+$COMPOSE restart playwright-mcp
+# 4) 再验证 cookie 还在；随后重建容器（down 不带 -v / up）
+$COMPOSE down
+$COMPOSE up -d playwright-mcp
+#    重新读取 document.cookie 或页面登录态，仍应看到 flux_persist_probe=1 / 已登录。
+
+# 5) 反向验证 reset 只清 profile、不删输出
+scripts/reset-browser-profile.sh
+#    cookie 应消失；/home/node/output 里的既有文件仍在。
+```
+
+若第 4 步 cookie 丢失，先确认 `--user-data-dir` 指向
+`/home/node/profiles/<id>`、该路径位于 `playwright-home` 卷内，并确认没有误用
+`--isolated` 或执行过 `down -v`。
 
 然后发起一轮 Bot 任务，启动日志里应出现：
 
@@ -168,9 +292,12 @@ Claude 本轮注入扩展 MCP server：browser
 `flux-bot` 里重跑第 4 步区分网络问题与端点路径问题。
 
 > **验证范围**：镜像已在 2026-11-13 用 Docker 29 拉取并运行过，上面「两个已知坑」
-> 及对应修法均为实机结果；**镜像大小仍未实测**。版本、digest、启动参数与端点来自
-> 上面的公开 registry / README。仓库测试只对 compose 文件做 YAML 静态解析，不会
-> 联网或启动容器，所以它只能防配置回退，不能替代上面的手工验证。
+> 及对应修法均为实机结果；**镜像大小仍未实测**。2026-11-14 的默认持久化 profile
+> 改动（`--user-data-dir` + 命名卷 + profile id）**没有**在本次改动环境里跑过
+> Docker —— 这台机器没有 docker / daemon，持久化登录态请按上面的手工步骤在有
+> Docker 的机器上验证。版本、digest、启动参数与端点来自公开 registry / README。
+> 仓库测试只对 compose 文件与文档做静态解析，不会联网或启动容器，所以它只能防
+> 配置回退，不能替代手工验证。
 
 #### 不叠加 overlay 时
 
@@ -236,10 +363,13 @@ Flux 审批卡而不是直接拒绝；在合并之前，`normal` 仍然直接拒
 2. **出站范围要自己收紧。** overlay 的 `browser` 网络刻意允许浏览器访问互联网
    （`internal: true` 会让浏览器直接不可用），所以默认没有出站白名单。高风险部署
    应在宿主机 / 网关做 egress 过滤或前置代理，不要依赖 MCP server 的 origins 参数。
-3. **使用隔离的浏览器 profile。** 不要挂载用户真实浏览器的 profile / Cookie /
-   已登录会话。overlay 用 `--isolated` 把 profile 放在内存里，容器重建即清空；
-   若改用 `--user-data-dir`，给它独立卷，并按需在任务结束后清理，避免不同 Bot /
-   任务之间串号。
+3. **只用 sidecar 自己的持久化 profile，且按用户分开。** 默认持久化的是 sidecar
+   自己那份专用 Chromium profile，位于 `playwright-home` 卷的
+   `/home/node/profiles/<profile id>`。**不要挂载人的真实桌面 Chrome / Edge
+   profile、宿主机 Cookie 或已登录会话**：那等于把个人账号完全交给 Agent，且
+   会绕过用户自己的安全边界。多用户 / 多账号部署时，为每个用户或账号使用独立的
+   `FLUX_BROWSER_PROFILE_ID`（各自独立子目录），不要共享同一份 profile，避免
+   cookie / 登录态串号；需要丢弃登录态时用上面的重置步骤。
 4. **出站动作要审批。** 登录、下单、发帖、提交表单、下载文件都属于对外副作用。
    `unattended` / `full` 模式不会逐次询问，只适合低风险或已明确授权的任务。注意
    目前 `normal` 在 headless 下并不能「逐次审批」——未经预授权的浏览器工具调用会
