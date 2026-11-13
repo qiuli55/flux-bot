@@ -34,6 +34,8 @@ from flux.api.v1 import (
     keys,
     memory,
     models,
+    pages,
+    public_pages,
     tasks,
     uploads,
     user_memory,
@@ -64,10 +66,12 @@ _BOT_ROUTERS = (
     uploads,
     user_memory,
     codex_account,
+    pages,
 )
 
-#: 免 REST 鉴权的公开回调：Webhook 用 HMAC 签名自证身份，不能套本机令牌。
-_BOT_PUBLIC_ROUTERS = (hooks,)
+#: 免 REST 鉴权的公开入口：Webhook 用 HMAC 签名自证身份，不能套本机令牌；
+#: 制品页面分享链接面向没有登录态的外部读者，只按不可猜测的 share_token 读取。
+_BOT_PUBLIC_ROUTERS = (hooks, public_pages)
 
 
 def resolve_bot_settings(settings: Settings) -> Settings:

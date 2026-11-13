@@ -154,6 +154,10 @@ SPEC_TABLES = {
     # pairing_codes 存一次性配对码哈希；两者都不落明文。
     "devices",
     "pairing_codes",
+    # Bot 产出的可分享制品页面（迁移 b3d7e1a9c5f2）：页面当前状态 + 只追加的版本历史。
+    # 公开链接按不可猜测的 share_token 读取，仅 published 页面可访问。
+    "artifact_pages",
+    "artifact_page_revisions",
 }
 
 

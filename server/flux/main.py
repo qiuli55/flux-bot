@@ -19,6 +19,7 @@ from flux.api.v1 import (
     channels_wecom,
     hooks,
     ide,
+    public_pages,
     supervisor_webhook,
     terminal,
 )
@@ -140,6 +141,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 正式 Bot 飞书频道：平台回调同样免本机 REST 令牌，靠 verification token /
     # Encrypt Key 签名 / 解密把关；出站仍由审批卡控制。
     app.include_router(channels_feishu.router, prefix=app_settings.api_v1_prefix)
+    # 制品页面公开读取：分享链接给没有本机登录态的人，免 REST 鉴权；
+    # 安全性由不可猜测的 share_token 与「仅 published 可读」共同把关。
+    app.include_router(public_pages.router, prefix=app_settings.api_v1_prefix)
     # 正式 Bot 钉钉频道：HTTP 事件订阅同样免本机 REST 令牌，靠签名 token /
     # EncodingAESKey 验签解密把关；出站仍由审批卡控制。
     app.include_router(channels_dingtalk.router, prefix=app_settings.api_v1_prefix)

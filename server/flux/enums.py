@@ -573,3 +573,15 @@ class RedactionKind(StrEnum):
     TOKEN = "token"
     #: `user:pass@host` 里的认证段（`@host` 保留，不打码）
     CRED = "cred"
+
+
+class ArtifactPageStatus(StrEnum):
+    """制品页面状态（artifact_pages.status）。
+
+    只有 PUBLISHED 能被公开链接读取；draft / unpublished 在公共入口一律 404，
+    不区分"从未发布"与"已下线"，避免泄露页面是否存在。
+    """
+
+    DRAFT = "draft"
+    PUBLISHED = "published"
+    UNPUBLISHED = "unpublished"
