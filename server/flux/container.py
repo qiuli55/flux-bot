@@ -39,6 +39,7 @@ from flux.core.channels.feishu_bot import FeishuBotChannel
 from flux.core.channels.outbound_drafts import OutboundDraftService
 from flux.core.channels.wecom_bot import WeComBotChannel
 from flux.core.code_intelligence.service import CodeIntelligenceService
+from flux.core.connectors.calendar import CalendarConnectorService
 from flux.core.connectors.email import EmailConnectorService
 from flux.core.connectors.framework import ConnectorFrameworkService, build_default_catalog
 from flux.core.context.lifecycle import ContextLifecycle
@@ -49,7 +50,7 @@ from flux.core.context.store import ContentStore
 from flux.core.context.trust import VerificationLedger
 from flux.core.desktop.service import DesktopService
 from flux.core.devices.service import DeviceService
-from flux.core.event.bus import EventBus, Events
+from flux.core.event.bus import EventBus, Events, build_event_bus
 from flux.core.git_integration.client import GitClient
 from flux.core.git_integration.service import GitService
 from flux.core.github.service import GitHubConnectorService
@@ -132,6 +133,8 @@ from flux.enums import ModelProvider
 @dataclass
 class Container:
     settings: Settings = field(default_factory=get_settings)
+    #: 事件总线：__post_init__ 按 settings 装配。默认进程内实现，只有
+    #: event_bus_backend=redis 时才换成 Redis pub/sub。
     bus: EventBus = field(default_factory=EventBus)
     policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     engine: AsyncEngine = field(init=False)
@@ -163,6 +166,8 @@ class Container:
     vault: VaultService = field(init=False)
     #: 外部连接器（GitHub）：按本地账号隔离的 OAuth 连接 + 只读 REST 工具
     github: GitHubConnectorService = field(init=False)
+    #: 用户账号日历连接器（CalDAV / ICS）：凭据复用同一把密钥库主密钥
+    calendar: CalendarConnectorService = field(init=False)
     #: 用户账号连接器框架（catalog / install / uninstall）；与 Agent 执行侧注册表分离
     connector_framework: ConnectorFrameworkService = field(init=False)
     #: Email 连接器（IMAP 读信 / SMTP 发信），凭据复用同一把密钥库主密钥
@@ -260,6 +265,9 @@ class Container:
     knowledge_worker: KnowledgeWorker = field(init=False)
 
     def __post_init__(self) -> None:
+        # 事件总线：按设置装配（默认进程内；仅显式 event_bus_backend=redis 时才用 Redis）。
+        # 客户端在 container.bus.start() 时才建连（Redis 不可达时降级，不影响启动）。
+        self.bus = build_event_bus(self.settings)
         self.engine = create_engine(self.settings.database_url)
         self.session_factory = create_session_factory(self.engine)  # type: ignore[attr-defined]
         self.devices = DeviceService(self.session_factory, self.settings)  # type: ignore[attr-defined]
@@ -277,13 +285,19 @@ class Container:
             self.settings,
             self.key_vault,
         )
+        # 账号侧日历连接器：CalDAV / ICS，凭据与安装状态同样按 account_key 隔离。
+        self.calendar = CalendarConnectorService(
+            self.session_factory,  # type: ignore[attr-defined]
+            self.settings,
+            self.key_vault,
+        )
         # Email 连接器：IMAP/SMTP 都是阻塞标准库调用，动作层用 asyncio.to_thread 包装；
         # 凭据（连接参数 + 邮箱密码）整体加密后落在 connector_installations。
         self.email = EmailConnectorService(
             self.session_factory,  # type: ignore[attr-defined]
             self.key_vault,
         )
-        # 账号侧连接器目录：GitHub（OAuth）+ Email（api_key 即邮箱密码）；
+        # 账号侧连接器目录：GitHub（OAuth）+ Email（api_key 即邮箱密码）+ Calendar；
         # 安装状态按 account_key 隔离。Agent 执行侧的 connector 注册表
         # （self.connectors）保持独立，互不替换。
         self.connector_framework = ConnectorFrameworkService(
@@ -292,6 +306,7 @@ class Container:
             build_default_catalog(self.settings),
             github=self.github,
             email=self.email,
+            calendar=self.calendar,
         )
         # Bot 桌面：只做公开隧道地址代读 + 凭据拼装，无状态
         self.desktop = DesktopService(self.settings)
@@ -756,6 +771,9 @@ class Container:
             return ModelProvider.LOCAL
 
     async def dispose(self, *, close_terminal_sessions: bool = True) -> None:
+        # 事件总线先停：取消并等待 Redis 监听任务，避免它在服务/数据库收尾后还在派发。
+        # 进程内实现是空操作；停掉后仍可本地 publish（不再跨进程广播）。
+        await self.bus.aclose()
         # 正式飞书频道先收摊：取消仍在等 turn 的后台任务并关发送端连接池，
         # 避免 Bot 对话 worker 停掉时它们又去挂新的出站审批。
         await self.feishu_bot.aclose()
