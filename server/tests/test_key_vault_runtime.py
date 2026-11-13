@@ -162,7 +162,9 @@ def test_claude_config_keeps_key_out_of_the_mcp_file(tmp_path: Path) -> None:
     assert mcp["mcpServers"]["flux"]["headers"]["Authorization"] == "Bearer tok"
     assert SECRET not in (tmp_path / "mcp.json").read_text(encoding="utf-8")
 
-    assert env["ANTHROPIC_API_KEY"] == SECRET
+    # 非官方网关：官方文档口径是 Bearer（ANTHROPIC_AUTH_TOKEN），不能下发 X-Api-Key 变量
+    assert env["ANTHROPIC_AUTH_TOKEN"] == SECRET
+    assert "ANTHROPIC_API_KEY" not in env
     assert env["ANTHROPIC_BASE_URL"] == "https://openclaw.local/anthropic"
     assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path)
     # 容器内 root + bypassPermissions 必须显式声明沙箱环境，否则 CLI 拒绝启动
