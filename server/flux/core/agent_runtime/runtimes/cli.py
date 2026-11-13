@@ -35,6 +35,12 @@ except ModuleNotFoundError:  # pragma: no cover - 3.10 用 tomli（见 pyproject
     import tomli as tomllib
 
 from flux.config import Settings
+from flux.core.agent_runtime.claude_auth import (
+    AUTH_VARS,
+    claude_auth_env,
+    resolve_auth_mode,
+    trim_inherited_auth_env,
+)
 from flux.core.agent_runtime.codex_account import (
     codex_account_home,
     codex_proxy_env,
@@ -296,7 +302,7 @@ class _CliSpec:
 
 
 #: 三个外部 CLI 的启动差异（argv 按本机实测版本校准：codex-cli 0.157.1 / opencode 1.18.29 /
-#: claude-code 2.x [2026-10-05 快照]）
+#: claude-code 2.1.323 [2026-11-12 快照]）
 _SPECS: dict[str, _CliSpec] = {
     RUNTIME_CLAUDE: _CliSpec(
         runtime_id=RUNTIME_CLAUDE,
@@ -721,6 +727,22 @@ class CliRuntime:
             raise
 
         env = {**os.environ}
+        if self.runtime_id == RUNTIME_CLAUDE:
+            # 父进程可能导出过另一套 Anthropic 鉴权变量；两套同时存在会让 CLI 报
+            # 鉴权冲突。Flux 注入了通道就只摘另一套；没注入时沿用父进程的配置
+            # （向后兼容），只有两套同时继承时才择一，详见 trim_inherited_auth_env。
+            injected = any(name in runtime_env for name in AUTH_VARS)
+            dropped = trim_inherited_auth_env(
+                env,
+                injected=runtime_env,
+                base_url=_claude_auth_base_url(channel, self._settings),
+                mode=self._settings.anthropic_auth_mode,
+            )
+            if dropped and injected:
+                logger.info(
+                    "Claude 子进程忽略父进程继承的鉴权变量 %s（以 Flux 解析的通道为准）",
+                    ",".join(dropped),
+                )
         env.update(
             build_runtime_env(
                 # 池化进程是任务级常驻：不写死某一轮的 run_id（否则下一轮就是过期 id）。
@@ -1246,15 +1268,15 @@ class CliRuntime:
             self._secure(state)
         env: dict[str, str] = {"CLAUDE_CONFIG_DIR": str(config_dir)}
         key = str(getattr(channel, "api_key", "") or "").strip() if channel is not None else ""
-        base_url = (
-            str(getattr(channel, "base_url", "") or "").strip() if channel is not None else ""
-        )
         if not key and channel is None:
             key = (self._settings.anthropic_api_key or "").strip()
-        if not base_url:
-            base_url = (self._settings.anthropic_base_url or "").strip()
-        if key:
-            env["ANTHROPIC_API_KEY"] = key
+        base_url = _claude_auth_base_url(channel, self._settings)
+        auth_mode = resolve_auth_mode(base_url, self._settings.anthropic_auth_mode)
+        auth_env = claude_auth_env(key, base_url, auth_mode)
+        if auth_env:
+            # 官方直连走 X-Api-Key，第三方网关走 Authorization: Bearer；只注入其一
+            env.update(auth_env)
+            logger.info("Claude 鉴权通道 mode=%s", auth_mode)
         else:
             # 没有密钥通道：沿用 `claude login` 的账号登录态（订阅套餐额度）
             self._inject_claude_credentials(config_dir)
@@ -2632,6 +2654,14 @@ def _codex_channel_lines(channel: Any, *, model: str) -> list[str]:
         "",
     ]
     return lines
+
+
+def _claude_auth_base_url(channel: Any, settings: Settings) -> str:
+    """Claude 本轮生效的模型通道 base_url：密钥库通道优先，空则回落到全局配置。"""
+    base_url = str(getattr(channel, "base_url", "") or "").strip() if channel is not None else ""
+    if not base_url:
+        base_url = (settings.anthropic_base_url or "").strip()
+    return base_url
 
 
 def _key_provider_id(channel: Any) -> str:
