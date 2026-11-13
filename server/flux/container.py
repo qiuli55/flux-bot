@@ -5,6 +5,7 @@ M0 是单进程装配。后续拆分微服务（§17.2 后端服务拆分）时�
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -222,6 +223,8 @@ class Container:
     bot_conversation: BotConversationService = field(init=False)
     #: 统一出站草稿：正文与状态落库，审批通过后原子认领并发送一次
     outbound_drafts: OutboundDraftService = field(init=False)
+    #: 出站审批卡的串行闸门：三个频道共享，保证同一对话同一时刻只挂一张卡
+    outbound_approval_lock: asyncio.Lock = field(init=False)
     #: 正式飞书频道：加密回调入站建 turn，出站回复必须经审批卡放行
     feishu_bot: FeishuBotChannel = field(init=False)
     #: 正式钉钉频道：HTTP 事件订阅入站建 turn，出站回复同样必须经审批卡放行
@@ -555,6 +558,9 @@ class Container:
         self.bot_conversation = BotConversationService(self)
         # 统一出站草稿：飞书等频道把待发送正文落库，审批结果只做状态迁移。
         self.outbound_drafts = OutboundDraftService(self.session_factory)  # type: ignore[attr-defined]
+        # 出站审批卡串行闸门：飞书 / 企业微信 / 钉钉共用一把锁，避免同一对话
+        # 同时挂出多张卡（`pending_decision()` 只认最后一张）。
+        self.outbound_approval_lock = asyncio.Lock()
         # Bot 后台子任务：独立于对话轮次跑的 tasks 行，结果以 kind=subtask 消息回到父对话。
         # 它不碰 last_task_id / chat_task_id，也不参与开工忙闲锁。
         self.bot_subtasks = BotSubtaskService(self)
