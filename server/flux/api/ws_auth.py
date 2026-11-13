@@ -11,7 +11,12 @@ from urllib.parse import urlparse
 
 from fastapi import WebSocket
 
-from flux.api.auth import FORWARDED_HEADERS, LOOPBACK_HOSTS
+from flux.api.auth import FORWARDED_HEADERS, LOOPBACK_HOSTS, parse_cloud_access_token
+
+
+def _set_ws_principal(websocket: WebSocket, kind: str, **extra: object) -> None:
+    """与 REST 的 `request.state.principal` 保持同一形状。"""
+    websocket.state.principal = {"kind": kind, **extra}
 
 
 def same_origin_websocket(websocket: WebSocket) -> bool:
@@ -27,20 +32,38 @@ def same_origin_websocket(websocket: WebSocket) -> bool:
 
 
 def authenticated_websocket(websocket: WebSocket) -> bool:
-    """与 REST 相同的鉴权边界：本机直连放行，其余需 Bearer / Cookie。"""
+    """与 REST 相同的鉴权边界：云登录态 / 本机直连 / Bearer / Cookie。
+
+    顺序与 `flux.api.auth.require_rest_auth` 对齐：先认账号云 access token，
+    这样只登录了账号云、没拿 `FLUX_AUTH_TOKEN` 的用户也能用 WS（终端 / LSP），
+    不会被"配置了本机令牌"误伤。设备令牌需要异步查库，暂不在 WS 上支持，
+    留作后续阶段的小改动。
+    """
 
     settings = websocket.app.state.container.settings
-    expected = (settings.auth_token or "").strip()
-    if not expected:
-        return True
-
-    client = websocket.client
-    has_forwarded = any(websocket.headers.get(name) for name in FORWARDED_HEADERS)
-    if client is not None and client.host in LOOPBACK_HOSTS and not has_forwarded:
-        return True
 
     authorization = websocket.headers.get("authorization", "")
     provided = authorization[7:].strip() if authorization.lower().startswith("bearer ") else None
     if not provided:
         provided = websocket.cookies.get("flux_auth_token")
-    return bool(provided) and hmac.compare_digest(provided, expected)
+
+    cloud_payload = parse_cloud_access_token(settings, provided)
+    if cloud_payload is not None:
+        _set_ws_principal(websocket, "cloud", cloud_user_id=cloud_payload["sub"])
+        return True
+
+    expected = (settings.auth_token or "").strip()
+    if not expected:
+        _set_ws_principal(websocket, "local")
+        return True
+
+    client = websocket.client
+    has_forwarded = any(websocket.headers.get(name) for name in FORWARDED_HEADERS)
+    if client is not None and client.host in LOOPBACK_HOSTS and not has_forwarded:
+        _set_ws_principal(websocket, "local")
+        return True
+
+    if bool(provided) and hmac.compare_digest(provided, expected):
+        _set_ws_principal(websocket, "admin")
+        return True
+    return False
