@@ -554,12 +554,40 @@ class ConnectorInstallRequest(BaseModel):
 
     - api_key 类连接器：必须提供 `api_key`；
     - oauth 类连接器：本接口只做校验并提示改用对应登录流程（GitHub 为设备码登录）。
+    - email：`api_key` 是邮箱密码 / 应用专用密码，`settings` 承载 IMAP/SMTP
+      主机、端口与 SSL 开关；密码也可以放在 `settings.password`（两者须一致）。
+    - calendar：`settings` 承载 mode / url / username / password / timeout；
+      公开 ICS 订阅允许空密码。
     """
 
     auth_type: str | None = Field(default=None, max_length=32)
     api_key: str | None = Field(default=None, max_length=4096)
     #: 不传时使用 catalog 定义里的默认 scopes。
     scopes: list[str] | None = Field(default=None, max_length=64)
+    #: 连接器专属配置（email 的 imap_host / smtp_host / port / ssl；
+    #: 日历的 mode / url / username / password / timeout）。
+    #: 与密码一起封装进加密凭据，绝不单独明文落库，接口响应与日志也不会回显。
+    settings: dict[str, Any] | None = Field(default=None)
+
+
+class EmailSendRequest(BaseModel):
+    """发送一封邮件（不落草稿、不自动发送）。"""
+
+    to: str | list[str]
+    cc: str | list[str] | None = None
+    subject: str = Field(min_length=1, max_length=998)
+    body: str = Field(default="", max_length=262144)
+    content_type: str = Field(default="text/plain", max_length=32)
+
+
+class CalendarEventCreateRequest(BaseModel):
+    """在 CalDAV 日历上新建事件（ICS 订阅只读）。"""
+
+    title: str = Field(min_length=1, max_length=500)
+    start: str = Field(min_length=1, max_length=64)
+    end: str = Field(min_length=1, max_length=64)
+    description: str | None = Field(default=None, max_length=20000)
+    location: str | None = Field(default=None, max_length=1000)
 
 
 class GitPathsRequest(BaseModel):
@@ -739,3 +767,71 @@ class GroupMessageCreateRequest(BaseModel):
     """在群里发一条消息；会打断正在进行的 epoch 并开启新一轮。"""
 
     content: str = Field(min_length=1, max_length=8000)
+
+
+# --- 用户保险库（站点登录 / 支付卡 / 联系人）---
+
+
+class VaultLoginCreateRequest(BaseModel):
+    """新增一条站点登录；`password` 只进请求体，落库即加密。"""
+
+    site: str = Field(min_length=1, max_length=512)
+    username: str = Field(min_length=1, max_length=256)
+    password: str = Field(min_length=1, max_length=4096)
+    notes: str = Field(default="", max_length=4000)
+
+
+class VaultLoginUpdateRequest(BaseModel):
+    """局部更新登录条目；字段未出现或为 null 表示不改，`password` 留空也不改。"""
+
+    site: str | None = Field(default=None, min_length=1, max_length=512)
+    username: str | None = Field(default=None, min_length=1, max_length=256)
+    password: str | None = Field(default=None, max_length=4096)
+    notes: str | None = Field(default=None, max_length=4000)
+
+
+class VaultCardCreateRequest(BaseModel):
+    """新增一张支付卡。
+
+    `pan` / `cvv` 只用于生成密文与 last4，明文立即丢弃；也可以只给 `last4`。
+    """
+
+    label: str = Field(default="", max_length=128)
+    brand: str = Field(default="", max_length=32)
+    pan: str | None = Field(default=None, max_length=32)
+    cvv: str | None = Field(default=None, max_length=4)
+    last4: str | None = Field(default=None, max_length=4)
+    exp_month: int | None = Field(default=None, ge=1, le=12)
+    exp_year: int | None = Field(default=None, ge=2000, le=2100)
+    notes: str = Field(default="", max_length=4000)
+
+
+class VaultCardUpdateRequest(BaseModel):
+    """局部更新支付卡；未出现或为 null 的字段保持不变。没有任何 reveal 接口。"""
+
+    label: str | None = Field(default=None, max_length=128)
+    brand: str | None = Field(default=None, max_length=32)
+    pan: str | None = Field(default=None, max_length=32)
+    cvv: str | None = Field(default=None, max_length=4)
+    last4: str | None = Field(default=None, max_length=4)
+    exp_month: int | None = Field(default=None, ge=1, le=12)
+    exp_year: int | None = Field(default=None, ge=2000, le=2100)
+    notes: str | None = Field(default=None, max_length=4000)
+
+
+class VaultContactCreateRequest(BaseModel):
+    """新增一个联系人；电话 / 邮箱是字符串数组，服务层再做条数与长度校验。"""
+
+    name: str = Field(min_length=1, max_length=128)
+    phones: list[str] = Field(default_factory=list, max_length=20)
+    emails: list[str] = Field(default_factory=list, max_length=20)
+    notes: str = Field(default="", max_length=4000)
+
+
+class VaultContactUpdateRequest(BaseModel):
+    """局部更新联系人；未出现或为 null 的字段保持不变。"""
+
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    phones: list[str] | None = Field(default=None, max_length=20)
+    emails: list[str] | None = Field(default=None, max_length=20)
+    notes: str | None = Field(default=None, max_length=4000)

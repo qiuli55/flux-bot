@@ -134,6 +134,12 @@ class Settings(BaseSettings):
     # --- 存储（主规格 §11.1）---
     database_url: str = "sqlite+aiosqlite:///./flux.db"
     redis_url: str = "redis://localhost:6379/0"
+    # 事件总线后端：memory = 进程内发布/订阅（默认，单机零依赖、测试稳定）；
+    # redis = 在本机分发之外再走 Redis pub/sub 跨进程广播（FLUX_EVENT_BUS_BACKEND=redis）。
+    # 注意：不会因为 redis_url 有默认值就自动切到 Redis——必须显式选 redis。
+    event_bus_backend: str = "memory"
+    # Redis 事件总线使用的频道名（仅 event_bus_backend=redis 时生效）。
+    event_bus_redis_channel: str = "flux.events"
     # doctor 的数据库探针上限（秒）。除了在协程层用 asyncio.wait_for 兜底，
     # 还会作为 asyncpg 的连接超时，避免不可达主机把 `flux doctor` 拖住。
     doctor_db_timeout_seconds: float = 5.0
@@ -420,6 +426,33 @@ class Settings(BaseSettings):
     # 这条飞书频道归属的 Flux Bot UUID；消息事件必须能定位到 Bot 才处理。
     feishu_bot_id: str | None = None
 
+    # --- Bot 频道 · 钉钉（HTTP 事件订阅入站 + 受审批出站）---
+    # AppKey 同时是应用级事件订阅的 ownerKey 与默认 robotCode；AppSecret 只用于
+    # 换取 accessToken 发消息。token / EncodingAESKey 未配置时回调 fail-closed。
+    dingtalk_app_key: str | None = None
+    dingtalk_app_secret: str | None = None
+    # 事件订阅后台配置的签名 token（3~32 位英文或数字）；留空 = 拒绝一切回调。
+    dingtalk_token: str | None = None
+    # 43 位 EncodingAESKey；回调密文用 AES-256-CBC 解密，应答也要用它加密。
+    dingtalk_aes_key: str | None = None
+    # 钉钉 OpenAPI 基址（私有化部署可改）。
+    dingtalk_api_base: str = "https://api.dingtalk.com"
+    # 这条钉钉频道归属的 Flux Bot UUID；消息事件必须能定位到 Bot 才处理。
+    dingtalk_bot_id: str | None = None
+    # --- Bot 频道 · 企业微信（WeCom，正式入站 + 受审批出站）---
+    # 自建应用凭据：corp_id / agent_id / secret 用于取 access_token 并发送应用消息。
+    wecom_corp_id: str | None = None
+    wecom_agent_id: str | None = None
+    wecom_secret: str | None = None
+    # 接收消息与事件的回调 token；留空 = 拒绝一切回调（fail-closed）。
+    wecom_token: str | None = None
+    # 回调加密的 EncodingAESKey（43 字符）；留空 = 拒绝一切回调。
+    wecom_encoding_aes_key: str | None = None
+    # 企业微信 API 基址（私有化部署可改）。
+    wecom_api_base: str = "https://qyapi.weixin.qq.com"
+    # 这条企业微信频道归属的 Flux Bot UUID；消息事件必须能定位到 Bot 才处理。
+    wecom_bot_id: str | None = None
+
     # --- Supervisor · 微信接入（OpenClaw + 微信 ClawBot 仅作传输层）---
     # 微信消息由本机 OpenClaw 网关转给 Flux，Flux 当大脑。入站令牌：插件每次转发
     # 都带 `Authorization: Bearer <token>`；留空 = 拒绝一切微信回调（fail-closed）。
@@ -446,6 +479,10 @@ class Settings(BaseSettings):
     github_api_base: str = "https://api.github.com"
     github_oauth_base: str = "https://github.com"
     github_timeout_seconds: float = 20.0
+
+    # --- 外部连接器（日历）---
+    # CalDAV / ICS 单次请求的默认超时；安装时可用 settings.timeout 覆盖（1–60 秒）。
+    calendar_timeout_seconds: float = 15.0
 
     # --- Bot 桌面（Hermes 云电脑 noVNC）---
     # App 进入「Bot 桌面」时向服务端要入口参数。隧道地址会随隧道重启变化，所以放在

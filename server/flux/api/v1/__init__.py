@@ -9,6 +9,7 @@ from flux.api.v1 import (
     bots,
     capabilities,
     codex_account,
+    connector_calendar,
     connectors,
     deliveries,
     designs,
@@ -22,12 +23,16 @@ from flux.api.v1 import (
     keys,
     memory,
     models,
+    outbound_drafts,
+    pages,
     projects,
+    skills,
     supervisor,
     tasks,
     terminal,
     uploads,
     user_memory,
+    vault,
     workspace,
 )
 
@@ -39,6 +44,7 @@ api_v1_router.include_router(keys.router)
 api_v1_router.include_router(installations.router)
 api_v1_router.include_router(tasks.router)
 api_v1_router.include_router(bots.router)
+api_v1_router.include_router(outbound_drafts.router)
 api_v1_router.include_router(bot_subtasks.router)
 api_v1_router.include_router(desktop.router)
 api_v1_router.include_router(devices.router)
@@ -50,13 +56,18 @@ api_v1_router.include_router(git.router)
 api_v1_router.include_router(projects.router)
 api_v1_router.include_router(memory.router)
 api_v1_router.include_router(models.router)
+api_v1_router.include_router(connector_calendar.router)
+api_v1_router.include_router(pages.router)
 api_v1_router.include_router(connectors.router)
 api_v1_router.include_router(capabilities.router)
 api_v1_router.include_router(designs.router)
 api_v1_router.include_router(deliveries.router)
 api_v1_router.include_router(uploads.router)
 api_v1_router.include_router(user_memory.router)
+api_v1_router.include_router(skills.router)
+api_v1_router.include_router(skills.bot_router)
 api_v1_router.include_router(codex_account.router)
+api_v1_router.include_router(vault.router)
 api_v1_router.include_router(supervisor.router)
 
 __all__ = ["api_v1_router"]

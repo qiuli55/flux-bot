@@ -1,5 +1,6 @@
 """用户账号连接器框架（catalog / install / uninstall / 凭据隔离）。"""
 
+from flux.core.connectors.calendar import CalendarConnectorService
 from flux.core.connectors.framework import (
     AUTH_API_KEY,
     AUTH_OAUTH,
@@ -12,6 +13,7 @@ from flux.core.connectors.framework import (
 __all__ = [
     "AUTH_API_KEY",
     "AUTH_OAUTH",
+    "CalendarConnectorService",
     "ConnectorCatalog",
     "ConnectorDefinition",
     "ConnectorFrameworkService",

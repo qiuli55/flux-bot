@@ -20,7 +20,9 @@ from flux.api.v1 import (
     agents,
     bots,
     capabilities,
+    channels_dingtalk,
     channels_feishu,
+    channels_wecom,
     codex_account,
     connectors,
     deliveries,
@@ -32,6 +34,8 @@ from flux.api.v1 import (
     keys,
     memory,
     models,
+    pages,
+    public_pages,
     tasks,
     uploads,
     user_memory,
@@ -62,10 +66,12 @@ _BOT_ROUTERS = (
     uploads,
     user_memory,
     codex_account,
+    pages,
 )
 
-#: 免 REST 鉴权的公开回调：Webhook 用 HMAC 签名自证身份，不能套本机令牌。
-_BOT_PUBLIC_ROUTERS = (hooks,)
+#: 免 REST 鉴权的公开入口：Webhook 用 HMAC 签名自证身份，不能套本机令牌；
+#: 制品页面分享链接面向没有登录态的外部读者，只按不可猜测的 share_token 读取。
+_BOT_PUBLIC_ROUTERS = (hooks, public_pages)
 
 
 def resolve_bot_settings(settings: Settings) -> Settings:
@@ -111,6 +117,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        # 事件总线先起：Redis 后端在此订阅跨进程频道；连接失败只降级并告警。
+        await container.bus.start()
         # 鉴权是公网暴露前的最后一道闸：没有令牌时必须让运维一眼看到当前生效模式。
         if not (app_settings.auth_token or "").strip():
             if app_settings.allow_no_auth:
@@ -178,6 +186,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 正式飞书频道回调：平台服务器没有本机令牌，免 REST 鉴权；安全性由
     # verification token / Encrypt Key 签名把关（未配置时 fail-closed）。
     app.include_router(channels_feishu.router, prefix=app_settings.api_v1_prefix)
+    # 正式钉钉频道回调：同样免 REST 鉴权，安全性由签名 token / EncodingAESKey 把关
+    # （未配置时 fail-closed）；出站回复仍必须经审批卡放行。
+    app.include_router(channels_dingtalk.router, prefix=app_settings.api_v1_prefix)
+    # 正式企业微信频道回调：同样免 REST 鉴权，安全性由 token / EncodingAESKey 把关。
+    app.include_router(channels_wecom.router, prefix=app_settings.api_v1_prefix)
     # MCP 能力面：给 agent 用的协议端点，与 REST 同进程同生命周期。
     app.include_router(mcp_router)
     return app

@@ -14,9 +14,12 @@ from flux.api.auth import require_rest_auth
 from flux.api.errors import register_exception_handlers
 from flux.api.v1 import (
     api_v1_router,
+    channels_dingtalk,
     channels_feishu,
+    channels_wecom,
     hooks,
     ide,
+    public_pages,
     supervisor_webhook,
     terminal,
 )
@@ -41,6 +44,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         nonlocal log_upload_task, memory_sync_task, billing_sync_task, context_sync_task
+        # 事件总线先起：Redis 后端在此订阅跨进程频道；连接失败只降级并告警，
+        # 不阻塞启动。进程内后端是空操作。
+        await container.bus.start()
         # P3-16：Agent 档案的权威在 agents 表，启动时重建内存注册表（canonical UUID 不因重启而变），
         # 并把历史"自由字符串"令牌迁移到 canonical id 上。
         await container.agents.load_from_db()
@@ -138,6 +144,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 正式 Bot 飞书频道：平台回调同样免本机 REST 令牌，靠 verification token /
     # Encrypt Key 签名 / 解密把关；出站仍由审批卡控制。
     app.include_router(channels_feishu.router, prefix=app_settings.api_v1_prefix)
+    # 制品页面公开读取：分享链接给没有本机登录态的人，免 REST 鉴权；
+    # 安全性由不可猜测的 share_token 与「仅 published 可读」共同把关。
+    app.include_router(public_pages.router, prefix=app_settings.api_v1_prefix)
+    # 正式 Bot 钉钉频道：HTTP 事件订阅同样免本机 REST 令牌，靠签名 token /
+    # EncodingAESKey 验签解密把关；出站仍由审批卡控制。
+    app.include_router(channels_dingtalk.router, prefix=app_settings.api_v1_prefix)
+    # 正式 Bot 企业微信频道：同样免本机 REST 令牌，靠回调 token / EncodingAESKey
+    # 签名与解密把关；出站仍由审批卡控制。
+    app.include_router(channels_wecom.router, prefix=app_settings.api_v1_prefix)
     # WebSocket 不能复用 Request + HTTPBearer 的 REST 依赖；Human PTY 自己执行
     # same-origin + token/cookie 鉴权，并单独挂到应用，避免依赖注入在 WS 上失效。
     app.include_router(

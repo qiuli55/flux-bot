@@ -34,8 +34,13 @@ from flux.core.bot.webhook_triggers import WebhookTriggerService
 from flux.core.capability_import.repository import ImportedCapabilityRepository
 from flux.core.capability_import.scanners import AgentScanner
 from flux.core.capability_import.service import CapabilityImportService
+from flux.core.channels.dingtalk_bot import DingTalkBotChannel
 from flux.core.channels.feishu_bot import FeishuBotChannel
+from flux.core.channels.outbound_drafts import OutboundDraftService
+from flux.core.channels.wecom_bot import WeComBotChannel
 from flux.core.code_intelligence.service import CodeIntelligenceService
+from flux.core.connectors.calendar import CalendarConnectorService
+from flux.core.connectors.email import EmailConnectorService
 from flux.core.connectors.framework import ConnectorFrameworkService, build_default_catalog
 from flux.core.context.lifecycle import ContextLifecycle
 from flux.core.context.metrics import BackfillObserver
@@ -45,7 +50,7 @@ from flux.core.context.store import ContentStore
 from flux.core.context.trust import VerificationLedger
 from flux.core.desktop.service import DesktopService
 from flux.core.devices.service import DeviceService
-from flux.core.event.bus import EventBus, Events
+from flux.core.event.bus import EventBus, Events, build_event_bus
 from flux.core.git_integration.client import GitClient
 from flux.core.git_integration.service import GitService
 from flux.core.github.service import GitHubConnectorService
@@ -76,12 +81,16 @@ from flux.core.memory.shared_user import SharedUserMemoryService
 from flux.core.memory.shared_user_repository import SharedUserMemoryRepository
 from flux.core.model_gateway.providers.registry import build_providers
 from flux.core.model_gateway.router import ModelRouter
+from flux.core.pages.repository import ArtifactPageRepository
+from flux.core.pages.service import ArtifactPageService
 from flux.core.permission_engine.policy import PermissionPolicy
 from flux.core.project_brain.refresh import BrainRefresher
 from flux.core.project_brain.repository import ProjectBrainRepository
 from flux.core.project_brain.service import ProjectBrain
 from flux.core.project_files.explorer import WorkspaceFileExplorer
 from flux.core.project_scanner.scanner import ProjectScanner
+from flux.core.skills.repository import SkillLibraryRepository
+from flux.core.skills.service import SkillLibraryService
 from flux.core.supervisor import (
     FeishuChannel,
     FeishuWebhook,
@@ -112,6 +121,7 @@ from flux.core.task_engine.stream import TaskStreamHub, TaskStreamRelay
 from flux.core.terminal.pty_service import HumanPtyService
 from flux.core.terminal.repository import TerminalRepository
 from flux.core.terminal.service import TerminalService
+from flux.core.vault.service import VaultService
 from flux.core.virtual_workspace.apply_engine import ApplyEngine
 from flux.core.virtual_workspace.batch_repository import ApplyBatchRepository
 from flux.core.virtual_workspace.repository import ProposalRepository
@@ -123,6 +133,8 @@ from flux.enums import ModelProvider
 @dataclass
 class Container:
     settings: Settings = field(default_factory=get_settings)
+    #: 事件总线：__post_init__ 按 settings 装配。默认进程内实现，只有
+    #: event_bus_backend=redis 时才换成 Redis pub/sub。
     bus: EventBus = field(default_factory=EventBus)
     policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     engine: AsyncEngine = field(init=False)
@@ -150,10 +162,16 @@ class Container:
     memory: MemoryService = field(init=False)
     task_repo: TaskRepository = field(init=False)
     key_vault: KeyVaultService = field(init=False)
+    #: 用户保险库（站点登录 / 支付卡 / 联系人），密文复用密钥库同一把主密钥
+    vault: VaultService = field(init=False)
     #: 外部连接器（GitHub）：按本地账号隔离的 OAuth 连接 + 只读 REST 工具
     github: GitHubConnectorService = field(init=False)
+    #: 用户账号日历连接器（CalDAV / ICS）：凭据复用同一把密钥库主密钥
+    calendar: CalendarConnectorService = field(init=False)
     #: 用户账号连接器框架（catalog / install / uninstall）；与 Agent 执行侧注册表分离
     connector_framework: ConnectorFrameworkService = field(init=False)
+    #: Email 连接器（IMAP 读信 / SMTP 发信），凭据复用同一把密钥库主密钥
+    email: EmailConnectorService = field(init=False)
     #: Bot 桌面入口参数：公开隧道地址 + 环境变量里的凭据
     desktop: DesktopService = field(init=False)
     task_runs: TaskRunBridge = field(init=False)
@@ -173,6 +191,11 @@ class Container:
     #: 跨 Bot 共享的用户记忆：画像（只由用户侧 API 写）+ 去重日志（只追加）
     shared_user_memory_repo: SharedUserMemoryRepository = field(init=False)
     shared_user_memory: SharedUserMemoryService = field(init=False)
+    #: 制品页面：Bot 产出的可分享静态内容，版本只追加，公开面按 share_token 读取
+    pages: ArtifactPageService = field(init=False)
+    #: 技能库：库内技能包 CRUD + 每 Bot 分配；对话时把正文注入 context
+    skill_library_repo: SkillLibraryRepository = field(init=False)
+    skills: SkillLibraryService = field(init=False)
     proposal_repo: ProposalRepository = field(init=False)
     batch_repo: ApplyBatchRepository = field(init=False)
     #: Run 生命周期看护（所有 Agent runtime 共用：Claude Code / Codex / OpenCode）
@@ -194,8 +217,14 @@ class Container:
     webhook_triggers: WebhookTriggerService = field(init=False)
     #: Bot 对话轮次：持久化 turn + 每 Bot 串行后台队列（legacy 对话也复用其助理逻辑）
     bot_conversation: BotConversationService = field(init=False)
+    #: 统一出站草稿：正文与状态落库，审批通过后原子认领并发送一次
+    outbound_drafts: OutboundDraftService = field(init=False)
     #: 正式飞书频道：加密回调入站建 turn，出站回复必须经审批卡放行
     feishu_bot: FeishuBotChannel = field(init=False)
+    #: 正式钉钉频道：HTTP 事件订阅入站建 turn，出站回复同样必须经审批卡放行
+    dingtalk_bot: DingTalkBotChannel = field(init=False)
+    #: 正式企业微信频道：加密回调入站建 turn，出站回复必须经审批卡放行
+    wecom_bot: WeComBotChannel = field(init=False)
     # IDE 行内补全（AI_COMPLETION_SPEC）：偏好/当前 Agent 落盘 + 模型解析 + 流式生成
     completion_prefs: CompletionPrefsStore = field(init=False)
     completion_resolver: CompletionModelResolver = field(init=False)
@@ -236,6 +265,9 @@ class Container:
     knowledge_worker: KnowledgeWorker = field(init=False)
 
     def __post_init__(self) -> None:
+        # 事件总线：按设置装配（默认进程内；仅显式 event_bus_backend=redis 时才用 Redis）。
+        # 客户端在 container.bus.start() 时才建连（Redis 不可达时降级，不影响启动）。
+        self.bus = build_event_bus(self.settings)
         self.engine = create_engine(self.settings.database_url)
         self.session_factory = create_session_factory(self.engine)  # type: ignore[attr-defined]
         self.devices = DeviceService(self.session_factory, self.settings)  # type: ignore[attr-defined]
@@ -244,19 +276,37 @@ class Container:
         self.task_repo = TaskRepository(self.session_factory)  # type: ignore[attr-defined]
         # 密钥库：Agent 模型通道的 API Key（加密落库），与任务级 model / api_key_id 配合解析
         self.key_vault = KeyVaultService(self.session_factory, self.settings)  # type: ignore[attr-defined]
+        # 用户保险库：登录密码 / 卡号 / CVV 与模型密钥共用同一把主密钥；
+        # 写入入口只有用户侧 REST API（不注册 MCP / Agent 写工具）。
+        self.vault = VaultService(self.session_factory, self.key_vault)  # type: ignore[attr-defined]
         # 外部连接器：令牌复用同一把密钥库主密钥加密，按本地账号隔离
         self.github = GitHubConnectorService(
             self.session_factory,  # type: ignore[attr-defined]
             self.settings,
             self.key_vault,
         )
-        # 账号侧连接器目录：当前只上架 GitHub；安装状态按 account_key 隔离。
-        # Agent 执行侧的 connector 注册表（self.connectors）保持独立，互不替换。
+        # 账号侧日历连接器：CalDAV / ICS，凭据与安装状态同样按 account_key 隔离。
+        self.calendar = CalendarConnectorService(
+            self.session_factory,  # type: ignore[attr-defined]
+            self.settings,
+            self.key_vault,
+        )
+        # Email 连接器：IMAP/SMTP 都是阻塞标准库调用，动作层用 asyncio.to_thread 包装；
+        # 凭据（连接参数 + 邮箱密码）整体加密后落在 connector_installations。
+        self.email = EmailConnectorService(
+            self.session_factory,  # type: ignore[attr-defined]
+            self.key_vault,
+        )
+        # 账号侧连接器目录：GitHub（OAuth）+ Email（api_key 即邮箱密码）+ Calendar；
+        # 安装状态按 account_key 隔离。Agent 执行侧的 connector 注册表
+        # （self.connectors）保持独立，互不替换。
         self.connector_framework = ConnectorFrameworkService(
             self.session_factory,  # type: ignore[attr-defined]
             self.key_vault,
             build_default_catalog(self.settings),
             github=self.github,
+            email=self.email,
+            calendar=self.calendar,
         )
         # Bot 桌面：只做公开隧道地址代读 + 凭据拼装，无状态
         self.desktop = DesktopService(self.settings)
@@ -307,6 +357,11 @@ class Container:
             self.session_factory  # type: ignore[attr-defined]
         )
         self.shared_user_memory = SharedUserMemoryService(self.shared_user_memory_repo)
+        # 制品页面：管理面走 REST，公开面只按不可猜测的 share_token 读取 published
+        self.pages = ArtifactPageService(ArtifactPageRepository(self.session_factory))  # type: ignore[attr-defined]
+        # 技能库：正文存库、按 Bot 分配，对话轮次只做 context 注入（不经过 agent_runtime）
+        self.skill_library_repo = SkillLibraryRepository(self.session_factory)  # type: ignore[attr-defined]
+        self.skills = SkillLibraryService(self.skill_library_repo)
         self.groups = GroupOrchestrator(
             self.group_repo,
             self.task_repo,
@@ -492,6 +547,8 @@ class Container:
         self.webhook_triggers = WebhookTriggerService(self)
         # Bot 对话：一轮落一条 bot_turns，后台按 Bot 串行调用同一个助手逻辑。
         self.bot_conversation = BotConversationService(self)
+        # 统一出站草稿：飞书等频道把待发送正文落库，审批结果只做状态迁移。
+        self.outbound_drafts = OutboundDraftService(self.session_factory)  # type: ignore[attr-defined]
         # Bot 后台子任务：独立于对话轮次跑的 tasks 行，结果以 kind=subtask 消息回到父对话。
         # 它不碰 last_task_id / chat_task_id，也不参与开工忙闲锁。
         self.bot_subtasks = BotSubtaskService(self)
@@ -507,6 +564,30 @@ class Container:
             bot_id=self.settings.feishu_bot_id,
         )
         self.bus.subscribe(Events.APPROVAL_RESOLVED, self.feishu_bot.on_approval_resolved)
+        # 正式钉钉频道：HTTP 事件订阅验签/解密后建 turn；出站同样只挂审批卡。
+        # kind=dingtalk_outbound 与飞书监听器互不干扰，两个订阅并存。
+        self.dingtalk_bot = DingTalkBotChannel(
+            self,
+            app_key=self.settings.dingtalk_app_key,
+            app_secret=self.settings.dingtalk_app_secret,
+            token=self.settings.dingtalk_token,
+            aes_key=self.settings.dingtalk_aes_key,
+            api_base=self.settings.dingtalk_api_base,
+            bot_id=self.settings.dingtalk_bot_id,
+        )
+        self.bus.subscribe(Events.APPROVAL_RESOLVED, self.dingtalk_bot.on_approval_resolved)
+        # 正式企业微信频道：与飞书并列订阅审批结果，只处理 kind=wecom_outbound。
+        self.wecom_bot = WeComBotChannel(
+            self,
+            corp_id=self.settings.wecom_corp_id,
+            agent_id=self.settings.wecom_agent_id,
+            secret=self.settings.wecom_secret,
+            token=self.settings.wecom_token,
+            encoding_aes_key=self.settings.wecom_encoding_aes_key,
+            api_base=self.settings.wecom_api_base,
+            bot_id=self.settings.wecom_bot_id,
+        )
+        self.bus.subscribe(Events.APPROVAL_RESOLVED, self.wecom_bot.on_approval_resolved)
         # 上游瞬时故障（429 / ReadTimeout）自动续跑一轮：事件桥只做判定与冷却，
         # 真正重新起 Run 交给 TaskRunService（沿用任务自己的 Agent / 模型 / 权限模式）。
         self.task_runs.set_retry_handler(self._auto_retry_task)
@@ -690,9 +771,16 @@ class Container:
             return ModelProvider.LOCAL
 
     async def dispose(self, *, close_terminal_sessions: bool = True) -> None:
+        # 事件总线先停：取消并等待 Redis 监听任务，避免它在服务/数据库收尾后还在派发。
+        # 进程内实现是空操作；停掉后仍可本地 publish（不再跨进程广播）。
+        await self.bus.aclose()
         # 正式飞书频道先收摊：取消仍在等 turn 的后台任务并关发送端连接池，
         # 避免 Bot 对话 worker 停掉时它们又去挂新的出站审批。
         await self.feishu_bot.aclose()
+        # 钉钉频道同理：先停跟踪任务与发送端，再停对话 worker。
+        await self.dingtalk_bot.aclose()
+        # 企业微信频道同理：先取消等待中的 turn 跟踪并关发送端连接池。
+        await self.wecom_bot.aclose()
         # Bot 对话 worker 先停：它要写 bot_turns / task_messages，不能跑在 dispose 之后。
         await self.bot_conversation.shutdown()
         # 后台子任务同样会写 task_messages / tasks；取消并等待，避免退出时挂住。
