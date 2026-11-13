@@ -38,6 +38,7 @@ from flux.core.billing.plans import (
 from flux.core.billing.pricing import PriceBook, load_price_book
 from flux.core.billing.repository import BillingRepository
 from flux.core.billing.sources import build_sources, resolve_default_model
+from flux.core.user_scope import normalize_cloud_user_id, owns
 from flux.errors import ConflictError
 from flux.logging import get_logger
 
@@ -167,6 +168,13 @@ class BillingService:
     def _cloud_enabled(self) -> bool:
         return bool(self._settings.billing_cloud_sync)
 
+    @property
+    def _owner(self) -> str | None:
+        return normalize_cloud_user_id(self._settings.owner_cloud_user_id)
+
+    def _resolve_user(self, cloud_user_id: str | None) -> str | None:
+        return normalize_cloud_user_id(cloud_user_id) or self._owner
+
     # --- 落账 ---
 
     async def record_step(
@@ -184,8 +192,13 @@ class BillingService:
         task_id: str | None = None,
         agent_id: str | None = None,
         occurred_at: datetime | None = None,
+        cloud_user_id: str | None = None,
     ) -> None:
-        """记录一次模型调用的增量用量；任何异常只记日志，不影响 Run。"""
+        """记录一次模型调用的增量用量；任何异常只记日志，不影响 Run。
+
+        `cloud_user_id` 是「人」；没传时回退到部署主用户。`account_key` 仍然是
+        凭据指纹，两者含义不同，不能互相覆盖。
+        """
         if not self.enabled:
             return
         if not (input_tokens or output_tokens or cache_read_tokens or cache_write_tokens):
@@ -208,6 +221,7 @@ class BillingService:
                 plan_key=plan.key if plan else None,
                 # 套餐已识别时打上本机账号指纹；未识别的模型只记账
                 account_key=self._accounts.get(plan.key, "") if plan else "",
+                cloud_user_id=self._resolve_user(cloud_user_id),
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cache_read_tokens=cache_read_tokens,
@@ -227,12 +241,18 @@ class BillingService:
         """按 Bot 聚合 `since` 之后的 token 用量（Bot 每日预算的数据来源）。"""
         return await self._repo.tokens_by_bot_since(since)
 
-    async def overview(self, *, refresh: bool = False) -> dict[str, Any]:
-        """所有套餐的额度概览（前端成本中心的主数据）。"""
+    async def overview(
+        self, *, refresh: bool = False, cloud_user_id: str | None = None
+    ) -> dict[str, Any]:
+        """所有套餐的额度概览（前端成本中心的主数据）。
+
+        传入 `cloud_user_id` 时只统计这个人的账本 / 快照（历史 NULL 归主用户）。
+        """
+        user = self._resolve_user(cloud_user_id)
         plans: list[dict[str, Any]] = []
         for plan in self._plans.values():
-            rows = await self._snapshot_rows(plan, refresh=refresh)
-            plans.append(await self._plan_view(plan, rows))
+            rows = await self._snapshot_rows(plan, refresh=refresh, cloud_user_id=user)
+            plans.append(await self._plan_view(plan, rows, cloud_user_id=user))
         return {
             "enabled": self.enabled,
             "enforce": self.enforce,
@@ -250,20 +270,26 @@ class BillingService:
             "plans": plans,
         }
 
-    async def plan_view(self, plan_key: str, *, refresh: bool = False) -> dict[str, Any]:
+    async def plan_view(
+        self, plan_key: str, *, refresh: bool = False, cloud_user_id: str | None = None
+    ) -> dict[str, Any]:
         plan = self._plans.get(plan_key)
         if plan is None:
             raise ConflictError(f"未登记的套餐：{plan_key}", code="unknown_plan")
-        rows = await self._snapshot_rows(plan, refresh=refresh)
-        return await self._plan_view(plan, rows)
+        user = self._resolve_user(cloud_user_id)
+        rows = await self._snapshot_rows(plan, refresh=refresh, cloud_user_id=user)
+        return await self._plan_view(plan, rows, cloud_user_id=user)
 
     def prices(self) -> dict[str, Any]:
         """官方价目表（前端只读展示，USD / 1M tokens）。"""
         return self._prices.view()
 
-    async def run_usage(self, run_id: str) -> dict[str, Any]:
-        """按 Run 回放明细并汇总。"""
-        records = await self._repo.records_by_run(run_id)
+    async def run_usage(self, run_id: str, *, cloud_user_id: str | None = None) -> dict[str, Any]:
+        """按 Run 回放明细并汇总（可按人过滤；别人的 Run 明细不可见）。"""
+        user = self._resolve_user(cloud_user_id)
+        records = await self._repo.records_by_run(
+            run_id, cloud_user_id=user, owner_cloud_user_id=self._owner
+        )
         totals = {
             "records": len(records),
             "input_tokens": sum(r.input_tokens for r in records),
@@ -373,8 +399,14 @@ class BillingService:
         plan = resolve_plan(model, runtime_id, self._plans)
         if plan is None:
             return GateDecision(plan_key="", level=LEVEL_OK)
-        rows = await self._snapshot_rows(plan, refresh=refresh)
-        return await self._gate_for_plan(plan, rows, account_key=self._accounts.get(plan.key, ""))
+        # 运行闸门代表这台机器 / 主用户；别的用户的查看请求不会走到这里。
+        rows = await self._snapshot_rows(plan, refresh=refresh, cloud_user_id=self._owner)
+        return await self._gate_for_plan(
+            plan,
+            rows,
+            account_key=self._accounts.get(plan.key, ""),
+            cloud_user_id=self._owner,
+        )
 
     async def ensure_can_start(self, *, model: str, runtime_id: str) -> GateDecision:
         """Run 创建前的闸门：超额且开启拦截时抛 ConflictError。"""
@@ -400,15 +432,24 @@ class BillingService:
 
     # --- 内部 ---
 
-    async def _plan_view(self, plan: PlanDefinition, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    async def _plan_view(
+        self,
+        plan: PlanDefinition,
+        rows: list[dict[str, Any]],
+        *,
+        cloud_user_id: str | None = None,
+    ) -> dict[str, Any]:
         current = self._accounts.get(plan.key, "")
+        if cloud_user_id is not None and cloud_user_id != self._owner:
+            # 本机凭据指纹属于主用户；别的用户没有「当前账号」概念。
+            current = ""
         earliest = min((window.start() for window in plan.windows), default=None)
         grouped: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             grouped.setdefault(str(row.get("account_key") or ""), []).append(row)
         # 展示顺序：本机当前账号 → 账本里出现过的账号 → 云端其它设备用过的账号 →
         # 只出现在官方快照里的账号
-        order = await self._account_keys(plan)
+        order = await self._account_keys(plan, cloud_user_id=cloud_user_id)
         for key in grouped:
             if key not in order:
                 order.append(key)
@@ -419,6 +460,7 @@ class BillingService:
                 grouped.get(key, []),
                 earliest,
                 is_current=(key == current or (not current and key == order[0])),
+                cloud_user_id=cloud_user_id,
             )
             for key in order
         ]
@@ -439,18 +481,34 @@ class BillingService:
             "windows": primary["windows"],
         }
 
-    async def _account_keys(self, plan: PlanDefinition) -> list[str]:
-        """账号展示顺序：本机当前账号 → 本地账本 → 云端其它设备用过的账号。"""
-        current = self._accounts.get(plan.key, "")
+    async def _account_keys(
+        self, plan: PlanDefinition, *, cloud_user_id: str | None = None
+    ) -> list[str]:
+        """账号展示顺序：本机当前账号 → 本地账本 → 云端其它设备用过的账号。
+
+        按人查看时，账本只取这个人的记录；非主用户不会看到本机凭据指纹或
+        云端其它设备归集的账号。
+        """
+        owner = self._owner
+        is_owner = cloud_user_id is None or cloud_user_id == owner
+        current = self._accounts.get(plan.key, "") if is_owner else ""
         earliest = min((window.start() for window in plan.windows), default=None)
         ledger = (
-            await self._repo.record_accounts(plan_key=plan.key, since=earliest)
+            await self._repo.record_accounts(
+                plan_key=plan.key,
+                since=earliest,
+                cloud_user_id=cloud_user_id,
+                owner_cloud_user_id=owner,
+            )
             if earliest is not None
             else []
         )
+        cloud_accounts = self._cloud_accounts.get(plan.key, []) if is_owner else []
         order: list[str] = []
-        for key in [current, *ledger, *self._cloud_accounts.get(plan.key, [])]:
-            if key not in order:
+        for key in [current, *ledger, *cloud_accounts]:
+            # 空串不是真实账号（本机没识别到凭据）；不要让它抢占 primary，
+            # 否则账本里明明有指纹记录，顶层窗口却统计到空账号上。
+            if key and key not in order:
                 order.append(key)
         return order or [""]
 
@@ -462,6 +520,7 @@ class BillingService:
         earliest: datetime | None,
         *,
         is_current: bool,
+        cloud_user_id: str | None = None,
     ) -> dict[str, Any]:
         """单个账号的窗口视图；`rows` 只包含该账号的官方快照。"""
         official = {str(row.get("window_key")): row for row in rows}
@@ -479,7 +538,11 @@ class BillingService:
         )
         flux_times = (
             await self._repo.record_times(
-                plan_key=plan.key, since=earliest, account_key=account_key
+                plan_key=plan.key,
+                since=earliest,
+                account_key=account_key,
+                cloud_user_id=cloud_user_id,
+                owner_cloud_user_id=self._owner,
             )
             if earliest is not None
             else []
@@ -497,7 +560,11 @@ class BillingService:
                     "label": window.label,
                     "since": window.start().isoformat(),
                     "local": await self._repo.totals(
-                        plan_key=plan.key, since=window.start(), account_key=account_key
+                        plan_key=plan.key,
+                        since=window.start(),
+                        account_key=account_key,
+                        cloud_user_id=cloud_user_id,
+                        owner_cloud_user_id=self._owner,
                     ),
                     "official": official_row,
                     #: 云端「全部设备」合计（未启用归集或还没同步时为 None）
@@ -508,10 +575,13 @@ class BillingService:
                         window.start(),
                         flux_times,
                         account_key=account_key,
+                        cloud_user_id=cloud_user_id,
                     ),
                 }
             )
-        decision = await self._gate_for_plan(plan, rows, account_key=account_key)
+        decision = await self._gate_for_plan(
+            plan, rows, account_key=account_key, cloud_user_id=cloud_user_id
+        )
         return {
             "key": account_key,
             "label": account_label(account_key),
@@ -528,6 +598,7 @@ class BillingService:
         flux_times: list[datetime],
         *,
         account_key: str = "",
+        cloud_user_id: str | None = None,
     ) -> dict[str, Any]:
         """官方百分比差分：估算 Flux 之外的客户端消耗（如 Trae）。
 
@@ -541,6 +612,8 @@ class BillingService:
             window_key=window_key,
             since=since,
             account_key=account_key,
+            cloud_user_id=cloud_user_id,
+            owner_cloud_user_id=self._owner,
         )
         points = mixed = increase = 0.0
         if len(snaps) >= 2:
@@ -578,6 +651,7 @@ class BillingService:
         rows: list[dict[str, Any]],
         *,
         account_key: str = "",
+        cloud_user_id: str | None = None,
     ) -> GateDecision:
         if not self.enabled:
             return GateDecision(
@@ -594,7 +668,9 @@ class BillingService:
         )
         percent, window_key = self._max_percent(scoped)
         if percent is None:
-            percent, window_key = await self._local_percent(plan, account_key=account_key)
+            percent, window_key = await self._local_percent(
+                plan, account_key=account_key, cloud_user_id=cloud_user_id
+            )
         if percent is None:
             return GateDecision(
                 plan_key=plan.key,
@@ -652,7 +728,11 @@ class BillingService:
         return best, best_key
 
     async def _local_percent(
-        self, plan: PlanDefinition, *, account_key: str = ""
+        self,
+        plan: PlanDefinition,
+        *,
+        account_key: str = "",
+        cloud_user_id: str | None = None,
     ) -> tuple[float | None, str]:
         """官方不可用时，用本地月度成本 ÷ 套餐总额兜底。"""
         quota = plan.quota_usd
@@ -664,7 +744,11 @@ class BillingService:
         if window is None:
             return None, ""
         totals = await self._repo.totals(
-            plan_key=plan.key, since=window.start(), account_key=account_key or None
+            plan_key=plan.key,
+            since=window.start(),
+            account_key=account_key or None,
+            cloud_user_id=cloud_user_id,
+            owner_cloud_user_id=self._owner,
         )
         return float(totals["cost"]) / quota * 100.0, window.key
 
@@ -676,25 +760,42 @@ class BillingService:
         return LEVEL_OK
 
     async def _snapshot_rows(
-        self, plan: PlanDefinition, *, refresh: bool = False
+        self,
+        plan: PlanDefinition,
+        *,
+        refresh: bool = False,
+        cloud_user_id: str | None = None,
     ) -> list[dict[str, Any]]:
         if not self.enabled or plan.key not in self._sources:
             return []
         if refresh:
             rows, _ = await self._fetch_locked(plan)
             # 采集只覆盖本机账号；视图仍需带上其它账号的最近快照
-            return self._cache.get(plan.key, rows)
+            return self._filter_owned(self._cache.get(plan.key, rows), cloud_user_id)
         cached = self._cache.get(plan.key)
         if cached is None:
-            stored = await self._repo.latest_snapshots(plan.key)
+            stored = await self._repo.latest_snapshots(
+                plan.key,
+                cloud_user_id=cloud_user_id,
+                owner_cloud_user_id=self._owner,
+            )
             if stored:
                 self._cache[plan.key] = stored
                 self._cache_at[plan.key] = _utcnow()
                 cached = stored
         if cached is not None and not self._stale(plan.key):
-            return cached
+            return self._filter_owned(cached, cloud_user_id)
         rows, _ = await self._fetch_locked(plan)
-        return rows or cached or []
+        return self._filter_owned(rows or cached or [], cloud_user_id)
+
+    def _filter_owned(
+        self, rows: list[dict[str, Any]], cloud_user_id: str | None
+    ) -> list[dict[str, Any]]:
+        """按人过滤快照行；`cloud_user_id=None` 表示不按人过滤（内部统计口径）。"""
+        user = normalize_cloud_user_id(cloud_user_id)
+        if user is None:
+            return rows
+        return [row for row in rows if owns(row.get("cloud_user_id"), user, self._owner)]
 
     def _stale(self, plan_key: str) -> bool:
         if self._refresh_seconds <= 0:
@@ -772,6 +873,7 @@ class BillingService:
                 {
                     "plan_key": plan.key,
                     "account_key": account_key,
+                    "cloud_user_id": self._owner,
                     "window_key": row.window_key,
                     "used": row.used,
                     "quota": row.quota,
@@ -825,11 +927,13 @@ class BillingService:
         resets_at: datetime | None = None,
         error: str | None = None,
         fetched_at: datetime,
+        cloud_user_id: str | None = None,
     ) -> None:
         try:
             await self._repo.add_snapshot(
                 plan_key=plan.key,
                 account_key=account_key,
+                cloud_user_id=self._resolve_user(cloud_user_id),
                 window_key=window_key,
                 used=used,
                 quota=quota,

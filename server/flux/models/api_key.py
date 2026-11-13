@@ -8,6 +8,10 @@
   `~/.flux/key-vault.key`）；**明文不落库、不出接口**；
 - `key_hint`：末 4 位，仅供界面辨识；
 - `models`：这条 key 可用的模型 id 列表，至少一项。
+
+Phase 2 起密钥库按人隔离：`cloud_user_id` 记录归属。`name` 不再是全局唯一
+（两个人可以都叫「DeepSeek 官方」），唯一性由服务层在「同一归属」内校验；
+历史 NULL 行归 `FLUX_OWNER_CLOUD_USER_ID` 配置的主用户。
 """
 
 from __future__ import annotations
@@ -23,7 +27,10 @@ from flux.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 class ApiKey(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "api_keys"
 
-    name: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    #: 同一用户内唯一（服务层校验）；不同用户可重名
+    name: Mapped[str] = mapped_column(String(128), index=True)
+    #: 归属的 Flux 云用户 id；历史 NULL 归 FLUX_OWNER_CLOUD_USER_ID
+    cloud_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     provider: Mapped[str] = mapped_column(String(32), index=True)
     base_url: Mapped[str] = mapped_column(String(256), default="", server_default="")
     #: codex 的 wire_api；空 = 按 provider 推导
@@ -38,6 +45,7 @@ class ApiKey(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         return {
             "id": str(self.id),
             "name": self.name,
+            "cloud_user_id": self.cloud_user_id,
             "provider": self.provider,
             "base_url": self.base_url,
             "wire_api": self.wire_api,

@@ -18,6 +18,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import StreamingResponse
 
+from flux.api.auth import current_cloud_user_id, get_current_cloud_user_id
 from flux.api.deps import get_container
 from flux.api.response import ok
 from flux.container import Container
@@ -27,7 +28,6 @@ from flux.core.agent_runtime.trace import summarize_trace
 from flux.core.attachment_store import resolve_uploads
 from flux.core.bot.conversation import attachments_brief, record_attachments
 from flux.core.event.bus import Events
-from flux.core.github.service import ACCOUNT_HEADER, normalize_account_key
 from flux.core.group.avatar import normalize_avatar
 from flux.core.task_engine.approvals import APPROVAL_ALLOW
 from flux.core.task_engine.assistant import validate_confirmation_items
@@ -123,7 +123,9 @@ def _task_id(value: str) -> uuid.UUID:
 
 @router.post("")
 async def create_task(
-    payload: TaskCreateRequest, container: Container = Depends(get_container)
+    payload: TaskCreateRequest,
+    container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     project_id = _parse_uuid(payload.project_id, field="project_id") if payload.project_id else None
     agent_id = _parse_uuid(payload.agent_id, field="agent_id") if payload.agent_id else None
@@ -133,7 +135,10 @@ async def create_task(
         agent = container.agents.get(payload.agent_id)
         runtime = str(getattr(getattr(agent, "spec", None), "runtime", DEFAULT_RUNTIME))
     model, key_id = await container.key_vault.resolve_selection(
-        runtime=runtime, model=payload.model or "", key_id=payload.key_id
+        runtime=runtime,
+        model=payload.model or "",
+        key_id=payload.key_id,
+        cloud_user_id=cloud_user_id,
     )
     avatar_shape, avatar_color = normalize_avatar(payload.avatar_shape, payload.avatar_color)
 
@@ -423,7 +428,9 @@ async def create_task_message(
             details={"task_id": task_id, "status": task.status},
         )
 
-    account_key = normalize_account_key(request.headers.get(ACCOUNT_HEADER))
+    # 对话不是连接器管理动作：分不清是谁时仍可聊天，只是不注入 GitHub 工具。
+    principal = getattr(request.state, "principal", None) or {}
+    account_key = current_cloud_user_id(principal, container.settings) or ""
     result = await container.bot_conversation.run_turn(
         task,
         content=content,
@@ -775,6 +782,7 @@ async def switch_task_model(
     task_id: str,
     payload: TaskModelRequest,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """切换任务的执行模型（移动端对话页 Agent 名称旁的下拉）。
 
@@ -794,7 +802,10 @@ async def switch_task_model(
         agent = container.agents.get(str(task.agent_id))
         runtime = getattr(getattr(agent, "spec", None), "runtime", DEFAULT_RUNTIME)
     model, key_id = await container.key_vault.resolve_selection(
-        runtime=runtime, model=payload.model, key_id=payload.key_id
+        runtime=runtime,
+        model=payload.model,
+        key_id=payload.key_id,
+        cloud_user_id=cloud_user_id,
     )
     task = await container.task_repo.set_model(task_uuid, model, key_id)
     return ok(_task_dict(task))

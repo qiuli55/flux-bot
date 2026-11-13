@@ -208,8 +208,9 @@ def test_invalid_cloud_tokens_are_not_accepted(
 
 def test_cloud_token_needs_configured_secret(settings: Settings) -> None:
     """未配置共享密钥时，即使令牌格式正确也不认（登录闭环整体关闭）。"""
-    assert settings.cloud_secret_key is None
-    assert parse_cloud_access_token(settings, mint_cloud_token("1")) is None
+    no_secret = settings.model_copy(update={"cloud_secret_key": None})
+    assert no_secret.cloud_secret_key is None
+    assert parse_cloud_access_token(no_secret, mint_cloud_token("1")) is None
 
 
 # --- I. current_cloud_user_id 的三级回退 ---
@@ -217,15 +218,16 @@ def test_cloud_token_needs_configured_secret(settings: Settings) -> None:
 
 def test_current_cloud_user_id_resolution_order(settings: Settings) -> None:
     with_owner = settings.model_copy(update={"owner_cloud_user_id": "1"})
+    no_owner = settings.model_copy(update={"owner_cloud_user_id": None})
 
     # 1. principal 自带优先
     assert current_cloud_user_id({"cloud_user_id": "2"}, with_owner) == "2"
     # 2. 回退到配置的主用户
     assert current_cloud_user_id({"kind": "admin"}, with_owner) == "1"
     # 3. 两边都没有 → None
-    assert current_cloud_user_id({}, settings) is None
+    assert current_cloud_user_id({}, no_owner) is None
     # 空白字符串视为未提供
-    assert current_cloud_user_id({"cloud_user_id": "  "}, settings) is None
+    assert current_cloud_user_id({"cloud_user_id": "  "}, no_owner) is None
     assert (
         current_cloud_user_id(
             {"kind": "device"}, settings.model_copy(update={"owner_cloud_user_id": "  "})

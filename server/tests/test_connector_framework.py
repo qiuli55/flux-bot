@@ -14,8 +14,8 @@ import httpx
 from fastapi.testclient import TestClient
 
 from flux.config import Settings
-from flux.core.github.service import ACCOUNT_HEADER
 from flux.main import create_app
+from tests.cloud_jwt import mint_cloud_token
 
 PREFIX = "/api/v1"
 ACCOUNT_A = "account-a"
@@ -85,7 +85,8 @@ def _client(
 
 
 def _headers(account: str) -> dict[str, str]:
-    return {ACCOUNT_HEADER: account}
+    """Phase 2：账号身份来自云 JWT（sub）。"""
+    return {"Authorization": f"Bearer {mint_cloud_token(account)}"}
 
 
 def _row(client: TestClient, account: str, connector_id: str = "github") -> dict:
@@ -390,9 +391,14 @@ def test_unknown_connector_returns_404(settings: Settings, db_schema: None) -> N
     assert "not-a-connector" not in json.dumps(catalog.json()["data"])
 
 
-def test_invalid_account_header_is_rejected(settings: Settings, db_schema: None) -> None:
-    with _client(settings, db_schema) as client:
-        response = client.get(f"{PREFIX}/connectors", headers={ACCOUNT_HEADER: "bad account!"})
+def test_client_account_header_is_ignored_for_identity(settings: Settings, db_schema: None) -> None:
+    """Phase 2：客户端自报的 X-Flux-Account 不再决定身份。
 
-    assert response.status_code == 400
-    assert response.json()["code"] == "bad_request"
+    非法值也不会 400；身份来自登录态（这里回退到主用户 1）。
+    """
+    with _client(settings, db_schema) as client:
+        response = client.get(f"{PREFIX}/connectors", headers={"X-Flux-Account": "bad account!"})
+
+    assert response.status_code == 200, response.text
+    # 列表按主用户（而非请求头里的非法值）读取。
+    assert all(isinstance(row, dict) for row in response.json()["data"])

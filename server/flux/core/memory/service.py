@@ -19,6 +19,7 @@ from contextlib import suppress
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from flux.config import Settings
 from flux.core.memory.policies import (
     ENVIRONMENT_MEMORY_SEED,
     MAX_CONTENT_CHARS,
@@ -28,9 +29,13 @@ from flux.core.memory.policies import (
 )
 from flux.core.memory.repository import MemoryRepository
 from flux.core.memory.secrets import ensure_no_secret
+from flux.core.user_scope import normalize_cloud_user_id, owns
 from flux.enums import MemoryLayer
-from flux.errors import BadRequestError, PermissionDeniedError, ValidationError
+from flux.errors import BadRequestError, NotFoundError, PermissionDeniedError, ValidationError
 from flux.models.memory import MemoryEntry
+
+#: 无法确定"这是谁"时的稳定错误码（与 devices / keys 保持一致）。
+CLOUD_LOGIN_REQUIRED = "cloud_login_required"
 
 if TYPE_CHECKING:  # pragma: no cover - 仅类型标注，避免与 project_brain 循环导入
     from flux.core.project_brain.service import ProjectBrain
@@ -69,9 +74,12 @@ class MemoryService:
         brain: ProjectBrain | None = None,
         policies: dict[MemoryLayer, MemoryPolicy] | None = None,
         environment_seed: tuple[tuple[str, str], ...] | None = None,
+        settings: Settings | None = None,
     ) -> None:
         self._repository = repository
         self._brain = brain
+        #: 用于把「没显式传人」的调用（MCP / 云端同步 / 内部任务）回退到主用户。
+        self._settings = settings
         # 按层覆盖默认策略（测试与部署都可以只改某一层）
         self._policies: dict[MemoryLayer, MemoryPolicy] = {**MEMORY_POLICIES, **(policies or {})}
         self._environment_seed = (
@@ -93,30 +101,47 @@ class MemoryService:
         content: str,
         source: str = "user",
         meta: dict | None = None,
+        cloud_user_id: str | None = None,
     ) -> MemoryEntry:
-        """写一条 User Memory。入口只有用户侧（REST），Agent 没有直写通道。"""
+        """写一条 User Memory。入口只有用户侧（REST），Agent 没有直写通道。
+
+        必须能确定归属人（请求 principal / 主用户配置）；分不清就拒绝，
+        绝不把记忆写到一个"公共"池子里。
+        """
+        owner = self._require_user(cloud_user_id)
         text = self._validate(content, where="User Memory")
-        await self._sweep_expired(MemoryLayer.USER)
+        await self._sweep_expired(MemoryLayer.USER, owner)
         entry = await self._repository.insert(
             layer=MemoryLayer.USER,
             content=text,
             source=source.strip() or "user",
             meta=meta,
             expires_at=self._deadline(MemoryLayer.USER),
+            cloud_user_id=owner,
         )
         await self._repository.prune_layer(
-            MemoryLayer.USER, keep=self._policies[MemoryLayer.USER].max_entries
+            MemoryLayer.USER,
+            keep=self._policies[MemoryLayer.USER].max_entries,
+            cloud_user_id=owner,
+            owner_cloud_user_id=self._owner(),
         )
-        if self._cloud is not None:
+        if self._can_sync(entry):
             # 推到账号云并回填 cloud_id；云端不可达时保留本地条目，等待下一次同步补推
             pushed = await self._cloud.push_entry(entry)
             if pushed is not None:
                 entry = pushed
         return entry
 
-    async def update_user(self, entry_id: str | uuid.UUID, *, content: str) -> MemoryEntry:
+    async def update_user(
+        self,
+        entry_id: str | uuid.UUID,
+        *,
+        content: str,
+        cloud_user_id: str | None = None,
+    ) -> MemoryEntry:
         """修改一条 User Memory（手动编辑）；同步失败时退回待补推，避免下轮被云端旧值覆盖。"""
-        entry = await self._repository.get(entry_id)
+        owner = self._require_user(cloud_user_id)
+        entry = await self._owned_entry(entry_id, owner)
         if entry.layer != MemoryLayer.USER.value:
             raise PermissionDeniedError(
                 "只有 User Memory 可修改；Environment / Project 记忆由平台或项目流程维护",
@@ -125,7 +150,7 @@ class MemoryService:
         text = self._validate(content, where="User Memory")
         updated = await self._repository.update_content(entry.id, content=text)
         cloud_id = str((updated.meta or {}).get("cloud_id") or "")
-        if self._cloud is not None and cloud_id:
+        if self._can_sync(updated) and cloud_id:
             ok = await self._cloud.update_remote(cloud_id, updated)
             if not ok:
                 # 云端没改成功：去掉 cloud_id，下一次同步按「新条目」重推并清掉旧行
@@ -186,45 +211,72 @@ class MemoryService:
 
     # --- 查询 / 删除 ---
 
-    async def list_entries(self, *, layer: MemoryLayer | None = None) -> list[MemoryEntry]:
-        """列出未过期条目；layer 缺省返回 Environment + User 两层。"""
+    async def list_entries(
+        self,
+        *,
+        layer: MemoryLayer | None = None,
+        cloud_user_id: str | None = None,
+    ) -> list[MemoryEntry]:
+        """列出未过期条目；layer 缺省返回 Environment + User 两层。
+
+        Environment 永远全局可见；User 层只返回当前人的条目。没有可解析的人时
+        User 层为空（不是"大家都看得到"），避免把别人的记忆泄露出去。
+        """
         if layer is MemoryLayer.PROJECT:
             raise ValidationError(
                 "Project Memory 请走项目接口：GET /projects/{project_id}/memory",
                 details={"layer": MemoryLayer.PROJECT.value},
             )
+        owner = self._resolve_user(cloud_user_id)
         if layer is MemoryLayer.ENVIRONMENT:
             return await self.ensure_environment()
         if layer is MemoryLayer.USER:
-            return await self._live(MemoryLayer.USER)
-        return await self.ensure_environment() + await self._live(MemoryLayer.USER)
+            return await self._live(MemoryLayer.USER, owner)
+        return await self.ensure_environment() + await self._live(MemoryLayer.USER, owner)
 
-    async def delete(self, entry_id: str | uuid.UUID) -> None:
-        """删除一条 User Memory；Environment / Project 层只能由各自的维护方处理。"""
-        entry = await self._repository.get(entry_id)
+    async def delete(self, entry_id: str | uuid.UUID, *, cloud_user_id: str | None = None) -> None:
+        """删除一条 User Memory；Environment / Project 层只能由各自的维护方处理。
+
+        别人的条目按"不存在"处理（404），不泄露 id 是否存在。
+        """
+        owner = self._require_user(cloud_user_id)
+        entry = await self._owned_entry(entry_id, owner)
         if entry.layer != MemoryLayer.USER.value:
             raise PermissionDeniedError(
                 "只有 User Memory 可删除；Environment / Project 记忆由平台或项目流程维护",
                 details={"memory_id": str(entry_id), "layer": entry.layer},
             )
         cloud_id = (entry.meta or {}).get("cloud_id")
-        if self._cloud is not None and cloud_id:
+        if self._can_sync(entry) and cloud_id:
             # 先删云端再删本地：云端失败时本地仍保留（可重试），不会出现"云端有、本地没了"
             await self._cloud.delete_remote(str(cloud_id))
         await self._repository.delete(entry_id)
 
-    async def update_entry_meta(self, entry_id: str | uuid.UUID, meta: dict) -> MemoryEntry:
+    async def update_entry_meta(
+        self,
+        entry_id: str | uuid.UUID,
+        meta: dict,
+        *,
+        cloud_user_id: str | None = None,
+    ) -> MemoryEntry:
         """更新一条 User 记忆的 meta（云端同步回填 cloud_id 用）。"""
+        owner = self._require_user(cloud_user_id)
+        await self._owned_entry(entry_id, owner)
         return await self._repository.update_meta(entry_id, meta=meta)
 
-    async def apply_cloud_snapshot(self, items: list[dict[str, Any]]) -> dict[str, int]:
+    async def apply_cloud_snapshot(
+        self, items: list[dict[str, Any]], *, cloud_user_id: str | None = None
+    ) -> dict[str, int]:
         """把账号云快照合并进本地 User 缓存（多设备一致性）。
 
-        - 云端有、本地没有 → 插入（meta.cloud_id 标记来源）；
-        - 两边都有且内容不同 → 以云端为准刷新本地内容；
-        - 本地有 cloud_id 但云端已删除 → 本地一并删除。
+        只处理当前/主用户自己的 User 层条目，绝不把别人在这台机器上的记忆
+        推上云或从云端覆盖掉。
         """
-        local = await self._live(MemoryLayer.USER)
+        owner = self._resolve_user(cloud_user_id)
+        if owner is None:
+            # 不知道这是谁：不写、不删、不覆盖任何人的记忆。
+            return {"inserted": 0, "updated": 0, "removed": 0}
+        local = await self._live(MemoryLayer.USER, owner)
         by_cloud: dict[str, MemoryEntry] = {}
         for entry in local:
             cloud_id = str((entry.meta or {}).get("cloud_id") or "")
@@ -249,6 +301,7 @@ class MemoryService:
                         "cloud_id": cloud_id,
                         "origin_device": item.get("origin_device"),
                     },
+                    cloud_user_id=owner,
                 )
                 inserted += 1
             elif current.content.strip() != content:
@@ -260,20 +313,32 @@ class MemoryService:
         if stale:
             removed = await self._repository.delete_many(stale)
         await self._repository.prune_layer(
-            MemoryLayer.USER, keep=self._policies[MemoryLayer.USER].max_entries
+            MemoryLayer.USER,
+            keep=self._policies[MemoryLayer.USER].max_entries,
+            cloud_user_id=owner,
+            owner_cloud_user_id=self._owner(),
         )
         return {"inserted": inserted, "updated": updated, "removed": removed}
 
-    async def recall(self, *, project_id: str | uuid.UUID | None = None) -> dict[str, Any]:
-        """三层统一只读出口：Environment → User → Project（仅当前项目）。"""
+    async def recall(
+        self,
+        *,
+        project_id: str | uuid.UUID | None = None,
+        cloud_user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """三层统一只读出口：Environment → User → Project（仅当前项目）。
+
+        Environment 是平台规则，任何登录用户都能读到；User 层只含当前人的条目。
+        """
         layers: list[dict[str, Any]] = []
         blocks: list[str] = []
+        owner = self._resolve_user(cloud_user_id)
 
         for layer in (MemoryLayer.ENVIRONMENT, MemoryLayer.USER):
             entries = (
                 await self.ensure_environment()
                 if layer is MemoryLayer.ENVIRONMENT
-                else await self._live(MemoryLayer.USER)
+                else await self._live(MemoryLayer.USER, owner)
             )
             if not entries:
                 continue
@@ -312,6 +377,46 @@ class MemoryService:
             "note": RECALL_NOTE,
         }
 
+    # --- 按人隔离 ---
+
+    def _owner(self) -> str | None:
+        return normalize_cloud_user_id(getattr(self._settings, "owner_cloud_user_id", None))
+
+    def _resolve_user(self, cloud_user_id: str | None) -> str | None:
+        """显式传入优先；内部调用（MCP / 云端同步）回退到配置的主用户。"""
+        return normalize_cloud_user_id(cloud_user_id) or self._owner()
+
+    def _require_user(self, cloud_user_id: str | None) -> str:
+        owner = self._resolve_user(cloud_user_id)
+        if owner is None:
+            raise PermissionDeniedError(
+                "该操作需要 Flux 账号登录（或由部署方设置 FLUX_OWNER_CLOUD_USER_ID）",
+                code=CLOUD_LOGIN_REQUIRED,
+                details={
+                    "hint": "请先登录账号云；本机 CLI / 主用户可配置 FLUX_OWNER_CLOUD_USER_ID"
+                },
+            )
+        return owner
+
+    def _can_sync(self, entry: MemoryEntry) -> bool:
+        """账号云同步用的是主用户的设备凭据，只能操作主用户自己的条目。
+
+        别人的 User 记忆留在本机，绝不推上主人的云账号，也不从云端覆盖。
+        """
+        if self._cloud is None:
+            return False
+        owner = self._owner()
+        return owner is not None and owns(entry.cloud_user_id, owner, owner)
+
+    async def _owned_entry(self, entry_id: str | uuid.UUID, owner: str) -> MemoryEntry:
+        """取一条属于 owner 的 User 记忆；别人的条目按不存在处理（404）。"""
+        entry = await self._repository.get(entry_id)
+        if entry.layer == MemoryLayer.USER.value and not owns(
+            entry.cloud_user_id, owner, self._owner()
+        ):
+            raise NotFoundError(f"记忆 {entry_id} 不存在", details={"memory_id": str(entry_id)})
+        return entry
+
     # --- 内部 ---
 
     def _validate(self, content: str, *, where: str) -> str:
@@ -332,13 +437,28 @@ class MemoryService:
             return None
         return _utcnow() + ttl
 
-    async def _live(self, layer: MemoryLayer) -> list[MemoryEntry]:
-        rows = await self._repository.list_layer(layer)
+    async def _live(self, layer: MemoryLayer, owner: str | None = None) -> list[MemoryEntry]:
+        if layer is MemoryLayer.USER:
+            if owner is None:
+                # 分不清是谁：User 层宁可为空，也不能返回所有人的记忆。
+                return []
+            rows = await self._repository.list_layer(
+                layer, cloud_user_id=owner, owner_cloud_user_id=self._owner()
+            )
+        else:
+            rows = await self._repository.list_layer(layer)
         return [entry for entry in rows if not _is_expired(entry)]
 
-    async def _sweep_expired(self, layer: MemoryLayer) -> int:
+    async def _sweep_expired(self, layer: MemoryLayer, owner: str | None = None) -> int:
         """清理机制：写过期条目即顺手删除，库不因 TTL 无界累积。"""
-        rows = await self._repository.list_layer(layer)
+        if layer is MemoryLayer.USER:
+            if owner is None:
+                return 0
+            rows = await self._repository.list_layer(
+                layer, cloud_user_id=owner, owner_cloud_user_id=self._owner()
+            )
+        else:
+            rows = await self._repository.list_layer(layer)
         stale = [entry.id for entry in rows if _is_expired(entry)]
         if not stale:
             return 0

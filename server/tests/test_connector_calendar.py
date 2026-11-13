@@ -16,9 +16,9 @@ from fastapi.testclient import TestClient
 from sqlalchemy.engine import make_url
 
 from flux.config import Settings
-from flux.core.github.service import ACCOUNT_HEADER
 from flux.core.key_vault.service import KeyVaultService
 from flux.main import create_app
+from tests.cloud_jwt import mint_cloud_token
 
 PREFIX = "/api/v1"
 CALENDAR = f"{PREFIX}/connectors/calendar"
@@ -93,7 +93,8 @@ PROPFIND_XML = """<?xml version="1.0" encoding="utf-8"?>
 
 
 def _headers(account: str) -> dict[str, str]:
-    return {ACCOUNT_HEADER: account}
+    """Phase 2：账号身份来自云 JWT（sub）。"""
+    return {"Authorization": f"Bearer {mint_cloud_token(account)}"}
 
 
 def _client(

@@ -445,7 +445,7 @@ class Container:
         # 三层记忆（批次② §4.2）：User / Environment 落 memories 表，Project 复用 brain；
         # 写入必须走受控路径（用户 REST / 平台代码），Agent 面只有只读的 memory.recall
         self.memory_repo = MemoryRepository(self.session_factory)  # type: ignore[attr-defined]
-        self.memory = MemoryService(self.memory_repo, brain=self.brain)
+        self.memory = MemoryService(self.memory_repo, brain=self.brain, settings=self.settings)
         # 账号级用户记忆：本地只做缓存，云端是权威存储；同步失败不影响本地读写
         self.memory_prefs = MemoryPrefsStore(
             self.settings.memory_prefs_path,

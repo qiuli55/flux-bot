@@ -93,6 +93,18 @@ class CloudMemorySync:
     def last_ok(self) -> bool:
         return self._last_ok
 
+    @property
+    def _owner(self) -> str | None:
+        """这台机器代表的 Flux 云用户。
+
+        同步走的是设备凭据（没有逐请求 principal），所以用部署配置的主用户 id：
+        只有这个人的 User 层记忆会被推上云 / 从云端覆盖。配置为空时不同步，
+        避免把整机所有用户的记忆混在一起上传。
+        """
+        value = getattr(self._settings, "owner_cloud_user_id", None)
+        text = str(value).strip() if value is not None else ""
+        return text or None
+
     def credentials(self) -> DeviceCredentials | None:
         if not self.enabled:
             return None
@@ -136,7 +148,8 @@ class CloudMemorySync:
             self._last_ok = False
             return None
         result = await self._memory.apply_cloud_snapshot(
-            [item for item in items if isinstance(item, dict)]
+            [item for item in items if isinstance(item, dict)],
+            cloud_user_id=self._owner,
         )
         self._last_error = ""
         self._last_ok = True
@@ -206,7 +219,9 @@ class CloudMemorySync:
                 }
                 meta["cloud_id"] = cloud_id
                 try:
-                    updated = await self._memory.update_entry_meta(entry.id, meta)
+                    updated = await self._memory.update_entry_meta(
+                        entry.id, meta, cloud_user_id=entry.cloud_user_id or self._owner
+                    )
                 except Exception:  # noqa: BLE001
                     logger.warning("回填 cloud_id 失败 memory=%s", entry.id, exc_info=True)
                     continue
@@ -215,8 +230,13 @@ class CloudMemorySync:
         return result
 
     async def push_pending(self) -> int:
-        """把本地还没有 cloud_id 的 User 记忆补推上去，返回推送条数。"""
-        entries = await self._memory.list_entries(layer=MemoryLayer.USER)
+        """把本地还没有 cloud_id 的 User 记忆补推上去，返回推送条数。
+
+        只补推主用户自己的条目；没有配置主用户时不同步。
+        """
+        if self._owner is None:
+            return 0
+        entries = await self._memory.list_entries(layer=MemoryLayer.USER, cloud_user_id=self._owner)
         pending = [entry for entry in entries if not str((entry.meta or {}).get("cloud_id") or "")]
         if not pending:
             return 0

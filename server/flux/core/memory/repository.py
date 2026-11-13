@@ -18,6 +18,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from flux.core.user_scope import UNSET, owned_clause
 from flux.enums import MemoryLayer
 from flux.errors import BadRequestError, NotFoundError
 from flux.logging import get_logger
@@ -28,6 +29,11 @@ logger = get_logger(__name__)
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _owner_clause(cloud_user_id: object, owner_cloud_user_id: str | None):
+    user = str(cloud_user_id).strip() if cloud_user_id is not None else ""
+    return owned_clause(MemoryEntry.cloud_user_id, user, owner_cloud_user_id)
 
 
 class MemoryRepository:
@@ -45,12 +51,14 @@ class MemoryRepository:
         key: str | None = None,
         meta: dict | None = None,
         expires_at: datetime | None = None,
+        cloud_user_id: str | None = None,
     ) -> MemoryEntry:
         now = _utcnow()
         entry = MemoryEntry(
             id=uuid.uuid4(),
             layer=layer.value,
             key=key,
+            cloud_user_id=cloud_user_id,
             content=content,
             source=source,
             meta=meta or {},
@@ -76,10 +84,19 @@ class MemoryRepository:
                 raise NotFoundError(f"记忆 {entry_id} 不存在", details={"memory_id": str(entry_id)})
             return entry
 
-    async def get_by_key(self, layer: MemoryLayer, key: str) -> MemoryEntry | None:
+    async def get_by_key(
+        self,
+        layer: MemoryLayer,
+        key: str,
+        *,
+        cloud_user_id: object = UNSET,
+        owner_cloud_user_id: str | None = None,
+    ) -> MemoryEntry | None:
         statement = select(MemoryEntry).where(
             MemoryEntry.layer == layer.value, MemoryEntry.key == key
         )
+        if cloud_user_id is not UNSET:
+            statement = statement.where(_owner_clause(cloud_user_id, owner_cloud_user_id))
         async with self._session_factory() as session:
             return await session.scalar(statement)
 
@@ -107,12 +124,25 @@ class MemoryRepository:
             await session.refresh(entry)
             return entry
 
-    async def list_layer(self, layer: MemoryLayer) -> list[MemoryEntry]:
+    async def list_layer(
+        self,
+        layer: MemoryLayer,
+        *,
+        cloud_user_id: object = UNSET,
+        owner_cloud_user_id: str | None = None,
+    ) -> list[MemoryEntry]:
+        """列出某一层。
+
+        `cloud_user_id` 缺省（UNSET）不做按人过滤——仓储层保持"库里有几条就返回几条"，
+        按人隔离由服务层显式传入；Environment 层永远不传，保持全局。
+        """
         statement = (
             select(MemoryEntry)
             .where(MemoryEntry.layer == layer.value)
             .order_by(MemoryEntry.created_at, MemoryEntry.id)
         )
+        if cloud_user_id is not UNSET:
+            statement = statement.where(_owner_clause(cloud_user_id, owner_cloud_user_id))
         async with self._session_factory() as session:
             return list(await session.scalars(statement))
 
@@ -136,17 +166,26 @@ class MemoryRepository:
             await session.commit()
             return int(result.rowcount or 0)
 
-    async def prune_layer(self, layer: MemoryLayer, *, keep: int) -> int:
-        """容量清理：只保留最新 keep 条，多余的最旧条目删除，返回删除数。"""
+    async def prune_layer(
+        self,
+        layer: MemoryLayer,
+        *,
+        keep: int,
+        cloud_user_id: object = UNSET,
+        owner_cloud_user_id: str | None = None,
+    ) -> int:
+        """容量清理：只保留最新 keep 条，多余的最旧条目删除，返回删除数。
+
+        User 层必须按人传入 `cloud_user_id`，否则一个人的容量裁剪会误删别人的记忆。
+        """
+        statement = select(MemoryEntry.id).where(MemoryEntry.layer == layer.value)
+        if cloud_user_id is not UNSET:
+            statement = statement.where(_owner_clause(cloud_user_id, owner_cloud_user_id))
+        statement = statement.order_by(MemoryEntry.created_at.desc(), MemoryEntry.id.desc()).offset(
+            keep
+        )
         async with self._session_factory() as session:
-            stale = list(
-                await session.scalars(
-                    select(MemoryEntry.id)
-                    .where(MemoryEntry.layer == layer.value)
-                    .order_by(MemoryEntry.created_at.desc(), MemoryEntry.id.desc())
-                    .offset(keep)
-                )
-            )
+            stale = list(await session.scalars(statement))
             if not stale:
                 return 0
             await session.execute(delete(MemoryEntry).where(MemoryEntry.id.in_(stale)))
