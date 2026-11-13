@@ -11,6 +11,11 @@
 # mcr.microsoft.com/playwright/mcp 存在 tag v0.0.85。下面的 sha256 是该 tag 的
 # 多架构索引 digest，用 digest 钉死可避免 tag 被重新指向后悄悄换掉运行内容。
 # 来源：npm registry、mcr.microsoft.com tag list、github.com/microsoft/playwright-mcp。
+#
+# 2026-11-13 实机验证（Docker 29 + 上面的钉死镜像）修掉两个启动即坏的问题：
+#   1) --allowed-hosts 只写服务名会被 403 拒绝（客户端发的 Host 带端口）；
+#   2) 输出目录挂到镜像里不存在的 /data/output 会因 root:root 属主 EACCES。
+# 细节见下方各参数旁的注释与 docs/browser-agent.md 的「两个已知坑」。
 
 services:
   flux-bot:
@@ -40,12 +45,19 @@ services:
       - "8931"
       - "--host"
       - "0.0.0.0"
-      # Host 头白名单：默认只接受 localhost / 回环与 --host 的值，容器间按服务名
-      # 访问时必须把服务名列进来，否则请求会被拒绝。
+      # Host 头白名单：默认只接受 localhost / 回环与 --host 的值。只写服务名
+      # "playwright-mcp" 不够：HTTP 客户端（Claude Code、httpx）访问
+      # http://playwright-mcp:8931/mcp 时发的是 "Host: playwright-mcp:8931"，
+      # server 会直接回 403 "Access is only allowed at playwright-mcp"。
+      # 因此必须把带端口的 host:port 形式一并列入（逗号分隔，同一个参数）。
+      # 端口必须与上面的 --port 以及 flux-bot 里的 MCP url 保持一致。
       - "--allowed-hosts"
-      - "playwright-mcp"
+      - "playwright-mcp,playwright-mcp:8931"
+      # 输出目录必须落在下面挂载的 /home/node 之下。不要用 /data/output：
+      # 该路径在镜像里不存在，Docker 会为命名卷新建 root:root 755 的目录，
+      # 而容器以 node(1000) 运行，browser_navigate 会 EACCES 写不进去。
       - "--output-dir"
-      - "/data/output"
+      - "/home/node/output"
     # 不发布端口：只有 browser 网络里的 flux-bot 能连到 8931。
     expose:
       - "8931"
@@ -54,9 +66,12 @@ services:
     shm_size: "1gb"
     restart: unless-stopped
     volumes:
-      # 截图与下载产物落到命名卷。profile 因 --isolated 放在内存里；
-      # 若改用 --user-data-dir 持久化 profile，需要再给它单独挂一个卷。
-      - playwright-output:/data/output
+      # 挂到 /home/node：该目录在镜像里已存在且属于 node，空命名卷首次挂载时
+      # 会继承其属主，因此 node 能直接往里写 output。若挂到镜像里不存在的路径
+      # （例如 /data/output），Docker 会以 root:root 创建挂载点，node 写不进去。
+      # 截图与下载产物落到 playwright-home/output。profile 因 --isolated 放在
+      # 内存里；若改用 --user-data-dir 持久化 profile，需要再给它单独挂一个卷。
+      - playwright-home:/home/node
     networks:
       - browser
 
@@ -67,4 +82,4 @@ networks:
     driver: bridge
 
 volumes:
-  playwright-output:
+  playwright-home:
