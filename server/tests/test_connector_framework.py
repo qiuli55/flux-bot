@@ -94,7 +94,7 @@ def _row(client: TestClient, account: str, connector_id: str = "github") -> dict
 
 
 def _register_fake_api_key_connector(client: TestClient, connector_id: str = "acme") -> None:
-    """测试内注册一个 api_key 类定义；生产目录由 GitHub + email 组成。"""
+    """测试内注册一个假的 api_key 类定义，避免依赖生产目录里的具体连接器。"""
     from flux.core.connectors.framework import ConnectorDefinition
 
     client.app.state.container.connector_framework.register(
@@ -111,14 +111,16 @@ def _register_fake_api_key_connector(client: TestClient, connector_id: str = "ac
 # --- catalog ---
 
 
-def test_catalog_lists_github_and_email_by_default(settings: Settings, db_schema: None) -> None:
+def test_catalog_lists_github_email_and_calendar_by_default(
+    settings: Settings, db_schema: None
+) -> None:
     with _client(settings, db_schema) as client:
         response = client.get(f"{PREFIX}/connectors/catalog")
 
     assert response.status_code == 200, response.text
     entries = response.json()["data"]
     by_id = {entry["id"]: entry for entry in entries}
-    assert set(by_id) == {"github", "email"}
+    assert set(by_id) == {"github", "email", "calendar"}
     assert by_id["github"] == {
         "id": "github",
         "name": "GitHub",
@@ -132,6 +134,14 @@ def test_catalog_lists_github_and_email_by_default(settings: Settings, db_schema
     assert email_entry["scopes"] == ["mail.read", "mail.send"]
     assert "IMAP" in email_entry["description"]
     assert "SMTP" in email_entry["description"]
+    assert by_id["calendar"] == {
+        "id": "calendar",
+        "name": "Calendar (CalDAV / ICS)",
+        "description": "读取已发布的 ICS 订阅或 CalDAV 日历，查看事件并在 CalDAV 上新建事件",
+        "auth_types": ["api_key"],
+        "scopes": ["calendar.read", "calendar.write"],
+    }
+    assert len(entries) == 3
 
 
 def test_catalog_does_not_include_account_data(settings: Settings, db_schema: None) -> None:
@@ -142,12 +152,10 @@ def test_catalog_does_not_include_account_data(settings: Settings, db_schema: No
         ]
 
     by_id = {entry["id"]: entry for entry in entries}
-    assert "github" in by_id
-    assert "email" in by_id
-    assert "account" not in by_id["github"]
-    assert "connected" not in by_id["github"]
-    assert "account" not in by_id["email"]
-    assert "connected" not in by_id["email"]
+    assert set(by_id) == {"github", "email", "calendar"}
+    for entry in entries:
+        assert "account" not in entry
+        assert "connected" not in entry
 
 
 # --- GitHub 既有流程 ---
@@ -173,13 +181,19 @@ def test_github_login_flow_and_list_shape(settings: Settings, db_schema: None) -
         listed = client.get(f"{PREFIX}/connectors", headers=_headers(ACCOUNT_A))
         assert listed.status_code == 200, listed.text
         rows = listed.json()["data"]
-        assert {row["id"] for row in rows} == {"github", "email"}
+        assert {row["id"] for row in rows} == {"github", "email", "calendar"}
         row = next(item for item in rows if item["id"] == "github")
         assert set(row) >= GITHUB_ROW_KEYS
         assert row["connected"] is True
         assert row["account"] == "octocat"
         assert row["display_name"] == "The Octocat"
         assert row["scopes"] == ["repo", "read:user"]
+        email_row = next(item for item in rows if item["id"] == "email")
+        assert email_row["connected"] is False
+        assert email_row["account"] == ""
+        calendar_row = next(item for item in rows if item["id"] == "calendar")
+        assert calendar_row["connected"] is False
+        assert calendar_row["account"] == ""
         # 令牌绝不出现在响应里
         assert "gho_super_secret_token" not in listed.text
 

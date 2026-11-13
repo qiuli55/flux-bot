@@ -134,6 +134,12 @@ class Settings(BaseSettings):
     # --- 存储（主规格 §11.1）---
     database_url: str = "sqlite+aiosqlite:///./flux.db"
     redis_url: str = "redis://localhost:6379/0"
+    # 事件总线后端：memory = 进程内发布/订阅（默认，单机零依赖、测试稳定）；
+    # redis = 在本机分发之外再走 Redis pub/sub 跨进程广播（FLUX_EVENT_BUS_BACKEND=redis）。
+    # 注意：不会因为 redis_url 有默认值就自动切到 Redis——必须显式选 redis。
+    event_bus_backend: str = "memory"
+    # Redis 事件总线使用的频道名（仅 event_bus_backend=redis 时生效）。
+    event_bus_redis_channel: str = "flux.events"
     # doctor 的数据库探针上限（秒）。除了在协程层用 asyncio.wait_for 兜底，
     # 还会作为 asyncpg 的连接超时，避免不可达主机把 `flux doctor` 拖住。
     doctor_db_timeout_seconds: float = 5.0
@@ -485,6 +491,10 @@ class Settings(BaseSettings):
     github_api_base: str = "https://api.github.com"
     github_oauth_base: str = "https://github.com"
     github_timeout_seconds: float = 20.0
+
+    # --- 外部连接器（日历）---
+    # CalDAV / ICS 单次请求的默认超时；安装时可用 settings.timeout 覆盖（1–60 秒）。
+    calendar_timeout_seconds: float = 15.0
 
     # --- Bot 桌面（Hermes 云电脑 noVNC）---
     # App 进入「Bot 桌面」时向服务端要入口参数。隧道地址会随隧道重启变化，所以放在

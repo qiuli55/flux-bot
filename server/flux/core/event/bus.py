@@ -1,15 +1,21 @@
 """事件总线（主规格 §5.4 事件命名格式 resource.action）。
 
-M0 实现为进程内发布/订阅，接口与生产形态一致；按 §15.7 换 Redis pub/sub 时只替换本模块实现。
+默认实现是进程内发布/订阅；需要跨进程广播时由 `build_event_bus` 按设置选
+`RedisEventBus`（见 flux.core.event.redis_bus）。两者对外契约一致：
+subscribe / unsubscribe / publish / history / clear，外加容器生命周期用的
+start / aclose（进程内实现是空操作）。测试仍可直接构造 `EventBus()`。
 """
 
 from __future__ import annotations
 
 import inspect
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from flux.logging import get_logger
+
+if TYPE_CHECKING:
+    from flux.config import Settings
 
 logger = get_logger(__name__)
 
@@ -107,6 +113,10 @@ class EventBus:
         """发布事件，返回被调用的处理器数量。处理器异常只记录，不中断其他订阅者。"""
         body = dict(payload or {})
         self._history.append((event, body))
+        return await self._invoke(event, body)
+
+    async def _invoke(self, event: str, body: dict[str, Any]) -> int:
+        """调用本进程订阅者；跨进程实现复用这段本地分发逻辑。"""
         handlers = [*self._handlers.get(event, []), *self._handlers.get(WILDCARD, [])]
         for handler in handlers:
             try:
@@ -117,9 +127,38 @@ class EventBus:
                 logger.exception("事件处理器执行失败 event=%s", event)
         return len(handlers)
 
+    async def start(self) -> None:
+        """启动总线后台任务。进程内实现无需后台循环，空操作。"""
+        return None
+
+    async def aclose(self) -> None:
+        """停止总线后台任务并释放连接。进程内实现无资源可释放。"""
+        return None
+
     @property
     def history(self) -> list[tuple[str, dict[str, Any]]]:
         return list(self._history)
 
     def clear(self) -> None:
         self._history.clear()
+
+
+def build_event_bus(settings: Settings) -> EventBus:
+    """按设置构建事件总线。
+
+    `event_bus_backend` 默认 "memory"；只有显式设为 "redis" 才换成 Redis pub/sub。
+    这样 redis_url 有默认 localhost 值也不会让本地测试或没装 Redis 的机器失效。
+    未知取值一律回退到进程内实现并告警（fail-safe，不让配置笔误拖垮启动）。
+    """
+    backend = (getattr(settings, "event_bus_backend", None) or "memory").strip().lower()
+    if backend == "redis":
+        # 延迟导入：进程内后端（默认）完全不加载 redis 客户端。
+        from flux.core.event.redis_bus import DEFAULT_CHANNEL, RedisEventBus
+
+        channel = (
+            getattr(settings, "event_bus_redis_channel", None) or ""
+        ).strip() or DEFAULT_CHANNEL
+        return RedisEventBus(settings.redis_url, channel=channel)
+    if backend != "memory":
+        logger.warning("未知的事件总线后端 %r，回退到进程内实现", backend)
+    return EventBus()
