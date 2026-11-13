@@ -32,13 +32,22 @@ from flux.core.channels.dingtalk_crypto import (
     build_encrypted_response,
     decrypt_event,
 )
+from flux.core.channels.inbound_media import (
+    DownloadedMedia,
+    Transcriber,
+    media_from_response,
+    pick_media_name,
+    safe_error,
+    save_media,
+    transcribe_audio,
+)
 from flux.core.event.bus import Events
 from flux.core.task_engine.approvals import (
     APPROVAL_ALLOW,
     outbound_approval_options,
     raise_approval,
 )
-from flux.errors import AIOSError, NotFoundError
+from flux.errors import AIOSError, NotFoundError, ValidationError
 from flux.logging import get_logger
 
 if TYPE_CHECKING:
@@ -81,6 +90,23 @@ class DingTalkCallbackResult:
 
     status_code: int
     payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _InboundMessage:
+    """解析后的入站消息：文本或一条待下载的媒体。"""
+
+    message_id: str
+    kind: str  # text / picture / audio / file
+    dest: dict[str, str]
+    text: str = ""
+    download_code: str = ""
+    file_name: str = ""
+    recognition: str = ""
+
+
+#: 媒体类型的中文名，用于缺凭据时给用户一句能看懂的解释。
+_KIND_LABELS = {"picture": "图片", "audio": "语音", "file": "文件"}
 
 
 class DingTalkBotSender:
@@ -150,6 +176,35 @@ class DingTalkBotSender:
             raise RuntimeError("钉钉发送缺少 conversation_id / staff_id")
         _raise_for_dingtalk(response, "发送钉钉消息")
 
+    @property
+    def default_robot_code(self) -> str:
+        """未从入站事件带出 robotCode 时的兜底（应用 AppKey）。"""
+        return self._default_robot_code
+
+    async def download_media(
+        self,
+        *,
+        download_code: str,
+        robot_code: str | None = None,
+    ) -> DownloadedMedia:
+        """官方两步下载：先换 downloadUrl，再 GET 预签名地址取字节。"""
+        code = (robot_code or self._default_robot_code or "").strip()
+        if not code:
+            raise RuntimeError("钉钉下载媒体缺少 robot_code")
+        token = await self._access_token()
+        response = await self._request(
+            "POST",
+            "/v1.0/robot/messageFiles/download",
+            headers={"x-acs-dingtalk-access-token": token},
+            json={"downloadCode": download_code, "robotCode": code},
+        )
+        data = _payload(response, "获取钉钉媒体下载地址")
+        url = str(data.get("downloadUrl") or "").strip()
+        if not url:
+            raise RuntimeError("钉钉媒体下载地址响应缺少 downloadUrl")
+        download = await self._send_stream("GET", url)
+        return await media_from_response(download, label="下载钉钉媒体")
+
     async def aclose(self) -> None:
         if self._client is not None and self._owns_client:
             await self._client.aclose()
@@ -177,12 +232,21 @@ class DingTalkBotSender:
             return token
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        return await self._ensure_client().request(method, f"{self._api_base}{path}", **kwargs)
+
+    async def _send_stream(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        """downloadUrl 是绝对地址（预签名），且可能 302；这里直接流式 GET。"""
+        client = self._ensure_client()
+        request = client.build_request(method, url, **kwargs)
+        return await client.send(request, stream=True, follow_redirects=True)
+
+    def _ensure_client(self) -> httpx.AsyncClient:
         client = self._client
         if client is None:
             client = httpx.AsyncClient(timeout=self._timeout)
             self._client = client
             self._owns_client = True
-        return await client.request(method, f"{self._api_base}{path}", **kwargs)
+        return client
 
 
 def _payload(response: httpx.Response, label: str) -> dict[str, Any]:
@@ -217,9 +281,11 @@ class DingTalkBotChannel:
         api_base: str = DEFAULT_API_BASE,
         bot_id: str | None = None,
         sender: Any | None = None,
+        transcriber: Transcriber | None = None,
         turn_wait_seconds: float = 900.0,
     ) -> None:
         self._container = container
+        self._transcriber = transcriber
         self._app_key = (app_key or "").strip() or None
         self._token = (token or "").strip() or None
         self._aes_key = (aes_key or "").strip() or None
@@ -324,7 +390,8 @@ class DingTalkBotChannel:
                 )
                 return self._success()
             return parsed
-        message_id, text, dest = parsed
+        message_id = parsed.message_id
+        dest = parsed.dest
 
         try:
             bot = await self._container.bots.get(bot_id)
@@ -332,9 +399,42 @@ class DingTalkBotChannel:
             logger.warning("钉钉回调指向的 Bot 不存在 bot=%s", bot_id)
             return DingTalkCallbackResult(404, {"error": "FLUX_DINGTALK_BOT_ID 指向的 Bot 不存在"})
 
+        if parsed.kind == "text":
+            files: list[Any] = []
+            content = parsed.text
+        else:
+            # 重推：turn 已存在就直接回加密 success，绝不再次下载媒体。
+            existing = await self._existing_turn(bot, message_id)
+            if existing is not None:
+                logger.info(
+                    "dingtalk.inbound.replay bot=%s message=%s turn=%s",
+                    bot_id,
+                    message_id,
+                    existing.id,
+                )
+                return self._success()
+            try:
+                files, content = await self._load_media(parsed)
+            except ValidationError as exc:
+                logger.warning(
+                    "钉钉入站媒体被拒绝 message=%s kind=%s reason=%s",
+                    message_id,
+                    parsed.kind,
+                    exc.message,
+                )
+                return self._success()
+            except Exception as exc:  # noqa: BLE001 - 下载异常不能拖垮进程
+                logger.warning(
+                    "钉钉入站媒体下载失败 message=%s kind=%s error=%s",
+                    message_id,
+                    parsed.kind,
+                    safe_error(exc),
+                )
+                return DingTalkCallbackResult(502, {"error": "钉钉媒体下载失败，请稍后重试"})
+
         try:
             turn, created = await self._container.bot_conversation.create_turn(
-                bot, content=text, client_turn_id=message_id
+                bot, content=content, files=files, client_turn_id=message_id
             )
         except AIOSError as exc:
             logger.warning(
@@ -478,6 +578,60 @@ class DingTalkBotChannel:
             await close()
 
     # --- 内部 ---
+
+    async def _existing_turn(self, bot: Any, client_turn_id: str) -> Any | None:
+        finder = getattr(self._container.bot_conversation, "find_turn", None)
+        if finder is None:
+            return None
+        return await finder(bot, client_turn_id)
+
+    async def _load_media(self, parsed: _InboundMessage) -> tuple[list[Any], str]:
+        """下载一条图片/语音/文件并落盘；缺凭据时给中文说明而不是静默忽略。"""
+        label = _KIND_LABELS[parsed.kind]
+        sender = self._sender
+        if sender is None or not hasattr(sender, "download_media"):
+            logger.warning(
+                "钉钉入站媒体缺少应用凭据 message=%s kind=%s",
+                parsed.message_id,
+                parsed.kind,
+            )
+            return [], f"收到{label}，但未配置钉钉应用凭据，无法下载附件。"
+
+        robot_code = (
+            parsed.dest.get("robot_code") or getattr(sender, "default_robot_code", "") or ""
+        ).strip()
+        if not robot_code:
+            logger.warning("钉钉入站媒体缺少 robotCode message=%s", parsed.message_id)
+            return [], f"收到{label}，但未配置钉钉 robotCode，无法下载附件。"
+
+        media = await sender.download_media(
+            download_code=parsed.download_code,
+            robot_code=robot_code,
+        )
+        stem = {"picture": "image", "audio": "voice", "file": "file"}[parsed.kind]
+        name = pick_media_name(
+            preferred=parsed.file_name,
+            downloaded=media.name,
+            mime=media.mime,
+            stem=stem,
+            ext=".amr" if parsed.kind == "audio" else "",
+        )
+        uploaded = await save_media(
+            self._container.settings,
+            DownloadedMedia(name=name, mime=media.mime, chunks=media.chunks),
+        )
+        if parsed.kind == "audio":
+            content = parsed.recognition or await transcribe_audio(self._transcriber, uploaded)
+        else:
+            content = ""
+        logger.info(
+            "钉钉入站媒体已落盘 message=%s kind=%s upload=%s bytes=%s",
+            parsed.message_id,
+            parsed.kind,
+            uploaded.id,
+            uploaded.size,
+        )
+        return [uploaded], content
 
     def _success(self) -> DingTalkCallbackResult:
         return DingTalkCallbackResult(
@@ -713,13 +867,23 @@ def _is_message_event(event_type: str, topic: str) -> bool:
     return event_type in MESSAGE_EVENT_TYPES or topic == BOT_MESSAGE_TOPIC
 
 
-def _parse_message(
-    data: dict[str, Any], event_id: str
-) -> tuple[str, str, dict[str, str]] | DingTalkCallbackResult:
+#: 官方入站类型（picture）与常见别名都收进来；video / 表情等保持忽略。
+_MESSAGE_KINDS = {
+    "text": "text",
+    "picture": "picture",
+    "image": "picture",
+    "audio": "audio",
+    "voice": "audio",
+    "file": "file",
+}
+
+
+def _parse_message(data: dict[str, Any], event_id: str) -> _InboundMessage | DingTalkCallbackResult:
     message_type = str(
         data.get("msgtype") or data.get("msgType") or data.get("messageType") or ""
     ).strip()
-    if message_type != "text":
+    kind = _MESSAGE_KINDS.get(message_type.lower())
+    if kind is None:
         return DingTalkCallbackResult(
             200,
             {"ignored": True, "reason": f"不支持的消息类型：{message_type or 'unknown'}"},
@@ -735,10 +899,6 @@ def _parse_message(
     ).strip()
     if not message_id:
         return DingTalkCallbackResult(400, {"error": "回调缺少 msgId / eventId"})
-
-    text = _text_content(data)
-    if not text:
-        return DingTalkCallbackResult(200, {"ignored": True, "reason": "空文本消息"})
 
     dest: dict[str, str] = {"message_id": message_id}
     conversation_id = str(
@@ -764,7 +924,53 @@ def _parse_message(
         dest["conversation_type"] = conversation_type
     if "conversation_id" not in dest and "staff_id" not in dest:
         return DingTalkCallbackResult(400, {"error": "回调缺少 conversationId / senderStaffId"})
-    return message_id, text, dest
+
+    if kind == "text":
+        text = _text_content(data)
+        if not text:
+            return DingTalkCallbackResult(200, {"ignored": True, "reason": "空文本消息"})
+        return _InboundMessage(message_id=message_id, kind="text", dest=dest, text=text)
+
+    # 官方媒体消息把字段放在与 msgtype 同名的子对象里（picture / audio / file），
+    # 常见别名（image / voice）也可能出现；部分网关则直接扁平化到顶层。
+    content: dict[str, Any] = {}
+    for key in dict.fromkeys((message_type.lower(), kind, "content")):
+        candidate = _content_dict(data.get(key))
+        if candidate:
+            content = candidate
+            break
+    download_code = str(
+        content.get("downloadCode")
+        or content.get("pictureDownloadCode")
+        or data.get("downloadCode")
+        or data.get("pictureDownloadCode")
+        or ""
+    ).strip()
+    if not download_code:
+        return DingTalkCallbackResult(
+            200,
+            {"ignored": True, "reason": f"媒体消息缺少 downloadCode：{kind}"},
+        )
+    return _InboundMessage(
+        message_id=message_id,
+        kind=kind,
+        dest=dest,
+        download_code=download_code,
+        file_name=str(content.get("fileName") or data.get("fileName") or "").strip(),
+        recognition=str(content.get("recognition") or data.get("recognition") or "").strip(),
+    )
+
+
+def _content_dict(raw: object) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _text_content(data: dict[str, Any]) -> str:

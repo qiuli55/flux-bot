@@ -177,6 +177,43 @@ def test_client_turn_id_is_idempotent(client: TestClient) -> None:
     assert [item["id"] for item in turns] == [first_turn["id"]]
 
 
+def test_turn_accepts_attachment_only_message(client: TestClient) -> None:
+    """只发附件不写正文也是合法的一轮；两者都没有仍然 422。"""
+    _fake(client)
+    bot = _create_bot(client)
+
+    empty = client.post(f"{PREFIX}/bots/{bot['id']}/turns", json={"content": ""})
+    assert empty.status_code == 422, empty.text
+
+    upload = client.post(
+        f"{PREFIX}/uploads",
+        params={"name": "照片.png", "mime": "image/png"},
+        content=b"png-body",
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert upload.status_code == 200, upload.text
+    upload_id = upload.json()["data"]["id"]
+
+    created = client.post(
+        f"{PREFIX}/bots/{bot['id']}/turns",
+        json={"content": "", "attachment_ids": [upload_id]},
+    )
+    assert created.status_code == 202, created.text
+    turn_id = created.json()["data"]["turn"]["id"]
+
+    done = _wait(client, bot["id"], turn_id)
+    assert done["status"] == "completed"
+    # 只有附件时，用户消息用附件说明兜底，而不是落一条空消息。
+    assert "照片.png" in done["user_message"]["content"]
+    assert "请看我随消息附上的文件" in done["user_message"]["content"]
+
+    chat_task_id = client.get(f"{PREFIX}/bots/{bot['id']}").json()["data"]["chat_task_id"]
+    messages = client.get(f"{PREFIX}/tasks/{chat_task_id}/messages").json()["data"]
+    attachment_messages = [item for item in messages if item["kind"] == "attachments"]
+    assert len(attachment_messages) == 1
+    assert attachment_messages[0]["payload"]["files"][0]["name"] == "照片.png"
+
+
 def test_budget_exhausted_returns_409_code(client: TestClient) -> None:
     _fake(client)
     bot = _create_bot(client, token_budget=10)
