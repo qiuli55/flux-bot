@@ -34,6 +34,7 @@ from flux.core.bot.webhook_triggers import WebhookTriggerService
 from flux.core.capability_import.repository import ImportedCapabilityRepository
 from flux.core.capability_import.scanners import AgentScanner
 from flux.core.capability_import.service import CapabilityImportService
+from flux.core.channels.dingtalk_bot import DingTalkBotChannel
 from flux.core.channels.feishu_bot import FeishuBotChannel
 from flux.core.channels.outbound_drafts import OutboundDraftService
 from flux.core.channels.wecom_bot import WeComBotChannel
@@ -200,6 +201,8 @@ class Container:
     outbound_drafts: OutboundDraftService = field(init=False)
     #: 正式飞书频道：加密回调入站建 turn，出站回复必须经审批卡放行
     feishu_bot: FeishuBotChannel = field(init=False)
+    #: 正式钉钉频道：HTTP 事件订阅入站建 turn，出站回复同样必须经审批卡放行
+    dingtalk_bot: DingTalkBotChannel = field(init=False)
     #: 正式企业微信频道：加密回调入站建 turn，出站回复必须经审批卡放行
     wecom_bot: WeComBotChannel = field(init=False)
     # IDE 行内补全（AI_COMPLETION_SPEC）：偏好/当前 Agent 落盘 + 模型解析 + 流式生成
@@ -515,6 +518,18 @@ class Container:
             bot_id=self.settings.feishu_bot_id,
         )
         self.bus.subscribe(Events.APPROVAL_RESOLVED, self.feishu_bot.on_approval_resolved)
+        # 正式钉钉频道：HTTP 事件订阅验签/解密后建 turn；出站同样只挂审批卡。
+        # kind=dingtalk_outbound 与飞书监听器互不干扰，两个订阅并存。
+        self.dingtalk_bot = DingTalkBotChannel(
+            self,
+            app_key=self.settings.dingtalk_app_key,
+            app_secret=self.settings.dingtalk_app_secret,
+            token=self.settings.dingtalk_token,
+            aes_key=self.settings.dingtalk_aes_key,
+            api_base=self.settings.dingtalk_api_base,
+            bot_id=self.settings.dingtalk_bot_id,
+        )
+        self.bus.subscribe(Events.APPROVAL_RESOLVED, self.dingtalk_bot.on_approval_resolved)
         # 正式企业微信频道：与飞书并列订阅审批结果，只处理 kind=wecom_outbound。
         self.wecom_bot = WeComBotChannel(
             self,
@@ -713,6 +728,8 @@ class Container:
         # 正式飞书频道先收摊：取消仍在等 turn 的后台任务并关发送端连接池，
         # 避免 Bot 对话 worker 停掉时它们又去挂新的出站审批。
         await self.feishu_bot.aclose()
+        # 钉钉频道同理：先停跟踪任务与发送端，再停对话 worker。
+        await self.dingtalk_bot.aclose()
         # 企业微信频道同理：先取消等待中的 turn 跟踪并关发送端连接池。
         await self.wecom_bot.aclose()
         # Bot 对话 worker 先停：它要写 bot_turns / task_messages，不能跑在 dispose 之后。
