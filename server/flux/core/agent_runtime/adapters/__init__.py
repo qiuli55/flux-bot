@@ -11,6 +11,7 @@ from flux.core.agent_runtime.adapters.base import (
     default_which,
     run_probe,
 )
+from flux.core.agent_runtime.adapters.claude import ClaudeAdapter
 from flux.core.agent_runtime.adapters.codex import CodexAdapter
 from flux.core.agent_runtime.adapters.generic import GenericCliAdapter
 from flux.core.agent_runtime.adapters.opencode import OpenCodeAdapter
@@ -20,6 +21,7 @@ __all__ = [
     "CliAgentAdapter",
     "CliAgentProbe",
     "CliProcess",
+    "ClaudeAdapter",
     "CodexAdapter",
     "GenericCliAdapter",
     "OpenCodeAdapter",

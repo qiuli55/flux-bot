@@ -1,6 +1,6 @@
 """Agent Run 持久化模型（修复方案 §2.2 / §2.7）。
 
-DSH Run 过去只存进程内字典（Phase 1），Flux 重启后状态全丢，卡死的 Run 没人知道、
+Agent Run 过去只存进程内字典（Phase 1），Flux 重启后状态全丢，卡死的 Run 没人知道、
 残留的子进程也没人清理。这张表是 Run 生命周期的权威存储：状态、进程树（pid/pgid）、
 心跳时间戳与超时判据全部落库，Reconciler 与重启恢复都以它为准。
 
@@ -21,14 +21,14 @@ from flux.models.base import Base, TimestampMixin
 
 
 class AgentRun(TimestampMixin, Base):
-    """一次 Agent Run（当前只有 DSH；表名不叫 dsh_runs，后续其它运行时共用同一生命周期表）。"""
+    """一次 Agent Run（所有 runtime 共用同一生命周期表，表名不叫 dsh_runs）。"""
 
     __tablename__ = "agent_runs"
 
-    #: Run 标识（DSH 的 run_id，uuid4().hex）
+    #: Run 标识（uuid4().hex）
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     session_id: Mapped[str] = mapped_column(String(128), default="")
-    #: 关联的任务（可空：`/dsh/runs` 也能独立起 Run）
+    #: 关联的任务（可空：直接创建 Run 也能独立跑）
     task_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), index=True, nullable=True)
     #: canonical Agent 标识（agents.id 的字符串形态）；归属看令牌，不看请求体
     agent_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
@@ -36,11 +36,11 @@ class AgentRun(TimestampMixin, Base):
     #: 取值见 flux.enums.DshRunStatus
     status: Mapped[str] = mapped_column(String(32), index=True)
     #: 启动时从任务快照的权限模式（flux.enums.PermissionMode）。MCP 层按它判定
-    #: 工具白名单与审批闸门——DSH 内置 Agent 用长期令牌，仅靠令牌 scopes 无法区分模式。
+    #: 工具白名单与审批闸门——长期令牌仅靠 scopes 无法区分模式。
     permission_mode: Mapped[str] = mapped_column(
         String(16), nullable=False, default="normal", server_default="normal"
     )
-    #: Agent 运行时子进程（进程组组长，见 dsh_client 的 setsid shim）
+    #: Agent 运行时子进程（进程组组长，见 CLI runtime 的 setsid shim）
     pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
     pgid: Mapped[int | None] = mapped_column(Integer, nullable=True)
     #: 创建该 Run 的 Flux 进程 pid（多实例共享库时用于区分归属 + 判断属主是否已死）

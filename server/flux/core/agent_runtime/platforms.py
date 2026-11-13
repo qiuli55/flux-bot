@@ -1,6 +1,6 @@
 """跨平台进程与文件原语（W-1 / P2-1，设计 §11.3）。
 
-Flux 里所有平台差异只在这里出现：dsh_client / supervisor / adapters / terminal 只表达意图
+Flux 里所有平台差异只在这里出现：runtimes / supervisor / adapters / terminal 只表达意图
 ——把进程放进独立进程组、终止整棵进程树、探活、保护敏感文件——具体实现按宿主平台选择。
 
 POSIX 侧是既有行为的收编（`setsid` 垫片、`killpg`、`kill(pid, 0)`、`chmod 0600`，行为不变）；

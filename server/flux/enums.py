@@ -48,6 +48,24 @@ class TaskOrigin(StrEnum):
 
     CHAT = "chat"
     ASSISTANT = "assistant"
+    #: Bot 对话里派出的后台子任务：有独立的 tasks 行与生命周期，但既不是用户对话，
+    #: 也不占 Bot 的「开工忙闲」锁；只通过父对话里的 kind=subtask 消息对外可见。
+    SUBTASK = "subtask"
+
+
+class OutboundDraftStatus(StrEnum):
+    """出站草稿状态（outbound_drafts.status）。
+
+    只有 PENDING 能被审批放行或取消；SENDING 是发送中的原子认领态；
+    其余都是终态，一律不自动重试、不自动发送。
+    """
+
+    PENDING = "pending"
+    SENDING = "sending"
+    SENT = "sent"
+    DENIED = "denied"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
 
 
 class BotStatus(StrEnum):
@@ -337,7 +355,7 @@ class MessageType(StrEnum):
 
 
 class DshRunStatus(StrEnum):
-    """DSH Agent Run 状态机（修复方案 §2.2）。
+    """Agent Run 状态机（修复方案 §2.2）。
 
     PENDING → STARTING → RUNNING → COMPLETED / FAILED / TIMEOUT，
     取消走 RUNNING → CANCELLING → CANCELLED（进程树确认清理完成才算 CANCELLED），
@@ -555,3 +573,15 @@ class RedactionKind(StrEnum):
     TOKEN = "token"
     #: `user:pass@host` 里的认证段（`@host` 保留，不打码）
     CRED = "cred"
+
+
+class ArtifactPageStatus(StrEnum):
+    """制品页面状态（artifact_pages.status）。
+
+    只有 PUBLISHED 能被公开链接读取；draft / unpublished 在公共入口一律 404，
+    不区分"从未发布"与"已下线"，避免泄露页面是否存在。
+    """
+
+    DRAFT = "draft"
+    PUBLISHED = "published"
+    UNPUBLISHED = "unpublished"
