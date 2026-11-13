@@ -650,6 +650,19 @@ class CliRuntime:
         # （opencode 是 opencode.json 顶层 model，codex 是 FLUX_CODEX_MODEL），
         # 它决定消耗哪个套餐的额度。
         effective_model = model_override or resolve_default_model(self._settings, self.runtime_id)
+        # Claude CLI 收不到 --model 时会用它自己的内置默认模型名；接在非 Anthropic 网关
+        # 后面时那个名字并不存在（实测 2.1.323 报 400 Model is unavailable）。任务没指定
+        # 模型时，把 runtime 配置的默认模型显式下发——与计费归因用的是同一个值。
+        claude_model = model_override
+        if self.runtime_id == RUNTIME_CLAUDE:
+            claude_model = model_override or effective_model
+            if claude_model:
+                logger.info(
+                    "%s：本轮模型来源=%s model=%s",
+                    self.runtime_id,
+                    "task" if model_override else "default",
+                    claude_model,
+                )
         # Bot 任务的执行目录来自 tasks.workspace 快照（每个 Bot 一个独立目录）；
         # 普通对话没有该字段，仍用全局工作区。
         task_workspace = str(getattr(task, "workspace", "") or "").strip()
@@ -818,7 +831,7 @@ class CliRuntime:
                     instruction,
                     mode,
                     config_dir=config_dir,
-                    model=model_override,
+                    model=claude_model,
                     resume=await self._resumable_claude_session(config_dir, task_key, agent_id),
                 )
             else:
@@ -1808,23 +1821,31 @@ class CliRuntime:
                     and event.type == EVENT_MESSAGE
                     and str(parsed.get("type") or "").strip().lower() == "assistant"
                 ):
-                    # assistant 事件回放整段文本，与已流式输出的 delta 重复
+                    # assistant 事件回放整段文本，与已流式输出的 delta 重复。回放与增量
+                    # 的空白形态不一定逐一相同（delta 可能被分帧拆开），按空白归一再比。
                     text = _text_of(event.data)
-                    if text and "".join(claude_text).endswith(text):
+                    if text and _stream_tail_matches(claude_text, text):
                         event = RuntimeEvent(
                             EVENT_STATUS,
                             launch.run_id,
                             {**event.data, "phase": "assistant", "text": ""},
                         )
                 if self.runtime_id == RUNTIME_CLAUDE and event.type == EVENT_FINAL:
-                    claude_final = _text_of(event.data) or claude_final
+                    # result 自带整段答复：优先作为最终文本，避免 delta 缺帧时拼出半截
+                    result_text = _raw_text_of(event.data)
+                    if result_text.strip():
+                        claude_final = result_text
                 delta = _accumulate_usage(usage, event, parsed)
                 if event.type == EVENT_MESSAGE:
-                    text = _text_of(event.data)
-                    if text:
-                        if self.runtime_id == RUNTIME_CLAUDE:
+                    if self.runtime_id == RUNTIME_CLAUDE:
+                        # text_delta 是逐 token 片段：必须原样拼接，前后空白（含换行）
+                        # 本身就是正文的一部分，strip 会让「 2.」变成「2.」并导致去重失败
+                        text = _raw_text_of(event.data)
+                        if text:
                             claude_text.append(text)
-                        else:
+                    else:
+                        text = _text_of(event.data)
+                        if text:
                             texts.append(text)
                 record = {
                     **event.data,
@@ -1839,7 +1860,16 @@ class CliRuntime:
         code = process.popen.wait()
         status = DshRunStatus.COMPLETED if code == 0 else DshRunStatus.FAILED
         if self.runtime_id == RUNTIME_CLAUDE:
-            response = "".join(claude_text) or claude_final
+            # 有 result 就用它的整段文本：delta 只是流式展示，最终答复以 result 为准。
+            # 没有 result（旧版本/异常中断）才退回增量拼接，避免答复里混进半截文本。
+            response = claude_final if claude_final.strip() else "".join(claude_text)
+            logger.info(
+                "cli.run 最终文本 run=%s runtime=%s 来源=%s chars=%d",
+                launch.run_id,
+                self.runtime_id,
+                "result" if claude_final.strip() else "stream",
+                len(response),
+            )
             if claude_session:
                 # 下一轮 --resume 用这里的会话 id（会话文件在 CLI 配置目录里）
                 asyncio.run_coroutine_threadsafe(
@@ -2458,6 +2488,25 @@ def _text_of(data: dict[str, Any]) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ""
+
+
+def _raw_text_of(data: dict[str, Any]) -> str:
+    """Claude 事件的正文原文：不做 strip——流式增量里的前后空白也是正文的一部分。"""
+    value = data.get("text")
+    return value if isinstance(value, str) else ""
+
+
+def _normalized_stream_text(text: str) -> str:
+    """流式去重用的空白归一：只比文字本身，不纠结换行/空格的切分形态。"""
+    return "".join(text.split())
+
+
+def _stream_tail_matches(chunks: list[str], text: str) -> bool:
+    """已累积的增量尾部是否已经完整包含这段回放文本（空白归一后比较）。"""
+    target = _normalized_stream_text(text)
+    if not target:
+        return False
+    return _normalized_stream_text("".join(chunks)).endswith(target)
 
 
 def _link_user_assets(user_home: Path, home: Path) -> None:
