@@ -7,7 +7,9 @@ from flux.api.v1 import (
     billing,
     bot_subtasks,
     bots,
+    browser,
     capabilities,
+    channels_status,
     codex_account,
     connector_calendar,
     connectors,
@@ -39,6 +41,9 @@ from flux.api.v1 import (
 api_v1_router = APIRouter()
 api_v1_router.include_router(health.router)
 api_v1_router.include_router(agents.router)
+# 只读状态接口：频道配置 / 收发时间 / 近期错误，以及浏览器 MCP 探活。
+api_v1_router.include_router(channels_status.router)
+api_v1_router.include_router(browser.router)
 api_v1_router.include_router(billing.router)
 api_v1_router.include_router(keys.router)
 api_v1_router.include_router(installations.router)
