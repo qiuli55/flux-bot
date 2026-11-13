@@ -56,6 +56,15 @@ class Settings(BaseSettings):
                     data = {**data, "timezone": tz}
         return data
 
+    @field_validator("anthropic_auth_mode")
+    @classmethod
+    def _validate_anthropic_auth_mode(cls, value: str) -> str:
+        """非法值不让服务起不来：告警并由解析层统一回退 auto。"""
+        # 惰性导入：config 是最底层模块，避免在模块加载期拉起 agent_runtime 包
+        from flux.core.agent_runtime.claude_auth import normalize_auth_mode
+
+        return normalize_auth_mode(value)
+
     @field_validator("timezone")
     @classmethod
     def _validate_timezone(cls, value: str) -> str:
@@ -138,6 +147,13 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = None
     anthropic_base_url: str = "https://api.anthropic.com"
     anthropic_model: str = "claude-sonnet-5-5"
+    # Claude Code 的鉴权头（code.claude.com/docs/en/env-vars，[2026-11-12 快照]）：
+    #   auto       = base_url 为空或官方域名时用 ANTHROPIC_API_KEY（X-Api-Key），
+    #                否则用 ANTHROPIC_AUTH_TOKEN（Authorization: Bearer），适合 LLM 网关；
+    #   api_key    = 强制 ANTHROPIC_API_KEY；
+    #   auth_token = 强制 ANTHROPIC_AUTH_TOKEN。
+    # 两者互斥（同时设置会触发 CLI 鉴权冲突告警），非法值告警后按 auto 处理。
+    anthropic_auth_mode: str = "auto"
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-flash"
@@ -193,42 +209,30 @@ class Settings(BaseSettings):
     # 平台内部模型调用的单次输出上限；None 表示不设上限，由模型自身的默认输出上限决定。
     model_max_output_tokens: int | None = None
 
-    # --- DSH Agent Runtime（集成方案 §17 配置表；Phase 1 用官方 Python SDK）---
-    # 是否启用 DSH Agent Runtime（默认关闭，未启用时 /dsh 接口返回 503）
-    dsh_enabled: bool = False
-    # DSH_HOME 绝对路径：profiles / plugins / 会话落盘，必须放仓库外
-    dsh_home: str = "/opt/flux/dsh-home"
-    # DSH Agent 的工作目录（cwd），Phase 1 用独立空目录，不指向真实项目
-    dsh_workspace: str = "/opt/flux/dsh-ws"
+    # --- Agent 执行内核（Claude Code / Codex / OpenCode 共用）---
+    # 运行期文件根目录：会话目录、隔离配置、Bot 工作区的父目录，必须放仓库外
+    runtime_home: str = "/opt/flux/runtime-home"
+    # Agent 的默认工作目录（cwd），未指定任务工作区时使用
+    runtime_workspace: str = "/opt/flux/runtime-ws"
     # 手机端聊天附件（用户上传的文件）：按上传 id 一目录存放，Agent 按绝对路径直接读
     uploads_dir: str = "/opt/flux/uploads"
     # AI 下发给用户的文件：按 delivery id 一目录存放，手机端按卡片里的 id/序号取文件
     deliveries_dir: str = "/opt/flux/deliveries"
-    # DSH provider 路由
-    dsh_provider: str = "deepseek-official"
-    # DSH 模型 id
-    dsh_model: str = "deepseek-v4-flash"
-    # 单次输出 token 上限
-    dsh_max_tokens: int = 49152
-    # 初始化握手超时（秒）
-    dsh_init_timeout_seconds: float = 30.0
-    # 单轮超时（秒）；0 表示不设限
-    dsh_run_timeout_seconds: float = 0.0
 
     # --- Run 生命周期看护（修复方案 §2.3~§2.7）---
     # 三类 timeout，全部可关（0 = 关闭该判据）：
     #   startup：进程起来但始终没有进入 RUNNING（构造/握手卡住）的上限
     #   idle：进程还在、但既无输出也无 MCP 活动、状态也不变的上限
     #   hard：无论有无输出都不放行的绝对上限
-    dsh_startup_timeout_seconds: float = 120.0
-    dsh_idle_timeout_seconds: float = 600.0
-    dsh_hard_timeout_seconds: float = 1800.0
+    run_startup_timeout_seconds: float = 120.0
+    run_idle_timeout_seconds: float = 600.0
+    run_hard_timeout_seconds: float = 1800.0
     # 心跳周期：写 last_heartbeat_at 并检查三类超时 / 进程存活
-    dsh_heartbeat_interval_seconds: float = 5.0
+    run_heartbeat_interval_seconds: float = 5.0
     # Reconciler 对账周期：数据库状态 ↔ 真实进程状态
-    dsh_reconcile_interval_seconds: float = 10.0
+    run_reconcile_interval_seconds: float = 10.0
     # Cancel 优雅期：SIGTERM 进程组后等这么久，仍在则 SIGKILL
-    dsh_cancel_grace_seconds: float = 5.0
+    run_cancel_grace_seconds: float = 5.0
 
     # --- Agent 执行时限通用覆盖（所有 runtime 共用；0 = 用 runtime 默认表）---
     # 各 runtime 的默认值登记在 runtimes/base.py 的 RUNTIME_LIMITS 里；这里只做运维级
@@ -248,18 +252,24 @@ class Settings(BaseSettings):
     # 上下文预算：估算输入超过该 token 数时压缩/重开会话；0 = 不限制
     agent_context_compact_tokens: int = 80000
 
-    # --- DSH × MCP 注入（目标架构 §3；P0-01 真闭环）---
-    # 内置 Agent 只能经 MCP 看项目、提提案；启动 DSH 时自动生成 patch 注入 MCP 客户端插件。
-    # 关闭后 DSH 会退化成"没有平台的裸 agent"——仅用于本地排查，默认必须开着。
-    dsh_mcp_enabled: bool = True
+    # --- MCP 注入（目标架构 §3；P0-01 真闭环）---
+    # Agent 只能经 MCP 看项目、提提案；起 Run 时自动生成隔离的 MCP 客户端配置。
+    # 关闭后 Agent 会退化成"没有平台的裸 agent"——仅用于本地排查，默认必须开着。
+    mcp_enabled: bool = True
     # Flux MCP 端点（streamable-http）。默认同机默认端口；隔离实例请显式指向自己的端口
-    dsh_mcp_url: str = "http://127.0.0.1:8000/mcp"
+    mcp_url: str = "http://127.0.0.1:8000/mcp"
     # MCP serverName（注入后工具名形如 mcp__flux__workspace.read）
-    dsh_mcp_server_name: str = "flux"
+    mcp_server_name: str = "flux"
     # 内置 Agent 的令牌身份：Flux 用它在 MCP 面盖章 provenance
-    dsh_mcp_agent_id: str = "flux-builtin"
+    mcp_agent_id: str = "flux-builtin"
     # 单次工具调用超时（毫秒）
-    dsh_mcp_tool_timeout_ms: int = 60000
+    mcp_tool_timeout_ms: int = 60000
+    # Claude Code 内核的扩展 MCP server（运维扩展点，JSON 对象字符串，形状同
+    # Claude Code 的 mcpServers）。只接受 http / sse 型远程 server：stdio / command
+    # 会在容器内拉起任意进程，一律拒绝；"flux" 是保留名。解析与校验见
+    # flux.core.agent_runtime.extra_mcp。示例：
+    # {"browser": {"type": "http", "url": "http://playwright-mcp:8931/mcp"}}
+    claude_extra_mcp_servers: str = ""
 
     # --- 外部 CLI Agent：Codex 的模型通道（P2-1 §6.2 续，2026-10-06）---
     # codex 把「鉴权方式」当全局状态，Flux 只能给它一个隔离的 CODEX_HOME（顺便注入 MCP），
@@ -333,17 +343,20 @@ class Settings(BaseSettings):
     supervisor_outbox_max_attempts: int = 5
     # watchdog：派活后迟迟没进入执行的租约上限（秒），超时回收并写 timed_out 报告。
     supervisor_dispatch_timeout_seconds: float = 120.0
-    # watchdog：单次 Run 执行时长上限（秒）；0 表示不限制，交给 DSH 自身超时。
+    # watchdog：单次 Run 执行时长上限（秒）；0 表示不限制，交给 runtime 自身超时。
     supervisor_run_timeout_seconds: float = 0.0
 
     # --- Bot 模式（常驻 Bot）---
     # Bot 独立服务监听的端口（entrypoint.sh / Dockerfile 用 FLUX_BOT_PORT 传入）。
-    # Bot 节点据此在未显式配置 FLUX_DSH_MCP_URL 时推导同机 MCP 端点。
+    # Bot 节点据此在未显式配置 FLUX_MCP_URL 时推导同机 MCP 端点。
     bot_port: int = 8600
     # 后台调度 worker：按 next_run_at 扫到期 Bot 并开工。测试里关掉，避免与用例抢时序。
     bot_scheduler_enabled: bool = True
     # 轮询间隔（秒）：cron 的最小粒度是分钟，30 秒足够且不会压垮 SQLite。
     bot_scheduler_interval_seconds: float = 30.0
+    # 后台子任务等待内核 Run 收尾的总时限（秒）：超时即终止 Run 并按失败回写父对话；
+    # 0 或负数表示不设上限（仍受 Run 自身的 idle / hard 超时约束）。
+    bot_subtask_timeout_seconds: float = 3600.0
     # 外部例程触发（Webhook）的 HMAC 密钥。留空 = fail-closed，拒绝所有入站请求。
     # 通用入口校验 X-Flux-Signature；GitHub 入口校验 X-Hub-Signature-256。
     routine_webhook_secret: str | None = None
@@ -418,6 +431,33 @@ class Settings(BaseSettings):
     feishu_api_base: str = "https://open.feishu.cn"
     # 这条飞书频道归属的 Flux Bot UUID；消息事件必须能定位到 Bot 才处理。
     feishu_bot_id: str | None = None
+
+    # --- Bot 频道 · 钉钉（HTTP 事件订阅入站 + 受审批出站）---
+    # AppKey 同时是应用级事件订阅的 ownerKey 与默认 robotCode；AppSecret 只用于
+    # 换取 accessToken 发消息。token / EncodingAESKey 未配置时回调 fail-closed。
+    dingtalk_app_key: str | None = None
+    dingtalk_app_secret: str | None = None
+    # 事件订阅后台配置的签名 token（3~32 位英文或数字）；留空 = 拒绝一切回调。
+    dingtalk_token: str | None = None
+    # 43 位 EncodingAESKey；回调密文用 AES-256-CBC 解密，应答也要用它加密。
+    dingtalk_aes_key: str | None = None
+    # 钉钉 OpenAPI 基址（私有化部署可改）。
+    dingtalk_api_base: str = "https://api.dingtalk.com"
+    # 这条钉钉频道归属的 Flux Bot UUID；消息事件必须能定位到 Bot 才处理。
+    dingtalk_bot_id: str | None = None
+    # --- Bot 频道 · 企业微信（WeCom，正式入站 + 受审批出站）---
+    # 自建应用凭据：corp_id / agent_id / secret 用于取 access_token 并发送应用消息。
+    wecom_corp_id: str | None = None
+    wecom_agent_id: str | None = None
+    wecom_secret: str | None = None
+    # 接收消息与事件的回调 token；留空 = 拒绝一切回调（fail-closed）。
+    wecom_token: str | None = None
+    # 回调加密的 EncodingAESKey（43 字符）；留空 = 拒绝一切回调。
+    wecom_encoding_aes_key: str | None = None
+    # 企业微信 API 基址（私有化部署可改）。
+    wecom_api_base: str = "https://qyapi.weixin.qq.com"
+    # 这条企业微信频道归属的 Flux Bot UUID；消息事件必须能定位到 Bot 才处理。
+    wecom_bot_id: str | None = None
 
     # --- Supervisor · 微信接入（OpenClaw + 微信 ClawBot 仅作传输层）---
     # 微信消息由本机 OpenClaw 网关转给 Flux，Flux 当大脑。入站令牌：插件每次转发

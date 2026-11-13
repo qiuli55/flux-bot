@@ -37,7 +37,7 @@ class AgentRepository:
         skills: tuple[str, ...] = (),
         tools: tuple[str, ...] = (),
         permissions: tuple[str, ...] = (),
-        runtime: str = "dsh",
+        runtime: str = "claude-code",
     ) -> Agent:
         """按 canonical id 落库（不存在则插入，存在则更新档案字段）。"""
         config: dict[str, Any] = {
@@ -45,7 +45,7 @@ class AgentRepository:
             "skills": list(skills),
             "tools": list(tools),
             "permissions": list(permissions),
-            # P2-1：执行该档案的 runtime（dsh / codex / opencode），重启后据此分发
+            # P2-1：执行该档案的 runtime（claude-code / codex / opencode），重启后据此分发
             "runtime": runtime,
         }
         async with self._session_factory() as session:

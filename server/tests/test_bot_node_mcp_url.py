@@ -6,7 +6,6 @@ import pytest
 
 from flux.bot_node.main import resolve_bot_settings
 from flux.config import get_settings
-from flux.core.agent_runtime.llm_stream_tap import tap_base_url
 
 
 @pytest.fixture(autouse=True)
@@ -18,38 +17,29 @@ def _clear_settings_cache():
 
 
 def test_default_derives_from_bot_port(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("FLUX_DSH_MCP_URL", raising=False)
+    monkeypatch.delenv("FLUX_MCP_URL", raising=False)
     monkeypatch.setenv("FLUX_BOT_PORT", "8611")
 
     settings = resolve_bot_settings(get_settings())
 
-    assert settings.dsh_mcp_url == "http://127.0.0.1:8611/mcp"
+    assert settings.mcp_url == "http://127.0.0.1:8611/mcp"
 
 
 def test_default_falls_back_to_8600_without_bot_port(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("FLUX_DSH_MCP_URL", raising=False)
+    monkeypatch.delenv("FLUX_MCP_URL", raising=False)
     monkeypatch.delenv("FLUX_BOT_PORT", raising=False)
 
     settings = resolve_bot_settings(get_settings())
 
-    assert settings.dsh_mcp_url == "http://127.0.0.1:8600/mcp"
+    assert settings.mcp_url == "http://127.0.0.1:8600/mcp"
 
 
 def test_explicit_mcp_url_wins_over_bot_port(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FLUX_BOT_PORT", "8611")
-    monkeypatch.setenv("FLUX_DSH_MCP_URL", "http://127.0.0.1:9001/mcp")
+    monkeypatch.setenv("FLUX_MCP_URL", "http://127.0.0.1:9001/mcp")
 
     settings = resolve_bot_settings(get_settings())
 
-    assert settings.dsh_mcp_url == "http://127.0.0.1:9001/mcp"
-
-
-def test_tap_base_url_derives_from_effective_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("FLUX_DSH_MCP_URL", raising=False)
-    monkeypatch.setenv("FLUX_BOT_PORT", "8611")
-
-    settings = resolve_bot_settings(get_settings())
-
-    assert tap_base_url(settings.dsh_mcp_url) == "http://127.0.0.1:8611/internal/llm-tap"
+    assert settings.mcp_url == "http://127.0.0.1:9001/mcp"

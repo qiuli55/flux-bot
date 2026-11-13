@@ -380,7 +380,7 @@ class SupervisorSubscription(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 
 class SupervisorAssignment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """一次派活记录：工单 → Agent / Task / DSH Run。"""
+    """一次派活记录：工单 → Agent / Task / Run。"""
 
     __tablename__ = "supervisor_assignments"
 

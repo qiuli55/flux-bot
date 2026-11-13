@@ -14,6 +14,7 @@ from flux.config import Settings
 from flux.core.agent_runtime.runtimes.base import ModelChannel
 from flux.core.key_vault.probe import probe_channel
 from flux.core.key_vault.service import KeyVaultService
+from tests.fakes import mark_runtime_ready
 
 PREFIX = "/api/v1"
 
@@ -30,6 +31,18 @@ def _create_key(client: TestClient, **overrides: object) -> dict:
     response = client.post(f"{PREFIX}/keys", json=body)
     assert response.status_code == 200, response.text
     return response.json()["data"]
+
+
+def _create_anthropic_key(client: TestClient, **overrides: object) -> dict:
+    return _create_key(
+        client,
+        name="Anthropic 官方",
+        provider="anthropic",
+        base_url="https://api.anthropic.com",
+        api_key="sk-ant-test-12345678",
+        models=["claude-sonnet-5-5"],
+        **overrides,
+    )
 
 
 def _db_path(settings: Settings) -> str:
@@ -102,18 +115,18 @@ def test_partial_update_keeps_the_key_when_blank(client: TestClient) -> None:
 
 
 def test_task_model_can_reference_a_key_and_delete_clears_it(client: TestClient) -> None:
-    key = _create_key(client)
+    key = _create_anthropic_key(client)
     created = client.post(
         f"{PREFIX}/tasks",
         json={
             "description": "用 key 库模型跑一次",
-            "model": "deepseek-v4-pro",
+            "model": "claude-sonnet-5-5",
             "key_id": key["id"],
         },
     )
     assert created.status_code == 200, created.text
     task = created.json()["data"]
-    assert task["model"] == "deepseek-v4-pro"
+    assert task["model"] == "claude-sonnet-5-5"
     assert task["api_key_id"] == key["id"]
 
     deleted = client.delete(f"{PREFIX}/keys/{key['id']}")
@@ -133,25 +146,38 @@ def test_key_models_are_exposed_per_runtime(client: TestClient) -> None:
         api_key="sk-openai-abcdef12",
         models=["gpt-5.5"],
     )
+    anthropic = _create_key(
+        client,
+        name="Anthropic 官方",
+        provider="anthropic",
+        base_url="https://api.anthropic.com",
+        api_key="sk-ant-abcdef12",
+        models=["claude-sonnet-5-5"],
+    )
     codex = client.post(
         f"{PREFIX}/agents",
         json={"name": "codex-agent", "role": "developer", "runtime": "codex"},
     )
     assert codex.status_code == 200, codex.text
-    dsh = client.post(
+    claude = client.post(
         f"{PREFIX}/agents",
-        json={"name": "dsh-agent", "role": "developer", "runtime": "dsh"},
+        json={"name": "claude-agent", "role": "developer", "runtime": "claude-code"},
     )
-    assert dsh.status_code == 200, dsh.text
+    assert claude.status_code == 200, claude.text
 
     agents = {a["spec"]["name"]: a for a in client.get(f"{PREFIX}/agents").json()["data"]}
-    builtin_models = {(m["key_id"], m["model"]) for m in agents["dsh-agent"]["spec"]["key_models"]}
+    claude_models = {
+        (m["key_id"], m["model"]) for m in agents["claude-agent"]["spec"]["key_models"]
+    }
     codex_models = {(m["key_id"], m["model"]) for m in agents["codex-agent"]["spec"]["key_models"]}
-    # dsh 只吃 DeepSeek 协议；codex 同时能看到 DeepSeek 与 OpenAI
-    assert (deepseek["id"], "deepseek-v4-pro") in builtin_models
-    assert (openai["id"], "gpt-5.5") not in builtin_models
+    # claude-code 只吃 Anthropic 协议（Base URL 可指向 OpenClaw 网关）；
+    # codex 同时能看到 DeepSeek 与 OpenAI
+    assert (anthropic["id"], "claude-sonnet-5-5") in claude_models
+    assert (deepseek["id"], "deepseek-v4-pro") not in claude_models
+    assert (openai["id"], "gpt-5.5") not in claude_models
     assert (deepseek["id"], "deepseek-v4-pro") in codex_models
     assert (openai["id"], "gpt-5.5") in codex_models
+    assert (anthropic["id"], "claude-sonnet-5-5") not in codex_models
 
 
 # --- 连通性探测（保存后校验端点/模型是否可用）---
@@ -244,18 +270,19 @@ def test_probe_disabled_key_is_skipped(client: TestClient) -> None:
 
 
 def test_switch_model_with_key_and_agent_switch_clears_it(client: TestClient) -> None:
-    key = _create_key(client)
+    mark_runtime_ready(client.app.state.container, "claude-code")
+    key = _create_anthropic_key(client)
     task = client.post(f"{PREFIX}/tasks", json={"description": "切模型", "agent_id": None}).json()[
         "data"
     ]
     agent_id = client.post(
         f"{PREFIX}/agents",
-        json={"name": "builtin-2", "role": "developer", "runtime": "dsh"},
+        json={"name": "builtin-2", "role": "developer", "runtime": "claude-code"},
     ).json()["data"]["id"]
 
     switched = client.post(
         f"{PREFIX}/tasks/{task['id']}/model",
-        json={"model": "deepseek-v4-pro", "key_id": key["id"]},
+        json={"model": "claude-sonnet-5-5", "key_id": key["id"]},
     )
     assert switched.status_code == 200, switched.text
     assert switched.json()["data"]["api_key_id"] == key["id"]
@@ -268,17 +295,18 @@ def test_switch_model_with_key_and_agent_switch_clears_it(client: TestClient) ->
 
 def test_switch_agent_and_model_on_a_finished_task(client: TestClient) -> None:
     """终态对话也能换 Agent / 模型：切换只影响下一次续聊，不执行任何东西。"""
+    mark_runtime_ready(client.app.state.container, "claude-code")
     task = client.post(f"{PREFIX}/tasks", json={"description": "终态切换"}).json()["data"]
     assert client.post(f"{PREFIX}/tasks/{task['id']}/cancel").status_code == 200
-    key = _create_key(client)
+    key = _create_anthropic_key(client)
     agent_id = client.post(
         f"{PREFIX}/agents",
-        json={"name": "builtin-3", "role": "developer", "runtime": "dsh"},
+        json={"name": "builtin-3", "role": "developer", "runtime": "claude-code"},
     ).json()["data"]["id"]
 
     switched = client.post(
         f"{PREFIX}/tasks/{task['id']}/model",
-        json={"model": "deepseek-v4-pro", "key_id": key["id"]},
+        json={"model": "claude-sonnet-5-5", "key_id": key["id"]},
     )
     assert switched.status_code == 200, switched.text
     assert switched.json()["data"]["api_key_id"] == key["id"]

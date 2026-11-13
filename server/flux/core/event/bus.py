@@ -83,6 +83,12 @@ class Events:
     #: IMAP 轮询发现的新邮件；载荷只含账号、目录、UID 与邮件头字段，
     #: 不含正文与凭据。Bot / 例程的 event_triggers 直接订阅这个事件名。
     EMAIL_RECEIVED = "email.received"
+    #: Bot 后台子任务（2026-11-13）：起止均发一次，载荷含 bot_id / subtask_id /
+    #: parent_task_id / status；父对话里另有 kind=subtask 的消息与 subtask_update 流事件。
+    SUBTASK_STARTED = "subtask.started"
+    SUBTASK_COMPLETED = "subtask.completed"
+    SUBTASK_FAILED = "subtask.failed"
+    SUBTASK_CANCELLED = "subtask.cancelled"
 
 
 class EventBus:

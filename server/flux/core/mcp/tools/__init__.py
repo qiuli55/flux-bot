@@ -19,9 +19,11 @@ from flux.core.mcp.tools.delivery_tools import delivery_tools
 from flux.core.mcp.tools.design_tools import design_tools
 from flux.core.mcp.tools.knowledge_tools import knowledge_tools
 from flux.core.mcp.tools.memory_tools import memory_tools
+from flux.core.mcp.tools.permission_tools import permission_tools
 from flux.core.mcp.tools.plan_tools import plan_tools
 from flux.core.mcp.tools.preview_tools import preview_tools
 from flux.core.mcp.tools.read_tools import read_tools
+from flux.core.mcp.tools.routine_tools import routine_tools
 from flux.core.mcp.tools.runtime_tools import runtime_tools
 from flux.core.mcp.tools.supervisor_tools import supervisor_tools
 from flux.core.mcp.tools.terminal_tools import terminal_tools
@@ -39,6 +41,8 @@ ALL_TOOLS: tuple[ToolSpec, ...] = (
     *plan_tools(),
     *supervisor_tools(),
     *knowledge_tools(),
+    *routine_tools(),
+    *permission_tools(),
 )
 
 TOOLS: dict[str, ToolSpec] = {tool.name: tool for tool in ALL_TOOLS}
