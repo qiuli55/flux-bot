@@ -285,6 +285,14 @@ class TaskRepository:
             await self._commit(session)
             return task
 
+    async def set_result(self, task_id: uuid.UUID, result: dict[str, Any]) -> Task:
+        """只补写结果、不改状态（内核 Run 的桥接已先一步落终态时用）。"""
+        async with self._session_factory() as session:
+            task = await self._require(session, task_id)
+            task.result = result
+            await self._commit(session)
+            return task
+
     async def set_decision_mode(self, task_id: uuid.UUID, mode: DecisionMode) -> Task:
         """切换任务级决策策略（文档 §5）：只影响后续遇到的决策点，不改历史记录。"""
         async with self._session_factory() as session:
