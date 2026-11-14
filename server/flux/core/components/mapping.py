@@ -44,6 +44,28 @@ from flux.errors import ValidationError
 
 COMPONENT_KIND = "component"
 
+
+def public_payload(payload: Any) -> Any:
+    """返回可下发给客户端的 payload 副本。
+
+    附件内部记录（`files` / `attachments`）会带服务端绝对路径供 Agent 读文件；
+    对外 JSON 必须剥掉 `path`。这里不改写数据库、也不递归改写其他业务字段。
+    """
+    if not isinstance(payload, dict):
+        return payload
+    copy = dict(payload)
+    for key in ("files", "attachments"):
+        items = copy.get(key)
+        if isinstance(items, list):
+            copy[key] = [
+                {field: value for field, value in item.items() if field != "path"}
+                if isinstance(item, dict)
+                else item
+                for item in items
+            ]
+    return copy
+
+
 #: 读取时会附带 `payload["component"]` 的既有消息类型。
 MAPPED_KINDS: frozenset[str] = frozenset(
     {

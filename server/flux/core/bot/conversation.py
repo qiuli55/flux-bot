@@ -104,7 +104,9 @@ async def record_attachments(
                     role=TaskMessageRole.USER.value,
                     kind="attachments",
                     content="、".join(item.name for item in files),
-                    payload={"files": [item.to_dict() for item in files]},
+                    # 落库存内部路径供 Agent 原生读文件；对外 JSON 由
+                    # TaskMessage.to_dict 统一剥掉 path。
+                    payload={"files": [item.to_internal_dict() for item in files]},
                 )
             ],
         )
@@ -584,7 +586,11 @@ class BotConversationService:
             async def _run_bot_tool(name: str, arguments: dict[str, Any]) -> Any:
                 if name == ATTACH_FILE_TOOL_NAME:
                     return await run_attach_file_tool(
-                        container, subtask_bot, arguments, outbound_files
+                        container,
+                        subtask_bot,
+                        arguments,
+                        outbound_files,
+                        cloud_user_id=account_key or self._owner(),
                     )
                 if name in {COMPONENT_EMIT_TOOL_NAME, COMPONENT_EMIT_CHAT_TOOL_NAME}:
                     return await _run_component(name, arguments)

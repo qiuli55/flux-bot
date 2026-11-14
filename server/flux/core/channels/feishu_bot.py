@@ -483,7 +483,7 @@ class FeishuBotChannel:
                 )
                 return FeishuCallbackResult(200, {"created": False, "turn_id": str(existing.id)})
             try:
-                files, content = await self._load_media(parsed)
+                files, content = await self._load_media(parsed, cloud_user_id=cloud_user_id)
             except ValidationError as exc:
                 # 超限 / 空文件是永久问题：确认掉，别让平台无限重推。
                 logger.warning(
@@ -718,7 +718,9 @@ class FeishuBotChannel:
             return
         await sender.send_text(chat_id, text)
 
-    async def _load_media(self, parsed: _InboundMessage) -> tuple[list[Any], str]:
+    async def _load_media(
+        self, parsed: _InboundMessage, *, cloud_user_id: str | None = None
+    ) -> tuple[list[Any], str]:
         """下载一条图片/文件/语音并落盘；没有应用凭据时给中文说明而不是静默忽略。"""
         label = _KIND_LABELS[parsed.kind]
         sender = self._sender
@@ -745,6 +747,7 @@ class FeishuBotChannel:
         uploaded = await save_media(
             self._container.settings,
             DownloadedMedia(name=name, mime=media.mime, chunks=media.chunks),
+            cloud_user_id=cloud_user_id,
         )
         if parsed.kind == "audio":
             content = parsed.recognition or await transcribe_audio(self._transcriber, uploaded)
