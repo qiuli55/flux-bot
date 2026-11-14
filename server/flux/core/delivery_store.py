@@ -21,6 +21,7 @@ from typing import Any
 
 from flux.config import Settings
 from flux.core.attachment_store import safe_name, size_label
+from flux.core.user_scope import normalize_cloud_user_id
 from flux.errors import ValidationError
 from flux.logging import get_logger
 
@@ -118,6 +119,9 @@ class Delivery:
     note: str
     created_at: str
     files: tuple[DeliveryFile, ...]
+    #: 归属的 Flux 云用户；None = Phase 之前的老下发，读取时按主用户兜底。
+    #: 只用于鉴权，不进入客户端 JSON（不暴露别人的用户 id）。
+    cloud_user_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -155,8 +159,14 @@ def create_delivery(
     *,
     sources: list[tuple[str, Path]],
     note: str = "",
+    cloud_user_id: str | None = None,
 ) -> Delivery:
-    """把 `(显示名, 源文件)` 复制进一个 delivery 目录；任何一步失败都不留半套。"""
+    """把 `(显示名, 源文件)` 复制进一个 delivery 目录；任何一步失败都不留半套。
+
+    `cloud_user_id` 是这次下发的归属人（由工具从任务 / Run 解析后传入）。它写进
+    `meta.json`，`GET /deliveries/{id}` 只允许归属人读取；传 None 则按老数据
+    （主用户可见）处理。
+    """
     if not sources:
         raise ValidationError("没有可下发的文件", details={"count": 0})
     if len(sources) > DELIVERY_MAX_FILES:
@@ -202,27 +212,28 @@ def create_delivery(
             note=note or "",
             created_at=datetime.now(timezone.utc).isoformat(),
             files=tuple(files),
+            cloud_user_id=normalize_cloud_user_id(cloud_user_id),
         )
-        (folder / "meta.json").write_text(
-            json.dumps(
+        meta: dict[str, Any] = {
+            "id": delivery.id,
+            "note": delivery.note,
+            "created_at": delivery.created_at,
+            "files": [
                 {
-                    "id": delivery.id,
-                    "note": delivery.note,
-                    "created_at": delivery.created_at,
-                    "files": [
-                        {
-                            "index": item.index,
-                            "name": item.name,
-                            "size": item.size,
-                            "mime": item.mime,
-                            "kind": item.kind,
-                            "path": item.path,
-                        }
-                        for item in delivery.files
-                    ],
-                },
-                ensure_ascii=False,
-            ),
+                    "index": item.index,
+                    "name": item.name,
+                    "size": item.size,
+                    "mime": item.mime,
+                    "kind": item.kind,
+                    "path": item.path,
+                }
+                for item in delivery.files
+            ],
+        }
+        if delivery.cloud_user_id is not None:
+            meta["cloud_user_id"] = delivery.cloud_user_id
+        (folder / "meta.json").write_text(
+            json.dumps(meta, ensure_ascii=False),
             encoding="utf-8",
         )
         return delivery
@@ -274,6 +285,8 @@ def resolve_delivery(settings: Settings, delivery_id: str) -> Delivery | None:
         note=str(raw.get("note") or ""),
         created_at=str(raw.get("created_at") or ""),
         files=tuple(sorted(items, key=lambda item: item.index)),
+        # 老 meta（本字段出现之前写入）没有归属人：保持 None，由读取方按主用户兜底。
+        cloud_user_id=normalize_cloud_user_id(raw.get("cloud_user_id")),
     )
 
 
