@@ -34,6 +34,12 @@ from flux.core.mcp.tools.approval_rule_tools import (
     APPROVAL_RULE_TOOLS,
     run_approval_rule_tool,
 )
+from flux.core.mcp.tools.component_tools import (
+    COMPONENT_CHAT_TOOLS,
+    COMPONENT_EMIT_CHAT_TOOL_NAME,
+    COMPONENT_EMIT_TOOL_NAME,
+    run_component_tool,
+)
 from flux.core.mcp.tools.routine_tools import ROUTINE_TOOLS, run_routine_tool
 from flux.core.model_gateway.base import ChatMessage
 from flux.core.task_engine.assistant import AssistantTurn
@@ -570,6 +576,9 @@ class BotConversationService:
                     owner_cloud_user_id=self._owner(),
                 )
 
+            async def _run_component(name: str, arguments: dict[str, Any]) -> Any:
+                return await run_component_tool(container, task.id, name, arguments)
+
             existing_runner = tool_kwargs.get("tool_runner")
 
             async def _run_bot_tool(name: str, arguments: dict[str, Any]) -> Any:
@@ -577,6 +586,8 @@ class BotConversationService:
                     return await run_attach_file_tool(
                         container, subtask_bot, arguments, outbound_files
                     )
+                if name in {COMPONENT_EMIT_TOOL_NAME, COMPONENT_EMIT_CHAT_TOOL_NAME}:
+                    return await _run_component(name, arguments)
                 if name.startswith("subtask_"):
                     return await _run_subtask(name, arguments)
                 if name.startswith("routine_"):
@@ -593,6 +604,7 @@ class BotConversationService:
                 *ROUTINE_TOOLS,
                 *APPROVAL_RULE_TOOLS,
                 *ATTACH_FILE_TOOLS,
+                *COMPONENT_CHAT_TOOLS,
             ]
             tool_kwargs["tool_runner"] = _run_bot_tool
             subtask_note = (
@@ -623,6 +635,12 @@ class BotConversationService:
                 "Bot 工作区内的文件，或提供已上传附件的 upload_id。attach_file 只登记、"
                 "不发送；真正发送要等用户在出站审批卡上选择允许。"
             )
+            component_note = (
+                "需要比纯文本更清楚的展示（步骤、文件清单、进度、可点击按钮）时，调用 "
+                "component_emit 发一张交互卡片：必须同时给 component 树和 fallback_text "
+                "纯文本兜底。按钮只能用客户端动作 open_desktop / open_url；决策、密钥输入"
+                "等需要服务端处理的动作不能自己伪造。"
+            )
             existing_note = str(tool_kwargs.get("tools_note") or "").strip()
             notes = [
                 note
@@ -632,6 +650,7 @@ class BotConversationService:
                     routine_note,
                     approval_rule_note,
                     attach_note,
+                    component_note,
                 )
                 if note
             ]

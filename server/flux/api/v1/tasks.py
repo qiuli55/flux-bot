@@ -28,6 +28,7 @@ from flux.core.agent_runtime.runtimes.base import DEFAULT_RUNTIME
 from flux.core.agent_runtime.trace import summarize_trace
 from flux.core.attachment_store import resolve_uploads
 from flux.core.bot.conversation import attachments_brief, record_attachments
+from flux.core.components.actions import find_action, route_component_action
 from flux.core.event.bus import Events
 from flux.core.group.avatar import normalize_avatar
 from flux.core.task_engine.approvals import APPROVAL_ALLOW
@@ -39,6 +40,7 @@ from flux.core.task_engine.context_usage import (
 )
 from flux.core.task_engine.decisions import build_decision, reject_decision, resolve_decision
 from flux.core.task_engine.repository import MessageDraft
+from flux.core.task_engine.secure_input import store_secure_input
 from flux.enums import (
     DecisionMode,
     DecisionStatus,
@@ -51,6 +53,7 @@ from flux.errors import BadRequestError, ConflictError, NotFoundError, Validatio
 from flux.logging import get_logger
 from flux.models.task import Task
 from flux.schemas.api import (
+    ComponentActionRequest,
     ConfirmationUpdateRequest,
     DecisionChooseRequest,
     DecisionCreateRequest,
@@ -511,72 +514,14 @@ async def submit_secure_input(
 
     card_uuid = _parse_uuid(payload.message_id, field="message_id")
     card = await container.task_repo.get_message(task_uuid, card_uuid)
-    if card is None or card.kind != "secure_input":
+    if card is None:
         raise NotFoundError(
             "安全输入卡片不存在或不属于该任务",
             details={"task_id": task_id, "message_id": payload.message_id},
         )
-    spec = (card.payload or {}).get("secure_input")
-    if not isinstance(spec, dict) or not spec:
-        raise ValidationError(
-            "卡片缺少密钥描述，无法保存", details={"message_id": payload.message_id}
-        )
-
-    receipts = await container.task_repo.messages_of_kind(task_uuid, "secure_input_result")
-    if any((item.payload or {}).get("message_id") == str(card_uuid) for item in receipts):
-        raise ConflictError(
-            "这张卡片的密钥已保存过，不会再写入一次",
-            details={"message_id": payload.message_id},
-        )
-
-    secret = payload.value.strip()
-    if not secret:
-        raise ValidationError("密钥不能为空", details={"field": "value"})
-
-    name = str(spec.get("name") or spec.get("title") or "API key")[:128]
-    fields = {
-        "provider": str(spec.get("provider") or ""),
-        "base_url": str(spec.get("base_url") or ""),
-        "models": [str(item) for item in spec.get("models") or []],
-        "wire_api": str(spec.get("wire_api") or ""),
-    }
-    # 同名密钥视为「重新填一次」：覆盖凭据与用途，而不是报 409 让用户去密钥库手动合并。
-    existing = next(
-        (row for row in await container.key_vault.list_entries() if row.name == name), None
-    )
-    if existing is None:
-        key = await container.key_vault.create(name=name, api_key=secret, **fields)
-    else:
-        key = await container.key_vault.update(existing.id, api_key=secret, **fields)
-
-    stored = (
-        await container.task_repo.add_messages(
-            task_uuid,
-            [
-                MessageDraft(
-                    role=TaskMessageRole.USER.value,
-                    kind="secure_input_result",
-                    content=f"已通过安全输入框保存密钥「{key.name}」，密钥不会出现在对话里。",
-                    payload={
-                        "message_id": str(card_uuid),
-                        "key_id": str(key.id),
-                        "name": key.name,
-                        "provider": key.provider,
-                        "key_hint": key.key_hint,
-                        "status": "stored",
-                    },
-                )
-            ],
-        )
-    )[0]
-    await container.task_stream.publish(task_uuid, "user_message", {"message": stored.to_dict()})
-    logger.info(
-        "安全输入已保存 task=%s message=%s key=%s provider=%s",
-        task_uuid,
-        card_uuid,
-        key.id,
-        key.provider,
-    )
+    result = await store_secure_input(container, task=task, card=card, secret=payload.value)
+    key = result["key"]
+    stored = result["message"]
     return ok(
         {
             "task": _task_dict(task),
@@ -584,6 +529,47 @@ async def submit_secure_input(
             "message": stored.to_dict(),
         }
     )
+
+
+@router.post("/{task_id}/messages/{message_id}/actions")
+async def submit_component_action(
+    task_id: str,
+    message_id: str,
+    payload: ComponentActionRequest,
+    container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
+) -> dict[str, object]:
+    """组件卡片的动作回调（决策按钮 / 安全输入 / 选项提交）。
+
+    服务端按 `action_id` 从落库的组件树里找回动作，不执行客户端给的任何 URL 或
+    内部动作名。消息必须属于当前用户可访问的任务；动作不存在或已失效一律 404。
+    """
+    task_uuid = _task_id(task_id)
+    task = await _require_open_task(container, task_uuid, task_id, cloud_user_id)
+    message_uuid = _parse_uuid(message_id, field="message_id")
+    message = await container.task_repo.get_message(task_uuid, message_uuid)
+    if message is None:
+        raise NotFoundError(
+            "消息不存在或不属于该任务",
+            details={"task_id": task_id, "message_id": message_id},
+        )
+    action = find_action(message, payload.action_id)
+    if action is None:
+        raise NotFoundError(
+            "操作不存在或已失效",
+            details={"action_id": payload.action_id, "message_id": message_id},
+        )
+    result = await route_component_action(
+        container,
+        task=task,
+        message=message,
+        action=action,
+        value=payload.value,
+        option=payload.option,
+        note=payload.note,
+        cloud_user_id=cloud_user_id,
+    )
+    return ok(result)
 
 
 @router.get("/{task_id}/stream")
