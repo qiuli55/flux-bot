@@ -23,6 +23,7 @@ import uuid
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -41,6 +42,14 @@ from flux.core.channels.inbound_media import (
     safe_error,
     save_media,
     transcribe_audio,
+)
+from flux.core.channels.outbound_media import (
+    attachment_meta,
+    attachment_record,
+    attachment_records,
+    render_outbound_detail,
+    resolve_attachment,
+    validate_channel_attachment,
 )
 from flux.core.event.bus import Events
 from flux.core.task_engine.approvals import (
@@ -77,8 +86,6 @@ DINGTALK_OUTBOUND_KIND = "dingtalk_outbound"
 CHANNEL_LABEL = "钉钉"
 #: 平台单条文本上限的安全值
 MAX_TEXT_CHARS = 4000
-#: 审批卡里展示的草稿摘录上限
-_DETAIL_TEXT_CHARS = 1500
 #: 提升排队草稿时最多重试几次（并发下别的处理器可能先认领同一张卡）
 _MAX_QUEUE_PROMOTIONS = 5
 #: 官方 OpenAPI 基址
@@ -136,14 +143,92 @@ class DingTalkBotSender:
 
     async def send_text(self, dest: Mapping[str, Any], text: str) -> None:
         """按 dest 选择单聊或群聊接口发送文本，绝不静默丢弃。"""
+        content = (text or "")[:MAX_TEXT_CHARS]
+        msg_param = json.dumps({"content": content}, ensure_ascii=False)
+        await self._send_robot(dest, "sampleText", msg_param, label="发送钉钉消息")
+
+    async def upload_media(
+        self,
+        *,
+        path: str,
+        name: str,
+        mime: str,
+        media_type: str,
+        robot_code: str = "",
+    ) -> str:
+        """上传机器人消息素材，返回 mediaId。
+
+        官方 robot 消息文件接口：POST /v1.0/robot/messageFiles/upload（multipart）。
+        保守上限：图片 10MB、文件 20MB；频道在调用前已按上限校验。
+        """
+        code = (robot_code or self._default_robot_code or "").strip()
+        if not code:
+            raise RuntimeError("钉钉上传媒体缺少 robot_code")
+        token = await self._access_token()
+        response = await self._request(
+            "POST",
+            "/v1.0/robot/messageFiles/upload",
+            params={"robotCode": code},
+            headers={"x-acs-dingtalk-access-token": token},
+            data={"robotCode": code, "mediaType": media_type},
+            files={"file": (name, _read_media(path, "钉钉"), mime or "application/octet-stream")},
+        )
+        data = _payload(response, "上传钉钉媒体")
+        media_id = str(data.get("mediaId") or data.get("media_id") or "")
+        if not media_id:
+            raise RuntimeError("上传钉钉媒体失败：响应缺少 mediaId")
+        return media_id
+
+    async def send_image(self, dest: Mapping[str, Any], media_id: str) -> None:
+        """发送图片：官方 msgKey=sampleImageMsg，msgParam 里的 photoURL 用 mediaId。"""
+        await self._send_robot(
+            dest,
+            "sampleImageMsg",
+            json.dumps({"photoURL": media_id}, ensure_ascii=False),
+            label="发送钉钉图片",
+        )
+
+    async def send_file(self, dest: Mapping[str, Any], media_id: str, name: str) -> None:
+        """发送文件：官方 msgKey=sampleFile，msgParam 为 mediaId + fileName + fileType。"""
+        suffix = Path(name).suffix.lstrip(".").lower() or "file"
+        await self._send_robot(
+            dest,
+            "sampleFile",
+            json.dumps(
+                {"mediaId": media_id, "fileName": name, "fileType": suffix},
+                ensure_ascii=False,
+            ),
+            label="发送钉钉文件",
+        )
+
+    async def send_media(
+        self, dest: Mapping[str, Any], *, path: str, name: str, mime: str, kind: str
+    ) -> None:
+        """按类型走官方上传 + 发送；调用方必须先按平台上限校验。"""
+        robot_code = str(dest.get("robot_code") or self._default_robot_code or "").strip()
+        media_type = "image" if kind == "image" else "file"
+        media_id = await self.upload_media(
+            path=path,
+            name=name,
+            mime=mime,
+            media_type=media_type,
+            robot_code=robot_code,
+        )
+        if kind == "image":
+            await self.send_image(dest, media_id)
+        else:
+            await self.send_file(dest, media_id, name)
+
+    async def _send_robot(
+        self, dest: Mapping[str, Any], msg_key: str, msg_param: str, *, label: str
+    ) -> None:
+        """复用既有单聊 / 群聊机器人接口，只替换 msgKey / msgParam。"""
         robot_code = str(dest.get("robot_code") or self._default_robot_code).strip()
         if not robot_code:
             raise RuntimeError("钉钉发送缺少 robot_code")
         conversation_id = str(dest.get("conversation_id") or "").strip()
         staff_id = str(dest.get("staff_id") or "").strip()
         conversation_type = str(dest.get("conversation_type") or "").strip()
-        content = (text or "")[:MAX_TEXT_CHARS]
-        msg_param = json.dumps({"content": content}, ensure_ascii=False)
 
         token = await self._access_token()
         headers = {"x-acs-dingtalk-access-token": token}
@@ -157,7 +242,7 @@ class DingTalkBotSender:
                 json={
                     "robotCode": robot_code,
                     "userIds": [staff_id],
-                    "msgKey": "sampleText",
+                    "msgKey": msg_key,
                     "msgParam": msg_param,
                 },
             )
@@ -169,13 +254,13 @@ class DingTalkBotSender:
                 json={
                     "robotCode": robot_code,
                     "openConversationId": conversation_id,
-                    "msgKey": "sampleText",
+                    "msgKey": msg_key,
                     "msgParam": msg_param,
                 },
             )
         else:
             raise RuntimeError("钉钉发送缺少 conversation_id / staff_id")
-        _raise_for_dingtalk(response, "发送钉钉消息")
+        _raise_for_dingtalk(response, label)
 
     @property
     def default_robot_code(self) -> str:
@@ -248,6 +333,15 @@ class DingTalkBotSender:
             self._client = client
             self._owns_client = True
         return client
+
+
+def _read_media(path: str, channel_label: str) -> bytes:
+    """读取出站附件字节；错误信息只带文件名，不回显宿主目录。"""
+    target = Path(path)
+    try:
+        return target.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"读取出站附件失败（{channel_label}）：{target.name}") from exc
 
 
 def _payload(response: httpx.Response, label: str) -> dict[str, Any]:
@@ -573,25 +667,64 @@ class DingTalkBotChannel:
                 sorted(dest),
             )
             return
+        records = attachment_records(draft.attachments)
+        # 上传前先按钉钉官方（保守）上限校验；超限 / 类型不支持时不调用上传接口。
         try:
-            await sender.send_text(dest, draft.body)
+            files = [resolve_attachment(self._container.settings, record) for record in records]
+            for uploaded in files:
+                fresh = attachment_record(uploaded)
+                validate_channel_attachment(
+                    "dingtalk",
+                    name=fresh["name"],
+                    mime=fresh["mime"],
+                    size=fresh["size"],
+                    kind=fresh["kind"],
+                )
+        except ValidationError as exc:
+            await service.mark_failed(draft.id, exc.message)
+            logger.warning(
+                "钉钉出站附件校验失败 draft=%s files=%s reason=%s",
+                draft.id,
+                len(records),
+                exc.message,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - 附件读取失败同样只落 failed
+            await service.mark_failed(draft.id, exc)
+            logger.exception("钉钉出站附件准备失败 draft=%s files=%s", draft.id, len(records))
+            return
+
+        try:
+            if (draft.body or "").strip():
+                await sender.send_text(dest, draft.body)
+            for uploaded in files:
+                fresh = attachment_record(uploaded)
+                await sender.send_media(
+                    dest,
+                    path=uploaded.path,
+                    name=fresh["name"],
+                    mime=fresh["mime"],
+                    kind=fresh["kind"],
+                )
         except Exception as exc:  # noqa: BLE001 - 发送失败只记录，不能拖垮决策接口
             await service.mark_failed(draft.id, exc)
             logger.exception(
-                "钉钉出站发送失败 draft=%s dest_keys=%s hash=%s chars=%s",
+                "钉钉出站发送失败 draft=%s dest_keys=%s hash=%s chars=%s files=%s",
                 draft.id,
                 sorted(dest),
                 draft.body_hash,
                 len(draft.body or ""),
+                len(files),
             )
             return
         await service.mark_sent(draft.id)
         logger.info(
-            "钉钉出站已发送 draft=%s dest_keys=%s hash=%s chars=%s",
+            "钉钉出站已发送 draft=%s dest_keys=%s hash=%s chars=%s files=%s",
             draft.id,
             sorted(dest),
             draft.body_hash,
             len(draft.body or ""),
+            len(files),
         )
 
     async def aclose(self) -> None:
@@ -747,7 +880,12 @@ class DingTalkBotChannel:
                     final.task_id, final.reply_message_id
                 )
                 text = (reply.content or "").strip() if reply is not None else ""
-                if not text:
+                attachments = attachment_records(
+                    reply.payload.get("attachments")
+                    if reply is not None and isinstance(reply.payload, dict)
+                    else None
+                )
+                if not text and not attachments:
                     logger.info("钉钉 turn 回复为空，不生成出站草稿 turn=%s", turn.id)
                     return
 
@@ -755,6 +893,7 @@ class DingTalkBotChannel:
                 draft = await service.create(
                     channel="dingtalk",
                     body=text,
+                    attachments=attachments,
                     dest=dict(dest),
                     bot_id=bot.id,
                     task_id=final.task_id,
@@ -762,12 +901,13 @@ class DingTalkBotChannel:
                     cloud_user_id=getattr(final, "cloud_user_id", None),
                 )
                 logger.info(
-                    "钉钉出站回复已入队 draft=%s turn=%s task=%s hash=%s chars=%s",
+                    "钉钉出站回复已入队 draft=%s turn=%s task=%s hash=%s chars=%s files=%s",
                     draft.id,
                     final.id,
                     final.task_id,
                     draft.body_hash,
                     len(text),
+                    len(attachments),
                 )
                 await self._promote_next_locked(final.task_id)
         except asyncio.CancelledError:
@@ -824,6 +964,7 @@ class DingTalkBotChannel:
         message_id = str(dest.get("message_id") or "").strip()
         bot_id = str(draft.bot_id) if draft.bot_id is not None else ""
         turn_id = str(draft.turn_id) if draft.turn_id is not None else ""
+        records = attachment_records(draft.attachments)
         await raise_approval(
             self._container,
             task_id=draft.task_id,
@@ -831,8 +972,10 @@ class DingTalkBotChannel:
             kind=DINGTALK_OUTBOUND_KIND,
             decision_id=decision_id,
             title="钉钉回复等待你确认",
-            detail=(
-                f"准备发送到钉钉会话 {target}（消息 {message_id}）：\n\n{_excerpt(draft.body)}"
+            detail=render_outbound_detail(
+                f"准备发送到钉钉会话 {target}（消息 {message_id}）：",
+                draft.body,
+                records,
             ),
             meta={
                 "channel": "dingtalk",
@@ -845,15 +988,18 @@ class DingTalkBotChannel:
                 "turn_id": turn_id,
                 "text_hash": draft.body_hash,
                 "chars": len(draft.body or ""),
+                "attachment_count": len(records),
+                "attachments": attachment_meta(records),
             },
             options=outbound_approval_options(CHANNEL_LABEL),
         )
         logger.info(
-            "钉钉出站审批已创建 draft=%s task=%s hash=%s chars=%s",
+            "钉钉出站审批已创建 draft=%s task=%s hash=%s chars=%s files=%s",
             draft.id,
             draft.task_id,
             draft.body_hash,
             len(draft.body or ""),
+            len(records),
         )
 
 
@@ -1033,9 +1179,3 @@ def _parse_uuid(value: str | None) -> uuid.UUID | None:
         return uuid.UUID(raw)
     except ValueError:
         return None
-
-
-def _excerpt(text: str) -> str:
-    if len(text) <= _DETAIL_TEXT_CHARS:
-        return text
-    return text[:_DETAIL_TEXT_CHARS] + "…"

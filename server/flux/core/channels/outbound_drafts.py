@@ -19,6 +19,10 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from flux.config import Settings
+from flux.core.channels.outbound_media import (
+    MAX_OUTBOUND_ATTACHMENTS,
+    normalize_attachment_records,
+)
 from flux.core.user_scope import UNSET, normalize_cloud_user_id, owned_clause, owns
 from flux.enums import OutboundDraftStatus
 from flux.errors import BadRequestError, ConflictError, NotFoundError
@@ -77,23 +81,38 @@ class OutboundDraftService:
         channel: str,
         body: str,
         dest: dict[str, Any] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
         bot_id: uuid.UUID | None = None,
         task_id: uuid.UUID | None = None,
         turn_id: uuid.UUID | None = None,
         decision_id: str | None = None,
         cloud_user_id: str | None = None,
     ) -> OutboundDraft:
-        """新建 pending 草稿；这里只落库，绝不触发发送。"""
+        """新建 pending 草稿；这里只落库，绝不触发发送、也绝不上传平台。
+
+        正文与附件至少要有一个；媒体附件只保存元数据（upload_id 等），文件本体
+        仍在 attachment_store，审批通过后发送端才按 upload_id 还原。
+        """
         normalized_channel = (channel or "").strip()
         if not normalized_channel:
             raise BadRequestError("channel 不能为空", details={"field": "channel"})
+        records = normalize_attachment_records(attachments)
+        if len(attachments or []) > MAX_OUTBOUND_ATTACHMENTS:
+            raise BadRequestError(
+                f"一条出站草稿最多带 {MAX_OUTBOUND_ATTACHMENTS} 个附件",
+                details={"count": len(attachments or []), "limit": MAX_OUTBOUND_ATTACHMENTS},
+            )
+        text = body or ""
+        if not text.strip() and not records:
+            raise BadRequestError("出站草稿必须包含正文或附件", details={"field": "body"})
         now = _utcnow()
         row = OutboundDraft(
             id=uuid.uuid4(),
             channel=normalized_channel,
             status=OutboundDraftStatus.PENDING.value,
-            body=body,
-            body_hash=_hash_body(body),
+            body=text,
+            body_hash=_hash_body(text),
+            attachments=records,
             dest=dict(dest or {}),
             bot_id=bot_id,
             task_id=task_id,
@@ -111,13 +130,15 @@ class OutboundDraftService:
             await session.commit()
             await session.refresh(row)
         logger.info(
-            "outbound_draft.created id=%s channel=%s status=%s hash=%s dest_keys=%s chars=%s",
+            "outbound_draft.created id=%s channel=%s status=%s hash=%s "
+            "dest_keys=%s chars=%s files=%s",
             row.id,
             row.channel,
             row.status,
             row.body_hash,
             sorted(row.dest or {}),
-            len(body or ""),
+            len(text),
+            len(records),
         )
         return row
 

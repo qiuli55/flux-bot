@@ -29,6 +29,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -42,6 +43,14 @@ from flux.core.channels.inbound_media import (
     safe_error,
     save_media,
     transcribe_audio,
+)
+from flux.core.channels.outbound_media import (
+    attachment_meta,
+    attachment_record,
+    attachment_records,
+    render_outbound_detail,
+    resolve_attachment,
+    validate_channel_attachment,
 )
 from flux.core.channels.wecom_crypto import WeComCryptoError, decrypt_message, verify_signature
 from flux.core.event.bus import Events
@@ -71,8 +80,6 @@ WECOM_OUTBOUND_KIND = "wecom_outbound"
 CHANNEL_LABEL = "企业微信"
 #: 企业微信应用消息单条文本上限（官方为 2048 字节，按 UTF-8 字节保守截断）
 MAX_TEXT_BYTES = 2048
-#: 审批卡里展示的草稿摘录上限
-_DETAIL_TEXT_CHARS = 1500
 #: 提升排队草稿时最多重试几次（并发下别的处理器可能先认领同一张卡）
 _MAX_QUEUE_PROMOTIONS = 5
 #: 回调体上限：正常消息远小于此，超限直接拒绝，避免 XML 解析消耗
@@ -173,34 +180,79 @@ class WeComBotSender:
         _install_httpx_redaction()
 
     async def send_text(self, dest: Mapping[str, Any], text: str) -> None:
+        content = _clip_text(text or "", MAX_TEXT_BYTES)
+        await self._send_message(dest, "text", {"content": content}, label="发送企业微信消息")
+
+    async def upload_media(self, *, path: str, name: str, mime: str, media_type: str) -> str:
+        """上传临时素材，返回 media_id（官方 /cgi-bin/media/upload?type=image|file）。
+
+        官方上限：图片 10MB（JPG/PNG），文件 20MB；频道在调用前已按上限校验。
+        """
+        token = await self._access_token()
+        response = await self._request(
+            "POST",
+            "/cgi-bin/media/upload",
+            params={"access_token": token, "type": media_type},
+            files={
+                "media": (name, _read_media(path, "企业微信"), mime or "application/octet-stream")
+            },
+        )
+        data = _payload(response, "上传企业微信媒体")
+        media_id = str(data.get("media_id") or "")
+        if not media_id:
+            raise RuntimeError("上传企业微信媒体失败：响应缺少 media_id")
+        return media_id
+
+    async def send_image(self, dest: Mapping[str, Any], media_id: str) -> None:
+        await self._send_message(dest, "image", {"media_id": media_id}, label="发送企业微信图片")
+
+    async def send_file(self, dest: Mapping[str, Any], media_id: str) -> None:
+        await self._send_message(dest, "file", {"media_id": media_id}, label="发送企业微信文件")
+
+    async def send_media(
+        self, dest: Mapping[str, Any], *, path: str, name: str, mime: str, kind: str
+    ) -> None:
+        """按类型走官方上传 + 发送；调用方必须先按平台上限校验。"""
+        media_type = "image" if kind == "image" else "file"
+        media_id = await self.upload_media(path=path, name=name, mime=mime, media_type=media_type)
+        if kind == "image":
+            await self.send_image(dest, media_id)
+        else:
+            await self.send_file(dest, media_id)
+
+    async def _send_message(
+        self,
+        dest: Mapping[str, Any],
+        msgtype: str,
+        body: dict[str, Any],
+        *,
+        label: str,
+    ) -> None:
+        """按 dest 选择应用消息 / 群聊接口，token 只放查询串（httpx 日志已脱敏）。"""
+        path, payload = self._message_target(dest, msgtype, body)
+        token = await self._access_token()
+        response = await self._request("POST", path, params={"access_token": token}, json=payload)
+        _payload(response, label)
+
+    def _message_target(
+        self, dest: Mapping[str, Any], msgtype: str, body: dict[str, Any]
+    ) -> tuple[str, dict[str, Any]]:
         touser = str(dest.get("touser") or "").strip()
         chatid = str(dest.get("chatid") or "").strip()
         if not touser and not chatid:
             raise RuntimeError("企业微信出站草稿缺少 touser / chatid")
-        content = _clip_text(text or "", MAX_TEXT_BYTES)
-        token = await self._access_token()
         if chatid:
-            path = "/cgi-bin/appchat/send"
-            payload: dict[str, Any] = {
+            return "/cgi-bin/appchat/send", {
                 "chatid": chatid,
-                "msgtype": "text",
-                "text": {"content": content},
+                "msgtype": msgtype,
+                msgtype: body,
             }
-        else:
-            path = "/cgi-bin/message/send"
-            payload = {
-                "touser": touser,
-                "msgtype": "text",
-                "agentid": self._agent_id,
-                "text": {"content": content},
-            }
-        response = await self._request(
-            "POST",
-            path,
-            params={"access_token": token},
-            json=payload,
-        )
-        _payload(response, "发送企业微信消息")
+        return "/cgi-bin/message/send", {
+            "touser": touser,
+            "msgtype": msgtype,
+            "agentid": self._agent_id,
+            msgtype: body,
+        }
 
     async def download_media(self, media_id: str) -> DownloadedMedia:
         """按官方 media/get 下载临时素材（MediaId 有效 3 天）。
@@ -259,6 +311,15 @@ class WeComBotSender:
             self._client = client
             self._owns_client = True
         return client
+
+
+def _read_media(path: str, channel_label: str) -> bytes:
+    """读取出站附件字节；错误信息只带文件名，不回显宿主目录。"""
+    target = Path(path)
+    try:
+        return target.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"读取出站附件失败（{channel_label}）：{target.name}") from exc
 
 
 def _int_or_zero(value: str | int | None) -> int:
@@ -617,25 +678,64 @@ class WeComBotChannel:
                 sorted(dest),
             )
             return
+        records = attachment_records(draft.attachments)
+        # 上传前先按企业微信官方上限校验；超限 / 类型不支持时绝不调用上传接口。
         try:
-            await sender.send_text(dest, draft.body)
+            files = [resolve_attachment(self._container.settings, record) for record in records]
+            for uploaded in files:
+                fresh = attachment_record(uploaded)
+                validate_channel_attachment(
+                    "wecom",
+                    name=fresh["name"],
+                    mime=fresh["mime"],
+                    size=fresh["size"],
+                    kind=fresh["kind"],
+                )
+        except ValidationError as exc:
+            await service.mark_failed(draft.id, exc.message)
+            logger.warning(
+                "企业微信出站附件校验失败 draft=%s files=%s reason=%s",
+                draft.id,
+                len(records),
+                exc.message,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - 附件读取失败同样只落 failed
+            await service.mark_failed(draft.id, exc)
+            logger.exception("企业微信出站附件准备失败 draft=%s files=%s", draft.id, len(records))
+            return
+
+        try:
+            if (draft.body or "").strip():
+                await sender.send_text(dest, draft.body)
+            for uploaded in files:
+                fresh = attachment_record(uploaded)
+                await sender.send_media(
+                    dest,
+                    path=uploaded.path,
+                    name=fresh["name"],
+                    mime=fresh["mime"],
+                    kind=fresh["kind"],
+                )
         except Exception as exc:  # noqa: BLE001 - 发送失败只记录，不能拖垮决策接口
             await service.mark_failed(draft.id, exc)
             logger.exception(
-                "企业微信出站发送失败 draft=%s dest_keys=%s hash=%s chars=%s",
+                "企业微信出站发送失败 draft=%s dest_keys=%s hash=%s chars=%s files=%s",
                 draft.id,
                 sorted(dest),
                 draft.body_hash,
                 len(draft.body or ""),
+                len(files),
             )
             return
         await service.mark_sent(draft.id)
         logger.info(
-            "企业微信出站已发送 draft=%s dest_keys=%s hash=%s chars=%s",
+            "企业微信出站已发送 draft=%s dest_keys=%s hash=%s chars=%s files=%s",
             draft.id,
             sorted(dest),
             draft.body_hash,
             len(draft.body or ""),
+            len(files),
         )
 
     async def aclose(self) -> None:
@@ -737,7 +837,12 @@ class WeComBotChannel:
                     final.task_id, final.reply_message_id
                 )
                 text = (reply.content or "").strip() if reply is not None else ""
-                if not text:
+                attachments = attachment_records(
+                    reply.payload.get("attachments")
+                    if reply is not None and isinstance(reply.payload, dict)
+                    else None
+                )
+                if not text and not attachments:
                     logger.info("企业微信 turn 回复为空，不生成出站草稿 turn=%s", turn.id)
                     return
 
@@ -745,6 +850,7 @@ class WeComBotChannel:
                 draft = await service.create(
                     channel="wecom",
                     body=text,
+                    attachments=attachments,
                     dest={"touser": touser, "message_id": message_id},
                     bot_id=bot.id,
                     task_id=final.task_id,
@@ -752,12 +858,13 @@ class WeComBotChannel:
                     cloud_user_id=getattr(final, "cloud_user_id", None),
                 )
                 logger.info(
-                    "企业微信出站回复已入队 draft=%s turn=%s task=%s hash=%s chars=%s",
+                    "企业微信出站回复已入队 draft=%s turn=%s task=%s hash=%s chars=%s files=%s",
                     draft.id,
                     final.id,
                     final.task_id,
                     draft.body_hash,
                     len(text),
+                    len(attachments),
                 )
                 await self._promote_next_locked(final.task_id)
         except asyncio.CancelledError:
@@ -816,6 +923,7 @@ class WeComBotChannel:
         message_id = str(dest.get("message_id") or "").strip()
         bot_id = str(draft.bot_id) if draft.bot_id is not None else ""
         turn_id = str(draft.turn_id) if draft.turn_id is not None else ""
+        records = attachment_records(draft.attachments)
         await raise_approval(
             self._container,
             task_id=draft.task_id,
@@ -823,8 +931,10 @@ class WeComBotChannel:
             kind=WECOM_OUTBOUND_KIND,
             decision_id=decision_id,
             title="企业微信回复等待你确认",
-            detail=(
-                f"准备发送到企业微信成员 {touser}（消息 {message_id}）：\n\n{_excerpt(draft.body)}"
+            detail=render_outbound_detail(
+                f"准备发送到企业微信成员 {touser}（消息 {message_id}）：",
+                draft.body,
+                records,
             ),
             meta={
                 "channel": "wecom",
@@ -835,15 +945,18 @@ class WeComBotChannel:
                 "turn_id": turn_id,
                 "text_hash": draft.body_hash,
                 "chars": len(draft.body or ""),
+                "attachment_count": len(records),
+                "attachments": attachment_meta(records),
             },
             options=outbound_approval_options(CHANNEL_LABEL),
         )
         logger.info(
-            "企业微信出站审批已创建 draft=%s task=%s hash=%s chars=%s",
+            "企业微信出站审批已创建 draft=%s task=%s hash=%s chars=%s files=%s",
             draft.id,
             draft.task_id,
             draft.body_hash,
             len(draft.body or ""),
+            len(records),
         )
 
 
@@ -929,9 +1042,3 @@ def _clip_text(text: str, max_bytes: int) -> str:
     if len(raw) <= max_bytes:
         return text
     return raw[:max_bytes].decode("utf-8", "ignore")
-
-
-def _excerpt(text: str) -> str:
-    if len(text) <= _DETAIL_TEXT_CHARS:
-        return text
-    return text[:_DETAIL_TEXT_CHARS] + "…"

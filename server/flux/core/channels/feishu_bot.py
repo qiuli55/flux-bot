@@ -27,6 +27,7 @@ import uuid
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
@@ -42,6 +43,14 @@ from flux.core.channels.inbound_media import (
     safe_error,
     save_media,
     transcribe_audio,
+)
+from flux.core.channels.outbound_media import (
+    attachment_meta,
+    attachment_record,
+    attachment_records,
+    render_outbound_detail,
+    resolve_attachment,
+    validate_channel_attachment,
 )
 from flux.core.event.bus import Events
 from flux.core.task_engine.approvals import (
@@ -73,8 +82,6 @@ FEISHU_OUTBOUND_KIND = "feishu_outbound"
 CHANNEL_LABEL = "飞书"
 #: 平台单条文本上限的安全值（与 Supervisor 通道口径一致）
 MAX_TEXT_CHARS = 4000
-#: 审批卡里展示的草稿摘录上限
-_DETAIL_TEXT_CHARS = 1500
 #: 提升排队草稿时最多重试几次（并发下别的处理器可能先认领同一张卡）
 _MAX_QUEUE_PROMOTIONS = 5
 
@@ -146,6 +153,72 @@ class FeishuBotSender:
         )
         _raise_for_feishu(response, "发送飞书消息")
 
+    async def upload_image(self, *, path: str, name: str, mime: str) -> str:
+        """上传图片素材，返回 image_key（官方 /open-apis/im/v1/images，上限 10MB）。"""
+        token = await self._tenant_token()
+        response = await self._request(
+            "POST",
+            "/open-apis/im/v1/images",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"image_type": "message"},
+            files={"image": (name, _read_media(path, "飞书"), mime or "application/octet-stream")},
+        )
+        data = _payload(response, "上传飞书图片")
+        image_key = str((data.get("data") or {}).get("image_key") or "")
+        if not image_key:
+            raise RuntimeError("上传飞书图片失败：响应缺少 image_key")
+        return image_key
+
+    async def upload_file(self, *, path: str, name: str, mime: str) -> str:
+        """上传文件素材，返回 file_key（官方 /open-apis/im/v1/files，上限 30MB）。"""
+        token = await self._tenant_token()
+        response = await self._request(
+            "POST",
+            "/open-apis/im/v1/files",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"file_type": "stream", "file_name": name},
+            files={"file": (name, _read_media(path, "飞书"), mime or "application/octet-stream")},
+        )
+        data = _payload(response, "上传飞书文件")
+        file_key = str((data.get("data") or {}).get("file_key") or "")
+        if not file_key:
+            raise RuntimeError("上传飞书文件失败：响应缺少 file_key")
+        return file_key
+
+    async def send_image(self, chat_id: str, image_key: str) -> None:
+        """发送图片消息（msg_type=image，content 只放 image_key）。"""
+        await self._send_message(chat_id, "image", {"image_key": image_key}, label="发送飞书图片")
+
+    async def send_file(self, chat_id: str, file_key: str) -> None:
+        """发送文件消息（msg_type=file，content 只放 file_key）。"""
+        await self._send_message(chat_id, "file", {"file_key": file_key}, label="发送飞书文件")
+
+    async def send_media(self, chat_id: str, *, path: str, name: str, mime: str, kind: str) -> None:
+        """按类型走官方上传 + 发送；调用方必须先按平台上限校验。"""
+        if kind == "image":
+            image_key = await self.upload_image(path=path, name=name, mime=mime)
+            await self.send_image(chat_id, image_key)
+            return
+        file_key = await self.upload_file(path=path, name=name, mime=mime)
+        await self.send_file(chat_id, file_key)
+
+    async def _send_message(
+        self, chat_id: str, msg_type: str, content: dict[str, Any], *, label: str
+    ) -> None:
+        token = await self._tenant_token()
+        response = await self._request(
+            "POST",
+            "/open-apis/im/v1/messages",
+            params={"receive_id_type": "chat_id"},
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "receive_id": chat_id,
+                "msg_type": msg_type,
+                "content": json.dumps(content, ensure_ascii=False),
+            },
+        )
+        _raise_for_feishu(response, label)
+
     async def download_media(
         self,
         *,
@@ -212,6 +285,15 @@ class FeishuBotSender:
             self._client = client
             self._owns_client = True
         return client
+
+
+def _read_media(path: str, channel_label: str) -> bytes:
+    """读取出站附件字节；错误信息只带文件名，不回显宿主目录。"""
+    target = Path(path)
+    try:
+        return target.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"读取出站附件失败（{channel_label}）：{target.name}") from exc
 
 
 def _payload(response: httpx.Response, label: str) -> dict[str, Any]:
@@ -522,25 +604,64 @@ class FeishuBotChannel:
                 chat_id,
             )
             return
+        records = attachment_records(draft.attachments)
+        # 先把每个附件还原并按平台上限校验：超限 / 类型不支持时绝不调用上传接口。
         try:
-            await sender.send_text(chat_id, draft.body)
+            files = [resolve_attachment(self._container.settings, record) for record in records]
+            for uploaded in files:
+                fresh = attachment_record(uploaded)
+                validate_channel_attachment(
+                    "feishu",
+                    name=fresh["name"],
+                    mime=fresh["mime"],
+                    size=fresh["size"],
+                    kind=fresh["kind"],
+                )
+        except ValidationError as exc:
+            await service.mark_failed(draft.id, exc.message)
+            logger.warning(
+                "飞书出站附件校验失败 draft=%s files=%s reason=%s",
+                draft.id,
+                len(records),
+                exc.message,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - 附件读取失败同样只落 failed
+            await service.mark_failed(draft.id, exc)
+            logger.exception("飞书出站附件准备失败 draft=%s files=%s", draft.id, len(records))
+            return
+
+        try:
+            if (draft.body or "").strip():
+                await sender.send_text(chat_id, draft.body)
+            for uploaded in files:
+                fresh = attachment_record(uploaded)
+                await sender.send_media(
+                    chat_id,
+                    path=uploaded.path,
+                    name=fresh["name"],
+                    mime=fresh["mime"],
+                    kind=fresh["kind"],
+                )
         except Exception as exc:  # noqa: BLE001 - 发送失败只记录，不能拖垮决策接口
             await service.mark_failed(draft.id, exc)
             logger.exception(
-                "飞书出站发送失败 draft=%s chat=%s hash=%s chars=%s",
+                "飞书出站发送失败 draft=%s chat=%s hash=%s chars=%s files=%s",
                 draft.id,
                 chat_id,
                 draft.body_hash,
                 len(draft.body or ""),
+                len(files),
             )
             return
         await service.mark_sent(draft.id)
         logger.info(
-            "飞书出站已发送 draft=%s chat=%s hash=%s chars=%s",
+            "飞书出站已发送 draft=%s chat=%s hash=%s chars=%s files=%s",
             draft.id,
             chat_id,
             draft.body_hash,
             len(draft.body or ""),
+            len(files),
         )
 
     async def aclose(self) -> None:
@@ -667,7 +788,13 @@ class FeishuBotChannel:
                     final.task_id, final.reply_message_id
                 )
                 text = (reply.content or "").strip() if reply is not None else ""
-                if not text:
+                attachments = attachment_records(
+                    reply.payload.get("attachments")
+                    if reply is not None and isinstance(reply.payload, dict)
+                    else None
+                )
+                # 只有附件、没有正文也是合法回复（媒体-only），不能因为 text 为空就丢。
+                if not text and not attachments:
                     logger.info("飞书 turn 回复为空，不生成出站草稿 turn=%s", turn.id)
                     return
 
@@ -675,6 +802,7 @@ class FeishuBotChannel:
                 draft = await service.create(
                     channel="feishu",
                     body=text,
+                    attachments=attachments,
                     dest={"chat_id": chat_id, "message_id": message_id},
                     bot_id=bot.id,
                     task_id=final.task_id,
@@ -682,12 +810,13 @@ class FeishuBotChannel:
                     cloud_user_id=getattr(final, "cloud_user_id", None),
                 )
                 logger.info(
-                    "飞书出站回复已入队 draft=%s turn=%s task=%s hash=%s chars=%s",
+                    "飞书出站回复已入队 draft=%s turn=%s task=%s hash=%s chars=%s files=%s",
                     draft.id,
                     final.id,
                     final.task_id,
                     draft.body_hash,
                     len(text),
+                    len(attachments),
                 )
                 await self._promote_next_locked(final.task_id)
         except asyncio.CancelledError:
@@ -744,6 +873,7 @@ class FeishuBotChannel:
         message_id = str(dest.get("message_id") or "").strip()
         bot_id = str(draft.bot_id) if draft.bot_id is not None else ""
         turn_id = str(draft.turn_id) if draft.turn_id is not None else ""
+        records = attachment_records(draft.attachments)
         await raise_approval(
             self._container,
             task_id=draft.task_id,
@@ -751,8 +881,10 @@ class FeishuBotChannel:
             kind=FEISHU_OUTBOUND_KIND,
             decision_id=decision_id,
             title="飞书回复等待你确认",
-            detail=(
-                f"准备发送到飞书会话 {chat_id}（消息 {message_id}）：\n\n{_excerpt(draft.body)}"
+            detail=render_outbound_detail(
+                f"准备发送到飞书会话 {chat_id}（消息 {message_id}）：",
+                draft.body,
+                records,
             ),
             meta={
                 "channel": "feishu",
@@ -763,15 +895,18 @@ class FeishuBotChannel:
                 "turn_id": turn_id,
                 "text_hash": draft.body_hash,
                 "chars": len(draft.body or ""),
+                "attachment_count": len(records),
+                "attachments": attachment_meta(records),
             },
             options=outbound_approval_options(CHANNEL_LABEL),
         )
         logger.info(
-            "飞书出站审批已创建 draft=%s task=%s hash=%s chars=%s",
+            "飞书出站审批已创建 draft=%s task=%s hash=%s chars=%s files=%s",
             draft.id,
             draft.task_id,
             draft.body_hash,
             len(draft.body or ""),
+            len(records),
         )
 
 
@@ -791,12 +926,6 @@ def _parse_uuid(value: str | None) -> uuid.UUID | None:
         return uuid.UUID(raw)
     except ValueError:
         return None
-
-
-def _excerpt(text: str) -> str:
-    if len(text) <= _DETAIL_TEXT_CHARS:
-        return text
-    return text[:_DETAIL_TEXT_CHARS] + "…"
 
 
 def _parse_message(payload: dict[str, Any]) -> _InboundMessage | FeishuCallbackResult:

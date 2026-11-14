@@ -11,8 +11,35 @@ from typing import Any
 
 from flux.connectors.base import Connector, ConnectorManifest
 from flux.core.agent_runtime.adapters.base import CliAgentProbe
+from flux.core.task_engine.assistant import AssistantTurn
 from flux.enums import AgentInstallStatus, Capability
 from flux.errors import PermissionDeniedError
+
+
+class AttachingAssistant:
+    """模拟 Bot 在轮次里调用 attach_file 登记附件；回复正文默认空（媒体-only）。"""
+
+    def __init__(self, *, path: str | None = None, upload_id: str | None = None, reply: str = ""):
+        self.path = path
+        self.upload_id = upload_id
+        self.reply = reply
+        self.attached: list[dict[str, Any]] = []
+
+    async def respond(self, **kwargs: Any) -> AssistantTurn:
+        runner = kwargs.get("tool_runner")
+        assert runner is not None, "Bot 轮次必须拿到工具执行器"
+        arguments: dict[str, Any] = {}
+        if self.path is not None:
+            arguments["path"] = self.path
+        if self.upload_id is not None:
+            arguments["upload_id"] = self.upload_id
+        self.attached.append(await runner("attach_file", arguments))
+        return AssistantTurn(
+            reply=self.reply,
+            provider="fake",
+            model="fake-model",
+            usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
 
 
 class FakeTerminalConnector(Connector):

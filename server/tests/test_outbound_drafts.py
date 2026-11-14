@@ -20,7 +20,7 @@ from flux.container import Container
 from flux.core.channels.outbound_drafts import OutboundDraftService
 from flux.core.task_engine.approvals import raise_approval
 from flux.db.session import create_engine, create_session_factory
-from flux.errors import ConflictError, NotFoundError
+from flux.errors import BadRequestError, ConflictError, NotFoundError
 
 PREFIX = "/api/v1"
 
@@ -98,6 +98,66 @@ def test_create_pending_draft_never_sends(settings: Settings, db_schema: None) -
             # 只是落库，没有任何发送痕迹
             pending = await service.list(channel="feishu", status="pending")
             assert [row.id for row in pending] == [draft.id]
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_media_draft_persists_metadata_without_sending(settings: Settings, db_schema: None) -> None:
+    """媒体草稿只落元数据（upload_id 等），正文可以为空，且不会触发任何发送。"""
+
+    async def scenario() -> None:
+        engine, service = _service(settings)
+        try:
+            draft = await service.create(
+                channel="feishu",
+                body="",
+                dest={"chat_id": "oc_media"},
+                attachments=[
+                    {
+                        "upload_id": "upload123",
+                        "name": "chart.png",
+                        "mime": "image/png",
+                        "size": 2048,
+                        "kind": "image",
+                    }
+                ],
+            )
+            assert draft.status == "pending"
+            assert draft.body == ""
+            assert draft.body_hash == hashlib.sha256(b"").hexdigest()
+            assert draft.attachments == [
+                {
+                    "upload_id": "upload123",
+                    "name": "chart.png",
+                    "mime": "image/png",
+                    "size": 2048,
+                    "kind": "image",
+                }
+            ]
+            # 只是落库：没有 sent_at / resolved_at，也没有被认领
+            assert draft.sent_at is None
+            assert draft.resolved_at is None
+            assert await service.claim(draft.id) is not None  # 审批通过后才认领
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_create_rejects_draft_without_text_or_attachments(
+    settings: Settings, db_schema: None
+) -> None:
+    async def scenario() -> None:
+        engine, service = _service(settings)
+        try:
+            with pytest.raises(BadRequestError):
+                await service.create(channel="feishu", body="", dest={"chat_id": "oc"})
+            with pytest.raises(BadRequestError):
+                await service.create(
+                    channel="feishu", body="   ", dest={"chat_id": "oc"}, attachments=[]
+                )
         finally:
             await engine.dispose()
 

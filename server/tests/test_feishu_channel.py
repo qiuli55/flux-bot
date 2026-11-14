@@ -42,6 +42,7 @@ from flux.core.channels.inbound_media import (
 )
 from flux.core.task_engine.assistant import AssistantTurn
 from flux.main import create_app
+from tests.fakes import AttachingAssistant
 
 VERIFY_TOKEN = "verify-token-for-feishu-tests"
 ENCRYPT_KEY = "encrypt-key-for-feishu-tests"
@@ -150,9 +151,23 @@ class _FakeSender:
         self.name = name
         self.parts = parts
         self.downloads: list[dict[str, Any]] = []
+        self.media: list[dict[str, Any]] = []
 
     async def send_text(self, chat_id: str, text: str) -> None:
         self.messages.append((chat_id, text))
+        if self.error is not None:
+            raise self.error
+
+    async def send_media(self, chat_id: str, *, path: str, name: str, mime: str, kind: str) -> None:
+        self.media.append(
+            {
+                "target": chat_id,
+                "name": name,
+                "mime": mime,
+                "kind": kind,
+                "bytes": Path(path).read_bytes(),
+            }
+        )
         if self.error is not None:
             raise self.error
 
@@ -1014,5 +1029,238 @@ def test_feishu_sender_surfaces_json_error_instead_of_saving_it() -> None:
                 await sender.download_media(message_id="om", file_key="bad")
             assert "resource not found" in str(excinfo.value)
             await sender.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_feishu_sender_uploads_then_sends_image_and_file(tmp_path: Path) -> None:
+    """官方链路：images/files 上传拿 key，再用 msg_type=image/file 发到同一 chat。"""
+    image = tmp_path / "chart.png"
+    image.write_bytes(b"\x89PNG fake")
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"%PDF-1.4 fake")
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/tenant_access_token/internal"):
+            return httpx.Response(
+                200, json={"code": 0, "tenant_access_token": "t-token", "expire": 7200}
+            )
+        if request.url.path.endswith("/im/v1/images"):
+            return httpx.Response(200, json={"code": 0, "data": {"image_key": "img_key"}})
+        if request.url.path.endswith("/im/v1/files"):
+            return httpx.Response(200, json={"code": 0, "data": {"file_key": "file_key"}})
+        return httpx.Response(200, json={"code": 0, "data": {"message_id": "om_sent"}})
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            sender = FeishuBotSender(app_id="app", app_secret="secret", client=http_client)
+            await sender.send_media(
+                CHAT_ID,
+                path=str(image),
+                name="chart.png",
+                mime="image/png",
+                kind="image",
+            )
+            await sender.send_media(
+                CHAT_ID,
+                path=str(document),
+                name="report.pdf",
+                mime="application/pdf",
+                kind="file",
+            )
+            await sender.aclose()
+
+    asyncio.run(scenario())
+
+    assert [request.url.path for request in requests] == [
+        "/open-apis/auth/v3/tenant_access_token/internal",
+        "/open-apis/im/v1/images",
+        "/open-apis/im/v1/messages",
+        "/open-apis/im/v1/files",
+        "/open-apis/im/v1/messages",
+    ]
+    image_upload, image_send, file_upload, file_send = requests[1:]
+    assert image_upload.headers["Authorization"] == "Bearer t-token"
+    assert b'name="image_type"' in image_upload.content
+    assert b"message" in image_upload.content
+    assert b'name="image"' in image_upload.content
+    assert b"chart.png" in image_upload.content
+
+    assert image_send.url.params["receive_id_type"] == "chat_id"
+    assert image_send.headers["Authorization"] == "Bearer t-token"
+    assert json.loads(image_send.content)["msg_type"] == "image"
+    assert json.loads(json.loads(image_send.content)["content"]) == {"image_key": "img_key"}
+
+    assert b'name="file_type"' in file_upload.content
+    assert b"stream" in file_upload.content
+    assert b'name="file_name"' in file_upload.content
+    assert b"report.pdf" in file_upload.content
+    assert json.loads(file_send.content)["msg_type"] == "file"
+    assert json.loads(json.loads(file_send.content)["content"]) == {"file_key": "file_key"}
+
+
+def _use_workspace(container: Container, workspace: Path) -> Path:
+    """把 Bot 工作区指到临时目录（默认 runtime_home 在测试机上不可写）。"""
+    workspace.mkdir(parents=True, exist_ok=True)
+    container.bots.workspace_path = lambda _bot: workspace  # type: ignore[method-assign]
+    return workspace
+
+
+def test_media_only_reply_queues_attachment_then_sends_after_allow(
+    settings: Settings, db_schema: None, tmp_path: Path
+) -> None:
+    """空正文 + 一张图片：先生成待审批草稿，允许后上传并发送。"""
+    with _callback_client(settings) as (client, container, context):
+        payload = b"\x89PNG fake image"
+        workspace = _use_workspace(container, tmp_path / "workspace")
+        (workspace / "chart.png").write_bytes(payload)
+        container.assistant = AttachingAssistant(path="chart.png", reply="")  # type: ignore[assignment]
+
+        assert client.post(WEBHOOK, json=_plain_body()).status_code == 200
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        pending = _wait_pending_decision(client, bot["chat_task_id"])
+
+        assert pending["kind"] == FEISHU_OUTBOUND_KIND
+        assert pending["meta"]["attachment_count"] == 1
+        attachment = pending["meta"]["attachments"][0]
+        assert attachment["name"] == "chart.png"
+        assert attachment["kind"] == "image"
+        assert attachment["mime"] == "image/png"
+        assert attachment["size"] == len(payload)
+        assert attachment["size_label"]
+        assert "chart.png" in pending["context"]
+        assert "image/png" in pending["context"]
+        assert [option["label"] for option in pending["options"]] == ["允许", "拒绝"]
+
+        # 审批前：不上传、不发送，草稿保留附件元数据且正文为空。
+        assert context["sender"].messages == []
+        assert context["sender"].media == []
+        draft = client.get(f"{PREFIX}/outbound-drafts/{pending['meta']['draft_id']}").json()["data"]
+        assert draft["status"] == "pending"
+        assert draft["body"] == ""
+        assert draft["attachments"][0]["name"] == "chart.png"
+        assert "path" not in draft["attachments"][0]
+
+        allowed = client.post(
+            f"{PREFIX}/tasks/{bot['chat_task_id']}/decisions/choose",
+            json={"decision_id": pending["id"], "action": "choose", "option": "允许"},
+        )
+        assert allowed.status_code == 200, allowed.text
+        assert context["sender"].messages == []
+        assert len(context["sender"].media) == 1
+        media = context["sender"].media[0]
+        assert media["target"] == CHAT_ID
+        assert media["name"] == "chart.png"
+        assert media["kind"] == "image"
+        assert media["bytes"] == payload
+        assert (
+            client.get(f"{PREFIX}/outbound-drafts/{draft['id']}").json()["data"]["status"] == "sent"
+        )
+
+
+def test_media_reply_denied_never_uploads_or_sends(
+    settings: Settings, db_schema: None, tmp_path: Path
+) -> None:
+    with _callback_client(settings) as (client, container, context):
+        workspace = _use_workspace(container, tmp_path / "workspace")
+        (workspace / "chart.png").write_bytes(b"png")
+        container.assistant = AttachingAssistant(path="chart.png", reply="")  # type: ignore[assignment]
+        assert client.post(WEBHOOK, json=_plain_body()).status_code == 200
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        pending = _wait_pending_decision(client, bot["chat_task_id"])
+
+        denied = client.post(
+            f"{PREFIX}/tasks/{bot['chat_task_id']}/decisions/choose",
+            json={"decision_id": pending["id"], "action": "choose", "option": "拒绝"},
+        )
+        assert denied.status_code == 200, denied.text
+        assert context["sender"].messages == []
+        assert context["sender"].media == []
+        draft = client.get(f"{PREFIX}/outbound-drafts/{pending['meta']['draft_id']}").json()["data"]
+        assert draft["status"] == "denied"
+        assert draft["attachments"][0]["name"] == "chart.png"
+
+
+def test_media_draft_survives_restart_and_sends(
+    settings: Settings, db_schema: None, tmp_path: Path
+) -> None:
+    """重启后附件元数据仍在，文件仍在 attachment_store，允许后可以发送。"""
+    payload = b"\x89PNG restart"
+    with _callback_client(settings) as (client, container, context):
+        workspace = _use_workspace(container, tmp_path / "workspace")
+        (workspace / "chart.png").write_bytes(payload)
+        container.assistant = AttachingAssistant(path="chart.png", reply="")  # type: ignore[assignment]
+        assert client.post(WEBHOOK, json=_plain_body()).status_code == 200
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        pending = _wait_pending_decision(client, bot["chat_task_id"])
+        draft_id = pending["meta"]["draft_id"]
+        task_id = bot["chat_task_id"]
+        assert context["sender"].media == []
+
+    with _app(settings, feishu_verification_token=VERIFY_TOKEN) as (client, container):
+        container.feishu_bot._bot_id = uuid.UUID(context["bot"]["id"])  # noqa: SLF001
+        sender = _FakeSender()
+        container.feishu_bot._sender = sender  # noqa: SLF001
+
+        reloaded = client.get(f"{PREFIX}/outbound-drafts/{draft_id}").json()["data"]
+        assert reloaded["status"] == "pending"
+        assert reloaded["body"] == ""
+        assert reloaded["attachments"][0]["name"] == "chart.png"
+
+        allowed = client.post(
+            f"{PREFIX}/tasks/{task_id}/decisions/choose",
+            json={"decision_id": pending["id"], "action": "choose", "option": "允许"},
+        )
+        assert allowed.status_code == 200, allowed.text
+        assert len(sender.media) == 1
+        assert sender.media[0]["bytes"] == payload
+        assert client.get(f"{PREFIX}/outbound-drafts/{draft_id}").json()["data"]["status"] == "sent"
+
+
+def test_timeout_and_cancel_never_upload_media(settings: Settings, db_schema: None) -> None:
+    """审批超时 / 草稿取消都只改状态：不调用上传，也不调用发送。"""
+    attachment = {
+        "upload_id": "upload123",
+        "name": "chart.png",
+        "mime": "image/png",
+        "size": 10,
+        "kind": "image",
+    }
+
+    async def scenario() -> None:
+        container = Container(settings)
+        try:
+            sender = _FakeSender()
+            channel = FeishuBotChannel(container, sender=sender)  # type: ignore[arg-type]
+            timed_out = await container.outbound_drafts.create(
+                channel="feishu",
+                body="",
+                attachments=[attachment],
+                dest={"chat_id": CHAT_ID, "message_id": MESSAGE_ID},
+            )
+            await channel._apply_outbound_result(  # noqa: SLF001 - 直接验证超时分支
+                {
+                    "result": "timeout",
+                    "chosen": None,
+                    "meta": {"draft_id": str(timed_out.id)},
+                }
+            )
+            assert (await container.outbound_drafts.get(timed_out.id)).status == "denied"
+
+            cancelled = await container.outbound_drafts.create(
+                channel="feishu",
+                body="",
+                attachments=[attachment],
+                dest={"chat_id": CHAT_ID, "message_id": MESSAGE_ID},
+            )
+            await container.outbound_drafts.cancel(cancelled.id)
+            assert (await container.outbound_drafts.get(cancelled.id)).status == "cancelled"
+            assert sender.messages == []
+            assert sender.media == []
+        finally:
+            await container.dispose()
 
     asyncio.run(scenario())
