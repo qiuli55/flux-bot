@@ -43,6 +43,14 @@ from flux.core.channels.inbound_media import (
     save_media,
     transcribe_audio,
 )
+from flux.core.channels.outbound_media import (
+    attachment_meta,
+    attachment_record,
+    attachment_records,
+    render_outbound_detail,
+    resolve_attachment,
+    validate_channel_attachment,
+)
 from flux.core.event.bus import Events
 from flux.core.task_engine.approvals import (
     APPROVAL_ALLOW,
@@ -78,8 +86,6 @@ DINGTALK_OUTBOUND_KIND = "dingtalk_outbound"
 CHANNEL_LABEL = "钉钉"
 #: 平台单条文本上限的安全值
 MAX_TEXT_CHARS = 4000
-#: 审批卡里展示的草稿摘录上限
-_DETAIL_TEXT_CHARS = 1500
 #: 提升排队草稿时最多重试几次（并发下别的处理器可能先认领同一张卡）
 _MAX_QUEUE_PROMOTIONS = 5
 #: 官方 OpenAPI 基址
@@ -661,25 +667,64 @@ class DingTalkBotChannel:
                 sorted(dest),
             )
             return
+        records = attachment_records(draft.attachments)
+        # 上传前先按钉钉官方（保守）上限校验；超限 / 类型不支持时不调用上传接口。
         try:
-            await sender.send_text(dest, draft.body)
+            files = [resolve_attachment(self._container.settings, record) for record in records]
+            for uploaded in files:
+                fresh = attachment_record(uploaded)
+                validate_channel_attachment(
+                    "dingtalk",
+                    name=fresh["name"],
+                    mime=fresh["mime"],
+                    size=fresh["size"],
+                    kind=fresh["kind"],
+                )
+        except ValidationError as exc:
+            await service.mark_failed(draft.id, exc.message)
+            logger.warning(
+                "钉钉出站附件校验失败 draft=%s files=%s reason=%s",
+                draft.id,
+                len(records),
+                exc.message,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - 附件读取失败同样只落 failed
+            await service.mark_failed(draft.id, exc)
+            logger.exception("钉钉出站附件准备失败 draft=%s files=%s", draft.id, len(records))
+            return
+
+        try:
+            if (draft.body or "").strip():
+                await sender.send_text(dest, draft.body)
+            for uploaded in files:
+                fresh = attachment_record(uploaded)
+                await sender.send_media(
+                    dest,
+                    path=uploaded.path,
+                    name=fresh["name"],
+                    mime=fresh["mime"],
+                    kind=fresh["kind"],
+                )
         except Exception as exc:  # noqa: BLE001 - 发送失败只记录，不能拖垮决策接口
             await service.mark_failed(draft.id, exc)
             logger.exception(
-                "钉钉出站发送失败 draft=%s dest_keys=%s hash=%s chars=%s",
+                "钉钉出站发送失败 draft=%s dest_keys=%s hash=%s chars=%s files=%s",
                 draft.id,
                 sorted(dest),
                 draft.body_hash,
                 len(draft.body or ""),
+                len(files),
             )
             return
         await service.mark_sent(draft.id)
         logger.info(
-            "钉钉出站已发送 draft=%s dest_keys=%s hash=%s chars=%s",
+            "钉钉出站已发送 draft=%s dest_keys=%s hash=%s chars=%s files=%s",
             draft.id,
             sorted(dest),
             draft.body_hash,
             len(draft.body or ""),
+            len(files),
         )
 
     async def aclose(self) -> None:
@@ -835,7 +880,12 @@ class DingTalkBotChannel:
                     final.task_id, final.reply_message_id
                 )
                 text = (reply.content or "").strip() if reply is not None else ""
-                if not text:
+                attachments = attachment_records(
+                    reply.payload.get("attachments")
+                    if reply is not None and isinstance(reply.payload, dict)
+                    else None
+                )
+                if not text and not attachments:
                     logger.info("钉钉 turn 回复为空，不生成出站草稿 turn=%s", turn.id)
                     return
 
@@ -843,6 +893,7 @@ class DingTalkBotChannel:
                 draft = await service.create(
                     channel="dingtalk",
                     body=text,
+                    attachments=attachments,
                     dest=dict(dest),
                     bot_id=bot.id,
                     task_id=final.task_id,
@@ -850,12 +901,13 @@ class DingTalkBotChannel:
                     cloud_user_id=getattr(final, "cloud_user_id", None),
                 )
                 logger.info(
-                    "钉钉出站回复已入队 draft=%s turn=%s task=%s hash=%s chars=%s",
+                    "钉钉出站回复已入队 draft=%s turn=%s task=%s hash=%s chars=%s files=%s",
                     draft.id,
                     final.id,
                     final.task_id,
                     draft.body_hash,
                     len(text),
+                    len(attachments),
                 )
                 await self._promote_next_locked(final.task_id)
         except asyncio.CancelledError:
@@ -912,6 +964,7 @@ class DingTalkBotChannel:
         message_id = str(dest.get("message_id") or "").strip()
         bot_id = str(draft.bot_id) if draft.bot_id is not None else ""
         turn_id = str(draft.turn_id) if draft.turn_id is not None else ""
+        records = attachment_records(draft.attachments)
         await raise_approval(
             self._container,
             task_id=draft.task_id,
@@ -919,8 +972,10 @@ class DingTalkBotChannel:
             kind=DINGTALK_OUTBOUND_KIND,
             decision_id=decision_id,
             title="钉钉回复等待你确认",
-            detail=(
-                f"准备发送到钉钉会话 {target}（消息 {message_id}）：\n\n{_excerpt(draft.body)}"
+            detail=render_outbound_detail(
+                f"准备发送到钉钉会话 {target}（消息 {message_id}）：",
+                draft.body,
+                records,
             ),
             meta={
                 "channel": "dingtalk",
@@ -933,15 +988,18 @@ class DingTalkBotChannel:
                 "turn_id": turn_id,
                 "text_hash": draft.body_hash,
                 "chars": len(draft.body or ""),
+                "attachment_count": len(records),
+                "attachments": attachment_meta(records),
             },
             options=outbound_approval_options(CHANNEL_LABEL),
         )
         logger.info(
-            "钉钉出站审批已创建 draft=%s task=%s hash=%s chars=%s",
+            "钉钉出站审批已创建 draft=%s task=%s hash=%s chars=%s files=%s",
             draft.id,
             draft.task_id,
             draft.body_hash,
             len(draft.body or ""),
+            len(records),
         )
 
 
@@ -1121,9 +1179,3 @@ def _parse_uuid(value: str | None) -> uuid.UUID | None:
         return uuid.UUID(raw)
     except ValueError:
         return None
-
-
-def _excerpt(text: str) -> str:
-    if len(text) <= _DETAIL_TEXT_CHARS:
-        return text
-    return text[:_DETAIL_TEXT_CHARS] + "…"

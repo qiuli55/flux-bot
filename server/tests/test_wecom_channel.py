@@ -45,6 +45,7 @@ from flux.core.channels.wecom_crypto import (
 )
 from flux.core.task_engine.assistant import AssistantTurn
 from flux.main import create_app
+from tests.fakes import AttachingAssistant
 
 TOKEN = "wecom-token-for-tests"
 CORP_ID = "ww_test_corp"
@@ -159,9 +160,25 @@ class _FakeSender:
         self.name = name
         self.parts = parts
         self.downloads: list[str] = []
+        self.media: list[dict[str, Any]] = []
 
     async def send_text(self, dest: dict[str, Any], text: str) -> None:
         self.messages.append((dest, text))
+        if self.error is not None:
+            raise self.error
+
+    async def send_media(
+        self, dest: dict[str, Any], *, path: str, name: str, mime: str, kind: str
+    ) -> None:
+        self.media.append(
+            {
+                "target": dict(dest),
+                "name": name,
+                "mime": mime,
+                "kind": kind,
+                "bytes": Path(path).read_bytes(),
+            }
+        )
         if self.error is not None:
             raise self.error
 
@@ -1243,3 +1260,103 @@ def test_wecom_sender_uploads_then_sends_image_and_file(tmp_path: Path) -> None:
         "msgtype": "file",
         "file": {"media_id": "media-file"},
     }
+
+
+def _use_workspace(container: Container, workspace: Path) -> Path:
+    workspace.mkdir(parents=True, exist_ok=True)
+    container.bots.workspace_path = lambda _bot: workspace  # type: ignore[method-assign]
+    return workspace
+
+
+def test_media_only_reply_queues_attachment_then_sends_after_allow(
+    settings: Settings, db_schema: None, tmp_path: Path
+) -> None:
+    with _callback_client(settings) as (client, container, context):
+        payload = b"\x89PNG wecom"
+        workspace = _use_workspace(container, tmp_path / "workspace")
+        (workspace / "chart.png").write_bytes(payload)
+        container.assistant = AttachingAssistant(path="chart.png", reply="")  # type: ignore[assignment]
+
+        assert _post_callback(client).status_code == 200
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        pending = _wait_pending_decision(client, bot["chat_task_id"])
+
+        assert pending["kind"] == WECOM_OUTBOUND_KIND
+        attachment = pending["meta"]["attachments"][0]
+        assert attachment["name"] == "chart.png"
+        assert attachment["kind"] == "image"
+        assert attachment["size"] == len(payload)
+        assert "chart.png" in pending["context"]
+        assert "image/png" in pending["context"]
+        # 审批前不上传、不发送。
+        assert context["sender"].messages == []
+        assert context["sender"].media == []
+
+        draft = client.get(f"{PREFIX}/outbound-drafts/{pending['meta']['draft_id']}").json()["data"]
+        assert draft["body"] == ""
+        assert draft["attachments"][0]["name"] == "chart.png"
+
+        allowed = client.post(
+            f"{PREFIX}/tasks/{bot['chat_task_id']}/decisions/choose",
+            json={"decision_id": pending["id"], "action": "choose", "option": "允许"},
+        )
+        assert allowed.status_code == 200, allowed.text
+        assert context["sender"].messages == []
+        assert len(context["sender"].media) == 1
+        assert context["sender"].media[0]["bytes"] == payload
+        assert context["sender"].media[0]["kind"] == "image"
+        assert (
+            client.get(f"{PREFIX}/outbound-drafts/{draft['id']}").json()["data"]["status"] == "sent"
+        )
+
+
+def test_media_reply_denied_never_uploads_or_sends(
+    settings: Settings, db_schema: None, tmp_path: Path
+) -> None:
+    with _callback_client(settings) as (client, container, context):
+        workspace = _use_workspace(container, tmp_path / "workspace")
+        (workspace / "chart.png").write_bytes(b"png")
+        container.assistant = AttachingAssistant(path="chart.png", reply="")  # type: ignore[assignment]
+        assert _post_callback(client).status_code == 200
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        pending = _wait_pending_decision(client, bot["chat_task_id"])
+
+        denied = client.post(
+            f"{PREFIX}/tasks/{bot['chat_task_id']}/decisions/choose",
+            json={"decision_id": pending["id"], "action": "choose", "option": "拒绝"},
+        )
+        assert denied.status_code == 200, denied.text
+        assert context["sender"].messages == []
+        assert context["sender"].media == []
+        assert (
+            client.get(f"{PREFIX}/outbound-drafts/{pending['meta']['draft_id']}").json()["data"][
+                "status"
+            ]
+            == "denied"
+        )
+
+
+def test_image_over_wecom_limit_fails_before_upload(
+    settings: Settings, db_schema: None, tmp_path: Path
+) -> None:
+    with _callback_client(settings) as (client, container, context):
+        workspace = _use_workspace(container, tmp_path / "workspace")
+        (workspace / "huge.png").write_bytes(b"x" * (10 * 1024 * 1024 + 1))
+        container.assistant = AttachingAssistant(path="huge.png", reply="")  # type: ignore[assignment]
+        assert _post_callback(client).status_code == 200
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        pending = _wait_pending_decision(client, bot["chat_task_id"])
+
+        allowed = client.post(
+            f"{PREFIX}/tasks/{bot['chat_task_id']}/decisions/choose",
+            json={"decision_id": pending["id"], "action": "choose", "option": "允许"},
+        )
+        assert allowed.status_code == 200, allowed.text
+        # 超限：绝不调用平台上传，草稿落 failed 且错误是中文。
+        assert context["sender"].media == []
+        assert context["sender"].messages == []
+        failed = client.get(f"{PREFIX}/outbound-drafts/{pending['meta']['draft_id']}").json()[
+            "data"
+        ]
+        assert failed["status"] == "failed"
+        assert "超过企业微信出站上限 10MB" in failed["error"]

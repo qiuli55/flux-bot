@@ -21,6 +21,12 @@ from typing import TYPE_CHECKING, Any
 from flux.core.attachment_store import UploadedFile, size_label
 from flux.core.bot.subtasks import SUBTASK_TOOLS, run_subtask_tool
 from flux.core.bot.turn_repository import TERMINAL_TURN_STATUSES, BotTurnRepository
+from flux.core.channels.outbound_media import (
+    ATTACH_FILE_TOOL_NAME,
+    ATTACH_FILE_TOOLS,
+    attachment_reply_payload,
+    run_attach_file_tool,
+)
 from flux.core.context.budget import history_message_limit
 from flux.core.github.service import normalize_account_key
 from flux.core.github.tools import GITHUB_TOOLS, run_github_tool
@@ -523,6 +529,8 @@ class BotConversationService:
                 }
             )
         tool_kwargs = dict(github_kwargs)
+        #: 本轮 Bot 通过 attach_file 登记的出站附件；只随回复消息落库，不直接发送。
+        outbound_files: list[UploadedFile] = []
         if subtask_bot is not None:
             # 子任务 / 例程工具只给 Bot 对话轮次：长活派到后台后，用户还能继续聊；
             # 结果会以 kind=subtask 消息回到当前对话，不需要本轮阻塞等待。
@@ -551,6 +559,10 @@ class BotConversationService:
             existing_runner = tool_kwargs.get("tool_runner")
 
             async def _run_bot_tool(name: str, arguments: dict[str, Any]) -> Any:
+                if name == ATTACH_FILE_TOOL_NAME:
+                    return await run_attach_file_tool(
+                        container, subtask_bot, arguments, outbound_files
+                    )
                 if name.startswith("subtask_"):
                     return await _run_subtask(name, arguments)
                 if name.startswith("routine_"):
@@ -563,6 +575,7 @@ class BotConversationService:
                 *tool_kwargs.get("tools", []),
                 *SUBTASK_TOOLS,
                 *ROUTINE_TOOLS,
+                *ATTACH_FILE_TOOLS,
             ]
             tool_kwargs["tool_runner"] = _run_bot_tool
             subtask_note = (
@@ -581,8 +594,15 @@ class BotConversationService:
                 "ISO 8601 时刻，二者都按 Bot 自己的时区解释且不能同时使用；"
                 "只跑一次的用 run_at，不要写成 cron。"
             )
+            attach_note = (
+                "需要把图片或文件发给用户时，调用 attach_file 登记出站附件：path 必须是 "
+                "Bot 工作区内的文件，或提供已上传附件的 upload_id。attach_file 只登记、"
+                "不发送；真正发送要等用户在出站审批卡上选择允许。"
+            )
             existing_note = str(tool_kwargs.get("tools_note") or "").strip()
-            notes = [note for note in (existing_note, subtask_note, routine_note) if note]
+            notes = [
+                note for note in (existing_note, subtask_note, routine_note, attach_note) if note
+            ]
             tool_kwargs["tools_note"] = "\n".join(notes)
         try:
             # 任务选了自己的模型时，这一轮对话也用它回答（与后续 Agent 执行同一通道）
@@ -609,6 +629,11 @@ class BotConversationService:
             )
             raise
 
+        reply_payload = assistant_turn.payload()
+        if outbound_files:
+            # 出站附件只记录元数据（upload_id / 文件名 / mime / 大小）；
+            # _track_turn 从这条回复消息生成待审批草稿，附件本体仍在 attachment_store。
+            reply_payload["attachments"] = attachment_reply_payload(outbound_files)
         reply = (
             await container.task_repo.add_messages(
                 task.id,
@@ -618,7 +643,7 @@ class BotConversationService:
                         # 需要用户填密钥时，气泡本身就是那张安全输入卡（正文仍是回复文案）
                         kind="secure_input" if assistant_turn.secure_input else "text",
                         content=assistant_turn.reply,
-                        payload=assistant_turn.payload(),
+                        payload=reply_payload,
                     )
                 ],
             )

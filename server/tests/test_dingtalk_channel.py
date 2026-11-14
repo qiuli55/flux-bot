@@ -45,6 +45,7 @@ from flux.core.channels.inbound_media import (
 )
 from flux.core.task_engine.assistant import AssistantTurn
 from flux.main import create_app
+from tests.fakes import AttachingAssistant
 
 TOKEN = "dingtalk-token-for-tests"
 #: 43 位 EncodingAESKey（合法 base64 字母表，解码后 32 字节）
@@ -158,9 +159,25 @@ class _FakeSender:
         self.name = name
         self.parts = parts
         self.downloads: list[dict[str, Any]] = []
+        self.media: list[dict[str, Any]] = []
 
     async def send_text(self, dest: dict[str, Any], text: str) -> None:
         self.messages.append((dict(dest), text))
+        if self.error is not None:
+            raise self.error
+
+    async def send_media(
+        self, dest: dict[str, Any], *, path: str, name: str, mime: str, kind: str
+    ) -> None:
+        self.media.append(
+            {
+                "target": dict(dest),
+                "name": name,
+                "mime": mime,
+                "kind": kind,
+                "bytes": Path(path).read_bytes(),
+            }
+        )
         if self.error is not None:
             raise self.error
 
@@ -1378,3 +1395,83 @@ def test_dingtalk_sender_uploads_then_sends_image_and_file(tmp_path: Path) -> No
         "fileName": "report.pdf",
         "fileType": "pdf",
     }
+
+
+def _use_workspace(container: Container, workspace: Path) -> Path:
+    workspace.mkdir(parents=True, exist_ok=True)
+    container.bots.workspace_path = lambda _bot: workspace  # type: ignore[method-assign]
+    return workspace
+
+
+def test_text_plus_file_reply_queues_attachment_then_sends_after_allow(
+    settings: Settings, db_schema: None, tmp_path: Path
+) -> None:
+    with _callback_client(settings) as (client, container, context):
+        payload = b"%PDF-dingtalk"
+        workspace = _use_workspace(container, tmp_path / "workspace")
+        (workspace / "report.pdf").write_bytes(payload)
+        container.assistant = AttachingAssistant(  # type: ignore[assignment]
+            path="report.pdf", reply="报表见附件"
+        )
+
+        query, raw = _encrypted_request(_message_payload())
+        _assert_encrypted_success(client.post(WEBHOOK, params=query, content=raw))
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        pending = _wait_pending_decision(client, bot["chat_task_id"])
+
+        assert pending["kind"] == DINGTALK_OUTBOUND_KIND
+        attachment = pending["meta"]["attachments"][0]
+        assert attachment["name"] == "report.pdf"
+        assert attachment["kind"] == "file"
+        assert attachment["size"] == len(payload)
+        assert "report.pdf" in pending["context"]
+        assert "application/pdf" in pending["context"]
+        assert context["sender"].messages == []
+        assert context["sender"].media == []
+
+        draft = client.get(f"{PREFIX}/outbound-drafts/{pending['meta']['draft_id']}").json()["data"]
+        assert draft["body"] == "报表见附件"
+        assert draft["attachments"][0]["name"] == "report.pdf"
+
+        allowed = client.post(
+            f"{PREFIX}/tasks/{bot['chat_task_id']}/decisions/choose",
+            json={"decision_id": pending["id"], "action": "choose", "option": "允许"},
+        )
+        assert allowed.status_code == 200, allowed.text
+        # 正文先发，再发文件。
+        assert len(context["sender"].messages) == 1
+        assert context["sender"].messages[0][1] == "报表见附件"
+        assert len(context["sender"].media) == 1
+        assert context["sender"].media[0]["kind"] == "file"
+        assert context["sender"].media[0]["bytes"] == payload
+        assert (
+            client.get(f"{PREFIX}/outbound-drafts/{draft['id']}").json()["data"]["status"] == "sent"
+        )
+
+
+def test_media_reply_denied_never_uploads_or_sends(
+    settings: Settings, db_schema: None, tmp_path: Path
+) -> None:
+    with _callback_client(settings) as (client, container, context):
+        workspace = _use_workspace(container, tmp_path / "workspace")
+        (workspace / "chart.png").write_bytes(b"png")
+        container.assistant = AttachingAssistant(path="chart.png", reply="")  # type: ignore[assignment]
+
+        query, raw = _encrypted_request(_message_payload())
+        _assert_encrypted_success(client.post(WEBHOOK, params=query, content=raw))
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        pending = _wait_pending_decision(client, bot["chat_task_id"])
+
+        denied = client.post(
+            f"{PREFIX}/tasks/{bot['chat_task_id']}/decisions/choose",
+            json={"decision_id": pending["id"], "action": "choose", "option": "拒绝"},
+        )
+        assert denied.status_code == 200, denied.text
+        assert context["sender"].messages == []
+        assert context["sender"].media == []
+        assert (
+            client.get(f"{PREFIX}/outbound-drafts/{pending['meta']['draft_id']}").json()["data"][
+                "status"
+            ]
+            == "denied"
+        )
