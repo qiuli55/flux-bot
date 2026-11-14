@@ -14,6 +14,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from flux.core.user_scope import normalize_cloud_user_id, owned_clause, owns
 from flux.errors import BadRequestError, NotFoundError
 from flux.logging import get_logger
 from flux.models.bot_turn import BotTurn
@@ -71,7 +72,16 @@ class BotTurnRepository:
             await session.refresh(row)
             return row, True
 
-    async def get(self, bot_id: uuid.UUID, turn_id: uuid.UUID) -> BotTurn:
+    async def get(
+        self,
+        bot_id: uuid.UUID,
+        turn_id: uuid.UUID,
+        *,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
+        scoped: bool = False,
+    ) -> BotTurn:
+        """取一轮对话；`scoped=True` 时只返回当前用户自己的轮次（含主用户的历史 NULL）。"""
         async with self._session_factory() as session:
             row = await session.get(BotTurn, turn_id)
             if row is None or row.bot_id != bot_id:
@@ -79,6 +89,15 @@ class BotTurnRepository:
                     f"Turn {turn_id} 不存在",
                     details={"turn_id": str(turn_id), "bot_id": str(bot_id)},
                 )
+            if scoped:
+                current = normalize_cloud_user_id(cloud_user_id) or normalize_cloud_user_id(
+                    owner_cloud_user_id
+                )
+                if not owns(row.cloud_user_id, current, owner_cloud_user_id):
+                    raise NotFoundError(
+                        f"Turn {turn_id} 不存在",
+                        details={"turn_id": str(turn_id), "bot_id": str(bot_id)},
+                    )
             return row
 
     async def get_by_id(self, turn_id: uuid.UUID) -> BotTurn | None:
@@ -86,13 +105,26 @@ class BotTurnRepository:
             return await session.get(BotTurn, turn_id)
 
     async def find_by_client_id(
-        self, bot_id: uuid.UUID, client_turn_id: str | None
+        self,
+        bot_id: uuid.UUID,
+        client_turn_id: str | None,
+        *,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
+        scoped: bool = False,
     ) -> BotTurn | None:
         text = (client_turn_id or "").strip()
         if not text:
             return None
         async with self._session_factory() as session:
-            return await self._by_client_id(session, bot_id, text)
+            return await self._by_client_id(
+                session,
+                bot_id,
+                text,
+                cloud_user_id=cloud_user_id,
+                owner_cloud_user_id=owner_cloud_user_id,
+                scoped=scoped,
+            )
 
     async def list(
         self,
@@ -100,8 +132,20 @@ class BotTurnRepository:
         *,
         limit: int = 50,
         before: datetime | None = None,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
+        scoped: bool = False,
     ) -> list[BotTurn]:
         statement = select(BotTurn).where(BotTurn.bot_id == bot_id)
+        if scoped:
+            current = normalize_cloud_user_id(cloud_user_id) or normalize_cloud_user_id(
+                owner_cloud_user_id
+            )
+            if current is None:
+                return []
+            statement = statement.where(
+                owned_clause(BotTurn.cloud_user_id, current, owner_cloud_user_id)
+            )
         if before is not None:
             statement = statement.where(BotTurn.created_at < before)
         statement = statement.order_by(BotTurn.created_at.desc(), BotTurn.id.desc()).limit(limit)
@@ -174,11 +218,26 @@ class BotTurnRepository:
             return row
 
     async def _by_client_id(
-        self, session: AsyncSession, bot_id: uuid.UUID, client_turn_id: str
+        self,
+        session: AsyncSession,
+        bot_id: uuid.UUID,
+        client_turn_id: str,
+        *,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
+        scoped: bool = False,
     ) -> BotTurn | None:
-        return await session.scalar(
-            select(BotTurn).where(
-                BotTurn.bot_id == bot_id,
-                BotTurn.client_turn_id == client_turn_id,
-            )
+        statement = select(BotTurn).where(
+            BotTurn.bot_id == bot_id,
+            BotTurn.client_turn_id == client_turn_id,
         )
+        if scoped:
+            current = normalize_cloud_user_id(cloud_user_id) or normalize_cloud_user_id(
+                owner_cloud_user_id
+            )
+            if current is None:
+                return None
+            statement = statement.where(
+                owned_clause(BotTurn.cloud_user_id, current, owner_cloud_user_id)
+            )
+        return await session.scalar(statement)

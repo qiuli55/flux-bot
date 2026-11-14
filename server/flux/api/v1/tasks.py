@@ -18,6 +18,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import StreamingResponse
 
+from flux.api.account_scope import account_key_for_request
 from flux.api.auth import current_cloud_user_id, get_current_cloud_user_id
 from flux.api.deps import get_container
 from flux.api.response import ok
@@ -89,9 +90,25 @@ def _confirmation_text(items: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
-async def _require_open_task(container: Container, task_uuid: uuid.UUID, task_id: str) -> Task:
+async def _owned_task(
+    container: Container, task_uuid: uuid.UUID, cloud_user_id: str | None
+) -> Task:
+    """REST 面统一按人取任务：不属于当前人一律 404。"""
+    return await container.task_repo.get_owned(
+        task_uuid,
+        cloud_user_id=cloud_user_id,
+        owner_cloud_user_id=container.settings.owner_cloud_user_id,
+    )
+
+
+async def _require_open_task(
+    container: Container,
+    task_uuid: uuid.UUID,
+    task_id: str,
+    cloud_user_id: str | None,
+) -> Task:
     """取任务并确认它还能被操作（终态任务一律 409，与追加消息同一口径）。"""
-    task = await container.task_repo.get(task_uuid)
+    task = await _owned_task(container, task_uuid, cloud_user_id)
     if task.status in _FINAL_STATUSES:
         raise ConflictError(
             f"任务 {task_id} 已处于终态 {task.status}，不能再执行该操作",
@@ -124,9 +141,11 @@ def _task_id(value: str) -> uuid.UUID:
 @router.post("")
 async def create_task(
     payload: TaskCreateRequest,
+    request: Request,
     container: Container = Depends(get_container),
-    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
+    # 新建任务必须能确定归属人：分不清是谁就 403，绝不落一条无主任务。
+    cloud_user_id = account_key_for_request(request, container.settings)
     project_id = _parse_uuid(payload.project_id, field="project_id") if payload.project_id else None
     agent_id = _parse_uuid(payload.agent_id, field="agent_id") if payload.agent_id else None
     runtime = DEFAULT_RUNTIME
@@ -158,6 +177,7 @@ async def create_task(
         bot_name=payload.bot_name,
         avatar_shape=avatar_shape,
         avatar_color=avatar_color,
+        cloud_user_id=cloud_user_id,
     )
     # 从旧对话接手：摘要落成一条 kind=summary 的助手消息。它同时进入助手历史
     # 与 Agent 执行指令（TaskRunService._latest_summary），新对话因此不是"从零开始"，
@@ -209,6 +229,7 @@ async def list_tasks(
     include_bot_tasks: bool = False,
     limit: int = 50,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """列出任务（任务执行中心的任务列表）。默认按创建时间倒序。
 
@@ -244,6 +265,9 @@ async def list_tasks(
         bot_id=bot_uuid,
         exclude_bot_tasks=bot_uuid is None and not include_bot_tasks,
         limit=limit,
+        cloud_user_id=cloud_user_id,
+        owner_cloud_user_id=container.settings.owner_cloud_user_id,
+        scope_to_user=True,
     )
     return ok([_task_dict(t) for t in tasks], metadata={"count": len(tasks)})
 
@@ -257,9 +281,11 @@ async def sync_context(container: Container = Depends(get_container)) -> dict[st
 
 @router.get("/{task_id}")
 async def get_task(
-    task_id: str, container: Container = Depends(get_container)
+    task_id: str,
+    container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
-    task = await container.task_repo.get(_task_id(task_id))
+    task = await _owned_task(container, _task_id(task_id), cloud_user_id)
     return ok(_task_dict(task))
 
 
@@ -269,12 +295,15 @@ async def list_task_messages(
     limit: int = 30,
     before: int | None = None,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """按 seq 升序返回一段任务消息；before 为向上加载更早消息的游标。"""
     if limit < 1 or limit > 200:
         raise BadRequestError("limit 必须在 1~200 之间", details={"limit": limit})
+    task_uuid = _task_id(task_id)
+    await _owned_task(container, task_uuid, cloud_user_id)
     messages, has_more = await container.task_repo.list_messages(
-        _task_id(task_id), limit=limit, before=before
+        task_uuid, limit=limit, before=before
     )
     return ok(
         [m.to_dict() for m in messages],
@@ -307,12 +336,13 @@ async def list_task_runs(
     task_id: str,
     limit: int = 20,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """任务名下的 Run 摘要（按时间升序）：耗时与「改动/命令/读取」计数。"""
     if limit < 1 or limit > 100:
         raise BadRequestError("limit 必须在 1~100 之间", details={"limit": limit})
     task_uuid = _task_id(task_id)
-    await container.task_repo.get(task_uuid)
+    await _owned_task(container, task_uuid, cloud_user_id)
     runs = await container.run_repo.list_by_task(task_uuid, limit=limit)
     rows = await container.run_trace_repo.list_for_runs([run.id for run in runs])
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -326,9 +356,11 @@ async def get_run_trace(
     task_id: str,
     run_id: str,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """一轮 Run 的完整执行轨迹：概览 + 思考过程 + 命令（含输出）。"""
     task_uuid = _task_id(task_id)
+    await _owned_task(container, task_uuid, cloud_user_id)
     run = await container.run_repo.get(run_id)
     if run is None or run.task_id != task_uuid:
         raise NotFoundError(
@@ -344,7 +376,9 @@ async def get_run_trace(
 
 @router.get("/{task_id}/context")
 async def get_task_context(
-    task_id: str, container: Container = Depends(get_container)
+    task_id: str,
+    container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """对话上下文占用（「上下文快满」提醒的唯一口径）。
 
@@ -354,7 +388,7 @@ async def get_task_context(
     否则对话一长就永远停在 100%。条数只作为解释信息返回。
     """
     task_uuid = _task_id(task_id)
-    task = await container.task_repo.get(task_uuid)
+    task = await _owned_task(container, task_uuid, cloud_user_id)
     # 与真实开跑共用一套装配，避免「占用条」与「Agent 实际收到」两套口径
     instruction = await container.task_run_service.preview_instruction(task)
     limit = context_message_limit()
@@ -367,7 +401,9 @@ async def get_task_context(
 
 @router.post("/{task_id}/handoff")
 async def create_task_handoff(
-    task_id: str, container: Container = Depends(get_container)
+    task_id: str,
+    container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """把一段对话压成前情摘要，供客户端带进新对话。
 
@@ -376,7 +412,7 @@ async def create_task_handoff(
     没有用户意图的孤儿对话。
     """
     task_uuid = _task_id(task_id)
-    task = await container.task_repo.get(task_uuid)
+    task = await _owned_task(container, task_uuid, cloud_user_id)
     if task.status == TaskStatus.RUNNING.value:
         raise ConflictError(
             "这段对话正在执行，结束后再新建带摘要的对话",
@@ -408,6 +444,7 @@ async def create_task_message(
     payload: TaskMessageCreateRequest,
     request: Request,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """发一条消息并取回助手的真实回复。
 
@@ -415,7 +452,7 @@ async def create_task_message(
     随后调用模型生成回复并落库——两个步骤都是真实数据，服务端不接受伪造的 assistant 消息。
     """
     task_uuid = _task_id(task_id)
-    task = await container.task_repo.get(task_uuid)
+    task = await _owned_task(container, task_uuid, cloud_user_id)
     content = payload.content.strip()
     files = resolve_uploads(container.settings, payload.attachment_ids)
     if not content and not files:
@@ -457,6 +494,7 @@ async def submit_secure_input(
     task_id: str,
     payload: SecureInputRequest,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """安全输入卡片的提交入口：明文只在这里出现一次，落库即加密，接口只回掩码。
 
@@ -464,7 +502,7 @@ async def submit_secure_input(
     正文与 payload 都不含明文，因此后续上传云端上下文时也不会带出密钥。
     """
     task_uuid = _task_id(task_id)
-    task = await container.task_repo.get(task_uuid)
+    task = await _owned_task(container, task_uuid, cloud_user_id)
     if task.status in _FINAL_STATUSES:
         raise ConflictError(
             f"任务 {task_id} 已处于终态 {task.status}，不能再提交密钥",
@@ -554,6 +592,7 @@ async def stream_task(
     after_seq: int = 0,
     last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> StreamingResponse:
     """对话增量流（SSE）：助手逐字回复 + Agent 运行事件。
 
@@ -561,7 +600,7 @@ async def stream_task(
     最终消息仍以 GET /tasks/{id}/messages 为准：断线期间漏掉的增量由客户端重拉补齐。
     """
     task_uuid = _task_id(task_id)
-    await container.task_repo.get(task_uuid)
+    await _owned_task(container, task_uuid, cloud_user_id)
     resume_from = after_seq
     if last_event_id:
         with suppress(ValueError):
@@ -587,6 +626,7 @@ async def poll_task_events(
     task_id: str,
     after_seq: int = 0,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """对话增量的轮询版（账号云中转只做请求-响应，不能承载 SSE 长连接）。
 
@@ -595,7 +635,7 @@ async def poll_task_events(
     if after_seq < 0:
         raise BadRequestError("after_seq 不能为负数", details={"after_seq": after_seq})
     task_uuid = _task_id(task_id)
-    await container.task_repo.get(task_uuid)
+    await _owned_task(container, task_uuid, cloud_user_id)
     events = container.task_stream.poll(task_uuid, after_seq=after_seq)
     return ok(
         [event.to_dict() for event in events],
@@ -608,6 +648,7 @@ async def continue_task(
     task_id: str,
     payload: TaskMessageCreateRequest,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """同一对话续跑：终态对话收到新消息时，重开任务并起一轮新 Run。
 
@@ -615,7 +656,7 @@ async def continue_task(
     让同一个对话接着执行（历史消息、项目关联与标题都保留）。
     """
     task_uuid = _task_id(task_id)
-    task = await container.task_repo.get(task_uuid)
+    task = await _owned_task(container, task_uuid, cloud_user_id)
     content = payload.content.strip()
     files = resolve_uploads(container.settings, payload.attachment_ids)
     if not content and not files:
@@ -665,6 +706,7 @@ async def update_confirmation(
     task_id: str,
     payload: ConfirmationUpdateRequest,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """用户修改需求确认（P0-06）：六个维度必须齐全，落库后就是执行依据。
 
@@ -672,7 +714,7 @@ async def update_confirmation(
     否则"执行用的是哪一版需求"事后无从解释（TC-103）。
     """
     task_uuid = _task_id(task_id)
-    await _require_open_task(container, task_uuid, task_id)
+    await _require_open_task(container, task_uuid, task_id, cloud_user_id)
     items = validate_confirmation_items([item.model_dump() for item in payload.items])
     confirmation = {"items": items, "actor": "user", "updated_at": _now_iso()}
     task = await container.task_repo.set_confirmation(task_uuid, confirmation)
@@ -697,10 +739,11 @@ async def set_decision_mode(
     task_id: str,
     payload: DecisionModeRequest,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """切换任务级决策策略（文档 §5）：auto = AI 默认方案，manual = 由我决定。"""
     task_uuid = _task_id(task_id)
-    await _require_open_task(container, task_uuid, task_id)
+    await _require_open_task(container, task_uuid, task_id, cloud_user_id)
     task = await container.task_repo.set_decision_mode(task_uuid, payload.mode)
     return ok(_task_dict(task))
 
@@ -710,6 +753,7 @@ async def set_permission_mode(
     task_id: str,
     payload: PermissionModeRequest,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """切换对话级权限模式（Plan / Normal / Full）。
 
@@ -718,7 +762,7 @@ async def set_permission_mode(
     也不改动历史消息与已完成的审批记录。
     """
     task_uuid = _task_id(task_id)
-    task = await container.task_repo.get(task_uuid)
+    task = await _owned_task(container, task_uuid, cloud_user_id)
     previous = task.permission_mode or "normal"
     task = await container.task_repo.set_permission_mode(task_uuid, payload.mode)
     effective_from = "next_run" if task.status == TaskStatus.RUNNING.value else "next_message"
@@ -748,6 +792,7 @@ async def switch_task_agent(
     task_id: str,
     payload: TaskAgentRequest,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """切换执行该任务的 Agent（移动端对话页的 Agent 下拉）。
 
@@ -758,7 +803,7 @@ async def switch_task_agent(
     - 预检失败（Agent 不存在 / runtime 未接入）：保留原 Agent，按真实原因报错。
     """
     task_uuid = _task_id(task_id)
-    task = await container.task_repo.get(task_uuid)
+    task = await _owned_task(container, task_uuid, cloud_user_id)
     _parse_uuid(payload.agent_id, field="agent_id")
     result = await container.agent_switch.switch(task, payload.agent_id)
     body = {
@@ -791,7 +836,7 @@ async def switch_task_model(
     终态对话同样允许切换，理由与切换 Agent 一致：只影响下一次续聊的模型。
     """
     task_uuid = _task_id(task_id)
-    task = await container.task_repo.get(task_uuid)
+    task = await _owned_task(container, task_uuid, cloud_user_id)
     if task.status == TaskStatus.RUNNING.value:
         raise ConflictError(
             f"任务 {task_id} 正在执行，先停止 Agent 再切换模型",
@@ -816,6 +861,7 @@ async def start_task(
     task_id: str,
     payload: TaskStartRequest,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """开始执行（P0-05）：把确认过的需求交给该 Agent 的 runtime 起一次 Run，任务进入 running。
 
@@ -825,7 +871,7 @@ async def start_task(
     （CLI 未接入）时不返回"假装开始执行"的 200。
     """
     task_uuid = _task_id(task_id)
-    task = await _require_open_task(container, task_uuid, task_id)
+    task = await _require_open_task(container, task_uuid, task_id, cloud_user_id)
     if task.run_id:
         raise ConflictError(
             f"任务 {task_id} 已开始执行，不能重复触发",
@@ -852,6 +898,7 @@ async def raise_decision(
     task_id: str,
     payload: DecisionCreateRequest,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """登记一个决策点（文档 §5）：Agent 执行中撞上可选方案时调用。
 
@@ -859,7 +906,7 @@ async def raise_decision(
     `waiting_for_user_decision`，等用户选完再继续。
     """
     task_uuid = _task_id(task_id)
-    task = await _require_open_task(container, task_uuid, task_id)
+    task = await _require_open_task(container, task_uuid, task_id, cloud_user_id)
     if not task.run_id:
         raise ConflictError(
             f"任务 {task_id} 尚未开始执行，此时没有执行中的决策点",
@@ -943,7 +990,7 @@ async def choose_decision(
       Agent 可以再问一次（TC-202/203）。
     """
     task_uuid = _task_id(task_id)
-    task = await _require_open_task(container, task_uuid, task_id)
+    task = await _require_open_task(container, task_uuid, task_id, cloud_user_id)
     pending = task.pending_decision()
     if pending is None:
         raise ConflictError("当前没有等待你决策的问题", details={"task_id": task_id})
@@ -1012,10 +1059,12 @@ async def choose_decision(
 
 @router.post("/{task_id}/cancel")
 async def cancel_task(
-    task_id: str, container: Container = Depends(get_container)
+    task_id: str,
+    container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     task_uuid = _task_id(task_id)
-    task = await container.task_repo.get(task_uuid)
+    task = await _owned_task(container, task_uuid, cloud_user_id)
     if task.status in _FINAL_STATUSES:
         raise ConflictError(
             f"任务 {task_id} 已处于终态 {task.status}，无法取消",
@@ -1044,7 +1093,9 @@ async def cancel_task(
 
 @router.delete("/{task_id}")
 async def delete_task(
-    task_id: str, container: Container = Depends(get_container)
+    task_id: str,
+    container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """彻底删除一段对话（任务）：消息与运行记录一并清除，不做软删除。
 
@@ -1052,7 +1103,7 @@ async def delete_task(
     删掉一个 Agent 仍在改文件的任务是矛盾的。
     """
     task_uuid = _task_id(task_id)
-    task = await container.task_repo.get(task_uuid)
+    task = await _owned_task(container, task_uuid, cloud_user_id)
     if task.status in {TaskStatus.RUNNING.value, TaskStatus.WAITING_FOR_USER_DECISION.value}:
         raise ConflictError(
             f"对话 {task_id} 正在执行，先停止后再删除",

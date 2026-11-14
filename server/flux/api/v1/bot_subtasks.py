@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Request, Response
 
+from flux.api.account_scope import account_key_for_request
+from flux.api.auth import get_current_cloud_user_id
 from flux.api.deps import get_container
 from flux.api.response import ok
 from flux.container import Container
@@ -43,14 +45,17 @@ async def create_bot_subtask(
     bot_id: str,
     payload: BotSubtaskCreateRequest,
     response: Response,
+    request: Request,
     container: Container = Depends(get_container),
 ) -> dict[str, object]:
     """派一条后台子任务：202 立即返回，执行在后台协程里进行。"""
+    cloud_user_id = account_key_for_request(request, container.settings)
     bot = await container.bots.get(_bot_id(bot_id))
     task = await container.bot_subtasks.create(
         bot,
         instruction=payload.instruction,
         title=payload.title,
+        cloud_user_id=cloud_user_id,
     )
     response.status_code = 202
     return ok(task.to_dict())
@@ -62,6 +67,7 @@ async def list_bot_subtasks(
     status: str | None = None,
     limit: int = 50,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """某个 Bot 的后台子任务（创建时间倒序），可按状态过滤。"""
     bot = await container.bots.get(_bot_id(bot_id))
@@ -76,7 +82,14 @@ async def list_bot_subtasks(
             ) from exc
     if limit < 1 or limit > 200:
         raise BadRequestError("limit 必须在 1~200 之间", details={"limit": limit})
-    tasks = await container.bot_subtasks.list(bot, status=wanted, limit=limit)
+    tasks = await container.bot_subtasks.list(
+        bot,
+        status=wanted,
+        limit=limit,
+        cloud_user_id=cloud_user_id,
+        owner_cloud_user_id=container.settings.owner_cloud_user_id,
+        scoped=True,
+    )
     return ok([task.to_dict() for task in tasks], metadata={"count": len(tasks)})
 
 
@@ -85,10 +98,17 @@ async def get_bot_subtask(
     bot_id: str,
     subtask_id: str,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
-    """一条子任务的状态与结果。"""
+    """一条子任务的状态与结果（别人的子任务按不存在处理）。"""
     bot = await container.bots.get(_bot_id(bot_id))
-    task = await container.bot_subtasks.get(bot, _subtask_id(subtask_id))
+    task = await container.bot_subtasks.get(
+        bot,
+        _subtask_id(subtask_id),
+        cloud_user_id=cloud_user_id,
+        owner_cloud_user_id=container.settings.owner_cloud_user_id,
+        scoped=True,
+    )
     return ok(task.to_dict())
 
 
@@ -97,10 +117,17 @@ async def cancel_bot_subtask(
     bot_id: str,
     subtask_id: str,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """取消仍在执行的子任务；已经终态时返回 409。"""
     bot = await container.bots.get(_bot_id(bot_id))
-    task = await container.bot_subtasks.cancel(bot, _subtask_id(subtask_id))
+    task = await container.bot_subtasks.cancel(
+        bot,
+        _subtask_id(subtask_id),
+        cloud_user_id=cloud_user_id,
+        owner_cloud_user_id=container.settings.owner_cloud_user_id,
+        scoped=True,
+    )
     return ok(task.to_dict())
 
 

@@ -7,16 +7,20 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from flux.config import Settings
 from flux.container import Container
+from flux.core.bot.subtasks import run_subtask_tool
 from flux.core.memory.shared_user import journal_content_hash
 from flux.core.task_engine.assistant import AssistantTurn
+from flux.errors import NotFoundError
 from flux.main import create_app
 from flux.models.shared_user_memory import UserJournalEntry, UserProfileEntry
 from tests.cloud_jwt import mint_cloud_token
@@ -83,8 +87,14 @@ def _create_bot(client: TestClient, *, name: str = "隔离 Bot") -> dict[str, An
     return created.json()["data"]
 
 
-def _wait_turn(client: TestClient, bot_id: str, turn_id: str) -> dict[str, Any]:
-    response = client.get(f"{PREFIX}/bots/{bot_id}/turns/{turn_id}", params={"wait": 5})
+def _wait_turn(
+    client: TestClient, bot_id: str, turn_id: str, *, user: str | None = None
+) -> dict[str, Any]:
+    response = client.get(
+        f"{PREFIX}/bots/{bot_id}/turns/{turn_id}",
+        params={"wait": 5},
+        headers=_auth(user) if user is not None else None,
+    )
     assert response.status_code == 200, response.text
     return response.json()["data"]["turn"]
 
@@ -267,7 +277,7 @@ def test_bot_turn_context_uses_only_the_speakers_profile_and_shared_space(
             headers=_auth(USER_A),
         )
         turn_id = created.json()["data"]["turn"]["id"]
-        assert _wait_turn(client, bot["id"], turn_id)["status"] == "completed"
+        assert _wait_turn(client, bot["id"], turn_id, user=USER_A)["status"] == "completed"
 
         context = assistant.calls[-1]["context"] or ""
         assert "A 的画像" in context and "A 的日志" in context
@@ -275,4 +285,261 @@ def test_bot_turn_context_uses_only_the_speakers_profile_and_shared_space(
         assert "B 的画像" not in context and "B 的日志" not in context
 
 
-# --- 对话 / 任务隔离在后续增量补充 ---
+# --- 2. 任务 / 对话按人隔离 ---
+
+
+def _create_task(client: TestClient, *, user: str | None, description: str) -> dict[str, Any]:
+    response = client.post(
+        f"{PREFIX}/tasks",
+        json={"description": description},
+        headers=_auth(user) if user is not None else None,
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["data"]
+
+
+def _insert_legacy_task(container: Container, description: str) -> str:
+    async def _insert() -> str:
+        task = await container.task_repo.create(
+            task_id=uuid.uuid4(),
+            description=description,
+            priority=100,
+            project_id=None,
+            agent_id=None,
+            cloud_user_id=None,
+        )
+        return str(task.id)
+
+    return asyncio.run(_insert())
+
+
+def test_rest_tasks_are_stamped_and_listed_per_user(
+    settings: Settings, db_schema: None, container: Container
+) -> None:
+    cfg = settings.model_copy(update={"owner_cloud_user_id": OWNER})
+    with _client(cfg) as client:
+        task_a = _create_task(client, user=USER_A, description="A 的任务")
+        task_b = _create_task(client, user=USER_B, description="B 的任务")
+        assert task_a["cloud_user_id"] == USER_A
+        assert task_b["cloud_user_id"] == USER_B
+
+        listed_a = client.get(f"{PREFIX}/tasks", headers=_auth(USER_A)).json()["data"]
+        listed_b = client.get(f"{PREFIX}/tasks", headers=_auth(USER_B)).json()["data"]
+        assert {row["id"] for row in listed_a} == {task_a["id"]}
+        assert {row["id"] for row in listed_b} == {task_b["id"]}
+
+        # B 的任务对 A 一律按不存在处理，不返回正文 / 事件 / 消息。
+        for method, path, body in (
+            ("get", f"{PREFIX}/tasks/{task_b['id']}", None),
+            ("get", f"{PREFIX}/tasks/{task_b['id']}/messages", None),
+            ("get", f"{PREFIX}/tasks/{task_b['id']}/events", None),
+            ("get", f"{PREFIX}/tasks/{task_b['id']}/stream", None),
+            ("post", f"{PREFIX}/tasks/{task_b['id']}/continue", {"content": "续"}),
+            ("post", f"{PREFIX}/tasks/{task_b['id']}/cancel", None),
+            ("delete", f"{PREFIX}/tasks/{task_b['id']}", None),
+        ):
+            response = (
+                getattr(client, method)(path, json=body, headers=_auth(USER_A))
+                if body is not None
+                else getattr(client, method)(path, headers=_auth(USER_A))
+            )
+            assert response.status_code == 404, (path, response.text)
+
+        # 自己的任务仍然正常可读。
+        assert (
+            client.get(f"{PREFIX}/tasks/{task_a['id']}", headers=_auth(USER_A)).status_code == 200
+        )
+
+
+def test_legacy_null_task_is_visible_only_to_owner(
+    settings: Settings, db_schema: None, container: Container
+) -> None:
+    cfg = settings.model_copy(update={"owner_cloud_user_id": OWNER})
+    legacy_id = _insert_legacy_task(container, "历史任务")
+    with _client(cfg) as client:
+        owner_list = client.get(f"{PREFIX}/tasks", headers=_auth(OWNER)).json()["data"]
+        assert legacy_id in {row["id"] for row in owner_list}
+        assert client.get(f"{PREFIX}/tasks/{legacy_id}", headers=_auth(OWNER)).status_code == 200
+
+        assert client.get(f"{PREFIX}/tasks", headers=_auth(USER_A)).json()["data"] == []
+        assert client.get(f"{PREFIX}/tasks/{legacy_id}", headers=_auth(USER_A)).status_code == 404
+        assert (
+            client.delete(f"{PREFIX}/tasks/{legacy_id}", headers=_auth(USER_A)).status_code == 404
+        )
+
+
+def test_task_create_without_person_is_rejected(settings: Settings, db_schema: None) -> None:
+    cfg = settings.model_copy(update={"owner_cloud_user_id": None})
+    with _client(cfg) as client:
+        response = client.post(f"{PREFIX}/tasks", json={"description": "匿名任务"})
+        assert response.status_code == 403, response.text
+        assert response.json()["code"] == "cloud_login_required"
+
+
+def _send_bot_turn(client: TestClient, bot_id: str, *, user: str, content: str) -> str:
+    created = client.post(
+        f"{PREFIX}/bots/{bot_id}/turns",
+        json={"content": content},
+        headers=_auth(user),
+    )
+    assert created.status_code == 202, created.text
+    return str(created.json()["data"]["turn"]["id"])
+
+
+def test_bot_history_turns_and_chat_tasks_are_per_user(settings: Settings, db_schema: None) -> None:
+    cfg = settings.model_copy(update={"owner_cloud_user_id": OWNER})
+    with _client(cfg) as client:
+        container = client.app.state.container  # type: ignore[attr-defined]
+        assistant = _RecordingAssistant()
+        container.assistant = assistant  # type: ignore[assignment]
+        bot = _create_bot(client)
+
+        turn_a = _send_bot_turn(client, bot["id"], user=USER_A, content="A 的第一句")
+        assert _wait_turn(client, bot["id"], turn_a, user=USER_A)["status"] == "completed"
+        turn_b = _send_bot_turn(client, bot["id"], user=USER_B, content="B 的第一句")
+        assert _wait_turn(client, bot["id"], turn_b, user=USER_B)["status"] == "completed"
+
+        # 轮次列表按人隔离。
+        turns_a = client.get(f"{PREFIX}/bots/{bot['id']}/turns", headers=_auth(USER_A)).json()[
+            "data"
+        ]
+        turns_b = client.get(f"{PREFIX}/bots/{bot['id']}/turns", headers=_auth(USER_B)).json()[
+            "data"
+        ]
+        assert [row["id"] for row in turns_a] == [turn_a]
+        assert [row["id"] for row in turns_b] == [turn_b]
+        # 知道对方的 turn_id 也读不到 / 不能订阅流。
+        assert (
+            client.get(
+                f"{PREFIX}/bots/{bot['id']}/turns/{turn_b}", headers=_auth(USER_A)
+            ).status_code
+            == 404
+        )
+        assert (
+            client.get(
+                f"{PREFIX}/bots/{bot['id']}/turns/{turn_b}/stream", headers=_auth(USER_A)
+            ).status_code
+            == 404
+        )
+
+        # 每个人的 chat_task_id 都是自己的，且互不相同。
+        payload_a = client.get(f"{PREFIX}/bots/{bot['id']}", headers=_auth(USER_A)).json()["data"]
+        payload_b = client.get(f"{PREFIX}/bots/{bot['id']}", headers=_auth(USER_B)).json()["data"]
+        assert payload_a["chat_task_id"]
+        assert payload_b["chat_task_id"]
+        assert payload_a["chat_task_id"] != payload_b["chat_task_id"]
+
+        # 会话消息也只包含自己的那一句。
+        conversation_a = client.get(
+            f"{PREFIX}/bots/{bot['id']}/conversation", headers=_auth(USER_A)
+        ).json()["data"]
+        conversation_b = client.get(
+            f"{PREFIX}/bots/{bot['id']}/conversation", headers=_auth(USER_B)
+        ).json()["data"]
+        assert conversation_a["chat_task_id"] == payload_a["chat_task_id"]
+        assert conversation_b["chat_task_id"] == payload_b["chat_task_id"]
+        assert [m["content"] for m in conversation_a["messages"] if m["role"] == "user"] == [
+            "A 的第一句"
+        ]
+        assert [m["content"] for m in conversation_b["messages"] if m["role"] == "user"] == [
+            "B 的第一句"
+        ]
+
+        # 两个用户的消息落在不同的 tasks 行里。
+        messages_a = client.get(
+            f"{PREFIX}/tasks/{payload_a['chat_task_id']}/messages", headers=_auth(USER_A)
+        ).json()["data"]
+        messages_b = client.get(
+            f"{PREFIX}/tasks/{payload_b['chat_task_id']}/messages", headers=_auth(USER_B)
+        ).json()["data"]
+        assert [m["content"] for m in messages_a if m["role"] == "user"] == ["A 的第一句"]
+        assert [m["content"] for m in messages_b if m["role"] == "user"] == ["B 的第一句"]
+
+
+def test_im_bound_service_turns_do_not_share_one_chat_task(
+    settings: Settings, db_schema: None
+) -> None:
+    cfg = settings.model_copy(update={"owner_cloud_user_id": OWNER})
+    with _client(cfg) as client:
+        container = client.app.state.container  # type: ignore[attr-defined]
+        container.assistant = _RecordingAssistant()  # type: ignore[assignment]
+        bot = _create_bot(client, name="绑定隔离 Bot")
+        bot_obj = asyncio.run(container.bots.get(uuid.UUID(bot["id"])))
+
+        async def _create(user: str) -> Any:
+            turn, created = await container.bot_conversation.create_turn(
+                bot_obj, content=f"{user} 的 IM 消息", cloud_user_id=user
+            )
+            assert created
+            return turn
+
+        turn_a = asyncio.run(_create(USER_A))
+        turn_b = asyncio.run(_create(USER_B))
+
+        # 两条 IM 消息落在不同人的对话任务里，绝不共用 bots.chat_task_id。
+        assert turn_a.task_id != turn_b.task_id
+        assert turn_a.cloud_user_id == USER_A and turn_b.cloud_user_id == USER_B
+
+        async def _owned(task_id: Any, user: str) -> Any:
+            return await container.task_repo.get_owned(
+                task_id, cloud_user_id=user, owner_cloud_user_id=OWNER
+            )
+
+        assert asyncio.run(_owned(turn_a.task_id, USER_A)).cloud_user_id == USER_A
+        assert asyncio.run(_owned(turn_b.task_id, USER_B)).cloud_user_id == USER_B
+        with pytest.raises(NotFoundError):
+            asyncio.run(_owned(turn_b.task_id, USER_A))
+
+
+def test_subtask_parents_to_the_speakers_chat_task(
+    settings: Settings, db_schema: None, monkeypatch: Any
+) -> None:
+    cfg = settings.model_copy(update={"owner_cloud_user_id": OWNER})
+    with _client(cfg) as client:
+        container = client.app.state.container  # type: ignore[attr-defined]
+        container.assistant = _RecordingAssistant()  # type: ignore[assignment]
+        bot = _create_bot(client, name="子任务隔离 Bot")
+
+        turn_a = _send_bot_turn(client, bot["id"], user=USER_A, content="A 先说话")
+        assert _wait_turn(client, bot["id"], turn_a, user=USER_A)["status"] == "completed"
+        turn_b = _send_bot_turn(client, bot["id"], user=USER_B, content="B 先说话")
+        assert _wait_turn(client, bot["id"], turn_b, user=USER_B)["status"] == "completed"
+
+        payload_a = client.get(f"{PREFIX}/bots/{bot['id']}", headers=_auth(USER_A)).json()["data"]
+        payload_b = client.get(f"{PREFIX}/bots/{bot['id']}", headers=_auth(USER_B)).json()["data"]
+        assert payload_a["chat_task_id"] != payload_b["chat_task_id"]
+
+        # 不让子任务真的去起内核 Run：只验证归属与父子关系。
+        async def _noop(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(container.bot_subtasks, "_run", _noop)
+        bot_obj = asyncio.run(container.bots.get(uuid.UUID(bot["id"])))
+        started = asyncio.run(
+            run_subtask_tool(
+                container.bot_subtasks,
+                bot_obj,
+                "subtask_start",
+                {"instruction": "帮 A 整理资料"},
+                cloud_user_id=USER_A,
+                owner_cloud_user_id=OWNER,
+            )
+        )
+        subtask_id = started["subtask_id"]
+        subtask = asyncio.run(container.task_repo.get(uuid.UUID(subtask_id)))
+        assert str(subtask.parent_task_id) == payload_a["chat_task_id"]
+        assert subtask.cloud_user_id == USER_A
+
+        # A 能看自己的子任务，B 看不到（404）。
+        assert (
+            client.get(
+                f"{PREFIX}/bots/{bot['id']}/subtasks/{subtask_id}", headers=_auth(USER_A)
+            ).status_code
+            == 200
+        )
+        assert (
+            client.get(
+                f"{PREFIX}/bots/{bot['id']}/subtasks/{subtask_id}", headers=_auth(USER_B)
+            ).status_code
+            == 404
+        )
