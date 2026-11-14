@@ -844,3 +844,24 @@ class VaultContactUpdateRequest(BaseModel):
     phones: list[str] | None = Field(default=None, max_length=20)
     emails: list[str] | None = Field(default=None, max_length=20)
     notes: str | None = Field(default=None, max_length=4000)
+
+
+# --- 全局审批规则（按 Flux 云用户，设置页展示全部规则）---
+
+
+class ApprovalRuleCreateRequest(BaseModel):
+    """新增一条审批规则；参数结构由服务层按 type 校验并归一化。"""
+
+    type: str = Field(min_length=1, max_length=32)
+    params: dict[str, Any] = Field(default_factory=dict)
+    description: str | None = Field(default=None, max_length=500)
+    enabled: bool = True
+
+
+class ApprovalRuleUpdateRequest(BaseModel):
+    """局部更新规则；未出现的字段保持不变，params 会按最终 type 重新校验。"""
+
+    type: str | None = Field(default=None, min_length=1, max_length=32)
+    params: dict[str, Any] | None = None
+    description: str | None = Field(default=None, max_length=500)
+    enabled: bool | None = None

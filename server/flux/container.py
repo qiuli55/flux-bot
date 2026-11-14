@@ -28,6 +28,7 @@ from flux.core.agent_runtime.session_repository import TaskRuntimeSessionReposit
 from flux.core.agent_runtime.supervisor import RunSupervisor
 from flux.core.agent_runtime.trace import RunTraceRecorder
 from flux.core.agent_runtime.trace_repository import RunTraceRepository
+from flux.core.approval_rules.service import ApprovalRuleService
 from flux.core.billing.service import BillingService
 from flux.core.bot.conversation import BotConversationService
 from flux.core.bot.service import BotService
@@ -234,6 +235,8 @@ class Container:
     outbound_drafts: OutboundDraftService = field(init=False)
     #: 出站审批卡的串行闸门：三个频道共享，保证同一对话同一时刻只挂一张卡
     outbound_approval_lock: asyncio.Lock = field(init=False)
+    #: 全局审批规则（按 Flux 云用户）：空表 = 零审批；规则对该用户所有 Bot 生效。
+    approval_rules: ApprovalRuleService = field(init=False)
     #: 频道入站活动（最近接收 / 近期错误）：进程内登记，重启清空
     channel_activity: ChannelActivityRegistry = field(init=False)
     #: 浏览器 MCP 探活（2 秒超时 + 30 秒缓存）：进程内单例，避免状态轮询打爆 sidecar
@@ -584,6 +587,12 @@ class Container:
         self.outbound_drafts = OutboundDraftService(
             self.session_factory,  # type: ignore[attr-defined]
             self.settings,
+        )
+        # 全局审批规则：写入口只有用户 REST 与 Bot 的「新增」工具；空表即零审批。
+        self.approval_rules = ApprovalRuleService(
+            self.session_factory,  # type: ignore[attr-defined]
+            self.settings,
+            bus=self.bus,
         )
         # 出站审批卡串行闸门：飞书 / 企业微信 / 钉钉共用一把锁，避免同一对话
         # 同时挂出多张卡（`pending_decision()` 只认最后一张）。
