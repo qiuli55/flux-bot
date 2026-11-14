@@ -32,6 +32,8 @@ from flux.enums import Capability, TaskMessageRole
 from flux.errors import ValidationError
 
 COMPONENT_EMIT_TOOL_NAME = "component.emit"
+#: Bot 对话侧的工具名用下划线：部分模型供应商只接受 `[A-Za-z0-9_-]` 的函数名。
+COMPONENT_EMIT_CHAT_TOOL_NAME = "component_emit"
 
 COMPONENT_EMIT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -143,7 +145,7 @@ async def run_component_tool(
     container: Any, task_id: uuid.UUID, name: str, params: dict[str, Any]
 ) -> dict[str, Any]:
     """Bot 对话工具入口：任务由调用方（当前轮次）提供。"""
-    if name != COMPONENT_EMIT_TOOL_NAME:
+    if name not in {COMPONENT_EMIT_TOOL_NAME, COMPONENT_EMIT_CHAT_TOOL_NAME}:
         raise ValidationError(f"不支持的组件工具：{name}", details={"tool": name})
     return await emit_component(container, task_id, params)
 
@@ -179,7 +181,28 @@ def component_tools() -> tuple[ToolSpec, ...]:
     )
 
 
+#: 供 Bot 对话直接拼进 tools 列表（OpenAI function 形状，与 SUBTASK_TOOLS /
+#: ROUTINE_TOOLS 一致；MCP 面用的是上面的 ToolSpec）。
+COMPONENT_CHAT_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": COMPONENT_EMIT_CHAT_TOOL_NAME,
+            "description": (
+                "把一张交互卡片写进当前对话：标题/正文/图片/文件/音频/按钮/选项/输入框/"
+                "进度/列表/分隔线。必须同时给 component 树与 fallback_text 纯文本兜底。"
+                "按钮只能用客户端动作 open_desktop / open_url；服务端动作不能伪造。"
+            ),
+            "parameters": COMPONENT_EMIT_SCHEMA,
+        },
+    }
+]
+
+COMPONENT_TOOLS: tuple[ToolSpec, ...] = component_tools()
+
 __all__ = [
+    "COMPONENT_CHAT_TOOLS",
+    "COMPONENT_EMIT_CHAT_TOOL_NAME",
     "COMPONENT_EMIT_TOOL_NAME",
     "COMPONENT_TOOLS",
     "component_emit",
@@ -187,6 +210,3 @@ __all__ = [
     "emit_component",
     "run_component_tool",
 ]
-
-#: 供 Bot 对话直接拼进 tools 列表（与 SUBTASK_TOOLS / ROUTINE_TOOLS 一致）。
-COMPONENT_TOOLS: tuple[ToolSpec, ...] = component_tools()

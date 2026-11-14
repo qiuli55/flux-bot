@@ -19,6 +19,10 @@
 - `decision` / `decision_auto` / `decision_result` → card + 选项按钮（仅 pending 时）
 - `component`     → 原样返回（写入时已校验）
 
+卡片是写入时的快照：决策 / 密钥提交后会另写一条 `decision_result` /
+`secure_input_result`。客户端以结果消息为准收起原卡片；服务端在动作回调里仍会
+重新校验 pending 状态与回执，重复提交不会执行两次。
+
 `attachments`（用户上传的图片/文件/语音）暂不映射：附件目前只有服务端绝对路径，
 没有按 upload_id 取回内容的鉴权接口，贸然给 App 一个取不到的引用没有意义。
 后续补上附件读取端点后，再映射成 image/file/audio 节点即可。

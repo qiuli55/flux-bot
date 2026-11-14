@@ -17,6 +17,8 @@ from flux.core.mcp.auth import AgentIdentity
 from flux.core.mcp.tools import TOOLS
 from flux.core.mcp.tools.base import ToolContext
 from flux.core.mcp.tools.component_tools import (
+    COMPONENT_CHAT_TOOLS,
+    COMPONENT_EMIT_CHAT_TOOL_NAME,
     COMPONENT_EMIT_TOOL_NAME,
     component_emit,
     run_component_tool,
@@ -82,6 +84,10 @@ async def _messages(container, task_id: uuid.UUID):
 def test_tool_is_registered_but_not_allowed_in_plan_mode() -> None:
     assert COMPONENT_EMIT_TOOL_NAME in TOOLS
     assert COMPONENT_EMIT_TOOL_NAME not in PLAN_ALLOWED_TOOLS
+    # Bot 对话侧用下划线函数名（部分模型供应商不接受点号），形状与其它 Bot 工具一致。
+    assert [tool["function"]["name"] for tool in COMPONENT_CHAT_TOOLS] == [
+        COMPONENT_EMIT_CHAT_TOOL_NAME
+    ]
 
 
 async def test_emit_writes_one_component_message(container) -> None:
@@ -151,7 +157,7 @@ async def test_bot_entrypoint_uses_the_current_task(container) -> None:
     result = await run_component_tool(
         container,
         task_id,
-        COMPONENT_EMIT_TOOL_NAME,
+        COMPONENT_EMIT_CHAT_TOOL_NAME,
         {"component": _CARD, "fallback_text": "给 Bot 对话的卡片"},
     )
     assert result["message_id"]

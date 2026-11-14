@@ -602,8 +602,8 @@ def _https_url(raw: Any, *, field: str, path: str) -> str:
         raise ValidationError("URL 缺少主机名", details={"path": path, "field": field})
     if parsed.username or parsed.password:
         raise ValidationError("URL 不能包含账号或密码", details={"path": path, "field": field})
-    host = parsed.hostname.strip().lower()
-    if host == "localhost":
+    host = parsed.hostname.strip().lower().rstrip(".")
+    if host == "localhost" or host.endswith(".localhost"):
         raise ValidationError(
             "URL 不能指向本机地址", details={"path": path, "field": field, "host": host}
         )
