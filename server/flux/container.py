@@ -383,7 +383,10 @@ class Container:
         self.shared_user_memory_repo = SharedUserMemoryRepository(
             self.session_factory  # type: ignore[attr-defined]
         )
-        self.shared_user_memory = SharedUserMemoryService(self.shared_user_memory_repo)
+        self.shared_user_memory = SharedUserMemoryService(
+            self.shared_user_memory_repo,
+            settings=self.settings,  # type: ignore[attr-defined]
+        )
         # 制品页面：管理面走 REST，公开面只按不可猜测的 share_token 读取 published
         self.pages = ArtifactPageService(ArtifactPageRepository(self.session_factory))  # type: ignore[attr-defined]
         # 技能库：正文存库、按 Bot 分配，对话轮次只做 context 注入（不经过 agent_runtime）

@@ -734,20 +734,31 @@ class BotConversationService:
             self._active_turns.pop(pending.bot_id, None)
 
     async def _memory_block(self, cloud_user_id: str | None) -> str:
-        """按本轮人格读取三层记忆（Environment + User + 共享空间 Shared）。
+        """按本轮人格读取记忆（Environment + User + 共享空间 + 本人的画像/日志）。
 
         读取失败只降级为「没有记忆块」，不影响本轮对话。没有可解析的人时，
-        MemoryService 的既有口径是回退到配置的主用户（兼容历史行为）。
+        既有口径是回退到配置的主用户（兼容历史行为）；画像/日志同样只注入
+        那个人的条目，别人的私有画像不会出现在这里。
         """
+        parts: list[str] = []
         memory = getattr(self._container, "memory", None)
-        if memory is None:
-            return ""
-        try:
-            data = await memory.recall(cloud_user_id=cloud_user_id)
-            return str(data.get("content") or "")
-        except Exception:  # noqa: BLE001 - 记忆只是上下文增强，失败不能打断 turn
-            logger.warning("Bot 记忆渲染失败，本轮仅使用 Bot 记忆", exc_info=True)
-            return ""
+        if memory is not None:
+            try:
+                data = await memory.recall(cloud_user_id=cloud_user_id)
+                content = str(data.get("content") or "")
+                if content:
+                    parts.append(content)
+            except Exception:  # noqa: BLE001 - 记忆只是上下文增强，不能打断 turn
+                logger.warning("Bot 记忆渲染失败，本轮仅使用 Bot 记忆", exc_info=True)
+        shared_user = getattr(self._container, "shared_user_memory", None)
+        if shared_user is not None:
+            try:
+                block = await shared_user.render_block(cloud_user_id=cloud_user_id)
+                if block:
+                    parts.append(block.rstrip())
+            except Exception:  # noqa: BLE001 - 画像/日志同样只是上下文增强
+                logger.warning("用户画像/日志渲染失败，本轮不注入", exc_info=True)
+        return "\n\n".join(parts)
 
     async def _skills_block(self, bot: Bot) -> str:
         """读取分配给该 Bot 的启用技能；任何失败都降级为空串，不影响本轮对话。"""

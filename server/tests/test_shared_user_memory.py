@@ -182,7 +182,7 @@ def test_combined_view(client: TestClient) -> None:
 def test_turn_context_contains_shared_space_and_bot_memory(client: TestClient) -> None:
     fake = _fake(client)
     bot = _create_bot(client, name="小方", description="负责巡检")
-    # 全局共享画像 / 日志不再注入 Bot 对话（它们没有按人隔离）。
+    # Phase 4：画像 / 日志按人隔离；本地请求回退到主用户，因此会注入主用户自己的条目。
     client.put(f"{MEMORY_PREFIX}/profile", json={"name": "张三", "notes": "偏好中文汇报"})
     _append_journal(client, "用户对磁盘告警很敏感")
 
@@ -209,9 +209,9 @@ def test_turn_context_contains_shared_space_and_bot_memory(client: TestClient) -
     # 共享空间记忆按成员身份注入
     assert "共享空间「我们俩」" in context
     assert "周末一起整理磁盘" in context
-    # 未按人隔离的全局画像 / 日志不再出现
-    assert "偏好中文汇报" not in context
-    assert "用户对磁盘告警很敏感" not in context
+    # 当前人（主用户）自己的画像 / 日志随轮次注入
+    assert "偏好中文汇报" in context
+    assert "用户对磁盘告警很敏感" in context
 
 
 def test_shared_memory_failure_does_not_fail_turn(
