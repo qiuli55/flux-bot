@@ -18,6 +18,10 @@ from flux.core.approval_rules.evaluator import (
     raise_rule_approval,
     require_approval_if_rule_matches,
 )
+from flux.core.approval_rules.payment import (
+    evaluate_payment_approval,
+    require_payment_approval_if_needed,
+)
 
 __all__ = [
     "ACTION_OUTBOUND_MESSAGE",
@@ -30,8 +34,10 @@ __all__ = [
     "RuleSpec",
     "ensure_outcome_allowed",
     "evaluate_approval",
+    "evaluate_payment_approval",
     "evaluate_rules",
     "match_rule",
     "raise_rule_approval",
     "require_approval_if_rule_matches",
+    "require_payment_approval_if_needed",
 ]
