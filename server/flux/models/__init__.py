@@ -8,6 +8,7 @@ from flux.models.agent_installation import AgentInstallation
 from flux.models.agent_run import AgentRun
 from flux.models.agent_token import AgentToken
 from flux.models.api_key import ApiKey
+from flux.models.approval_rule import ApprovalRule
 from flux.models.apply_batch import ApplyBatch
 from flux.models.artifact_page import ArtifactPage, ArtifactPageRevision
 from flux.models.base import Base
@@ -73,6 +74,7 @@ __all__ = [
     "AgentSkill",
     "AgentToken",
     "ApiKey",
+    "ApprovalRule",
     "ApplyBatch",
     "ArtifactPage",
     "ArtifactPageRevision",
