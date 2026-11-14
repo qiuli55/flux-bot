@@ -257,6 +257,23 @@ class SecureInputRequest(BaseModel):
     value: str = Field(min_length=1, max_length=4096)
 
 
+class ComponentActionRequest(BaseModel):
+    """组件卡片上的服务端动作提交（按钮 / 选项 / 安全输入）。
+
+    客户端只回传服务端铸造的 `action_id` 与用户填的值；动作名、decision_id 等
+    一律以落库的组件树为准，不接受客户端自造。
+    """
+
+    action_id: str = Field(min_length=1, max_length=128)
+    #: 安全输入的明文值（只出现在本次请求里，落库即加密）。
+    value: str | None = Field(default=None, max_length=4096)
+    #: choice 多选提交的选项 id。
+    values: list[str] = Field(default_factory=list, max_length=50)
+    #: 决策选择；省略时用动作里预先写好的 option。
+    option: str | None = Field(default=None, max_length=512)
+    note: str | None = Field(default=None, max_length=2000)
+
+
 class ConfirmationItem(BaseModel):
     """需求确认的一项：维度 + 结论（P0-06 六个固定维度，label 由服务端校验）。"""
 

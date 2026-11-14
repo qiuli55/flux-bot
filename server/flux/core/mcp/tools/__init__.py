@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from flux.core.mcp.tools.approval_rule_tools import approval_rule_tools
 from flux.core.mcp.tools.base import ToolContext, ToolSpec
+from flux.core.mcp.tools.component_tools import component_tools
 from flux.core.mcp.tools.delivery_tools import delivery_tools
 from flux.core.mcp.tools.design_tools import design_tools
 from flux.core.mcp.tools.knowledge_tools import knowledge_tools
@@ -39,6 +40,7 @@ ALL_TOOLS: tuple[ToolSpec, ...] = (
     *preview_tools(),
     *design_tools(),
     *delivery_tools(),
+    *component_tools(),
     *plan_tools(),
     *supervisor_tools(),
     *knowledge_tools(),

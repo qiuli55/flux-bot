@@ -67,6 +67,13 @@ def test_health_endpoints_present(client: TestClient) -> None:
     assert "/api/v1/health/ready" in paths
 
 
+def test_component_action_callback_is_exposed(client: TestClient) -> None:
+    """生成式组件的服务端动作回调必须在契约里可见（App 按钮/输入提交依赖）。"""
+    paths = _schema(client)["paths"]
+    path = "/api/v1/tasks/{task_id}/messages/{message_id}/actions"
+    assert "post" in paths[path]
+
+
 def test_approval_rule_endpoints_are_exposed(client: TestClient) -> None:
     """全局审批规则的 CRUD 必须在契约里可见（App 设置页依赖）。"""
     paths = _schema(client)["paths"]
