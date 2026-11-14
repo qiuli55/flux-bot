@@ -26,6 +26,7 @@ from fastapi.testclient import TestClient
 
 from flux.core.agent_runtime.protocol import build_runtime_env
 from flux.core.agent_runtime.runtimes.cli import _CLAUDE_PERMISSION_MODES
+from flux.core.approval_rules import evaluator as approval_evaluator
 from flux.core.mcp.auth import AgentIdentity
 from flux.core.mcp.server import McpServer, _attach_run_id
 from flux.core.mcp.tools.base import ToolContext
@@ -251,13 +252,35 @@ async def test_attach_run_id_carries_run_permission_mode(apply_container) -> Non
 # ---------------------------------------------------------------- 4. 审批闸门
 
 
-async def _seed_task_and_run(container, *, mode: str = "normal"):
+async def _seed_rule(
+    container,
+    *,
+    cloud_user_id: str = "1",
+    rule_type: str = "command_pattern",
+    params: dict | None = None,
+):
+    return await container.approval_rules.create(
+        cloud_user_id=cloud_user_id,
+        rule_type=rule_type,
+        params=params or {"pattern": "rm -rf *", "style": "glob"},
+    )
+
+
+async def _seed_task_and_run(
+    container,
+    *,
+    mode: str = "normal",
+    cloud_user_id: str | None = None,
+    bot_id: uuid.UUID | None = None,
+):
     task = await container.task_repo.create(
         task_id=uuid.uuid4(),
         description="审批闸门用例",
         priority=1,
         project_id=None,
         agent_id=None,
+        cloud_user_id=cloud_user_id,
+        bot_id=bot_id,
     )
     run_id = uuid.uuid4().hex
     await container.run_repo.create(
@@ -272,16 +295,15 @@ async def _seed_task_and_run(container, *, mode: str = "normal"):
     return task, run_id
 
 
-async def test_approval_allow_runs_the_command(apply_container, monkeypatch) -> None:
+async def test_rule_match_allow_runs_the_command(apply_container, monkeypatch) -> None:
     task, run_id = await _seed_task_and_run(apply_container)
     ctx = _ctx(apply_container, mode="normal", run_id=run_id)
+    rule = await _seed_rule(apply_container)
 
-    async def fake_raise(container, **kwargs):
-        return await raise_approval(container, **kwargs)
-
-    monkeypatch.setattr(terminal_tools, "raise_approval", fake_raise)
     monkeypatch.setattr(
-        terminal_tools, "wait_for_approval", lambda *a, **k: _allow(apply_container, task.id)
+        approval_evaluator,
+        "wait_for_approval",
+        lambda *a, **k: _allow(apply_container, task.id),
     )
 
     await terminal_tools._approve_if_needed(ctx, "rm -rf build")
@@ -291,6 +313,7 @@ async def test_approval_allow_runs_the_command(apply_container, monkeypatch) -> 
     record = fresh.decisions[-1]
     assert record["chosen"] == APPROVAL_ALLOW
     assert record["status"] == DecisionStatus.RESOLVED.value
+    assert record["meta"]["approval_rule_id"] == str(rule.id)
 
 
 async def _allow(container, task_id) -> str:
@@ -310,93 +333,128 @@ async def _allow(container, task_id) -> str:
     return "allowed"
 
 
-async def test_approval_denied_raises_and_does_not_run(apply_container, monkeypatch) -> None:
+async def test_rule_match_denied_raises_and_does_not_run(apply_container, monkeypatch) -> None:
     task, run_id = await _seed_task_and_run(apply_container)
     ctx = _ctx(apply_container, mode="normal", run_id=run_id)
+    await _seed_rule(apply_container)
 
     async def deny(*args, **kwargs):
         return "denied"
 
-    monkeypatch.setattr(
-        terminal_tools, "raise_approval", lambda *a, **k: _raise_real(apply_container, **k)
-    )
-    monkeypatch.setattr(terminal_tools, "wait_for_approval", deny)
+    monkeypatch.setattr(approval_evaluator, "wait_for_approval", deny)
 
     with pytest.raises(ApprovalDeniedError):
         await terminal_tools._approve_if_needed(ctx, "rm -rf build")
 
 
-async def _raise_real(container, **kwargs):
-    return await raise_approval(container, **kwargs)
-
-
-async def test_full_mode_skips_high_risk_but_asks_for_protected(
+async def test_empty_rules_never_ask_even_for_high_risk_or_protected(
     apply_container, monkeypatch
 ) -> None:
-    task, run_id = await _seed_task_and_run(apply_container, mode="full")
-    ctx = _ctx(apply_container, mode="full", run_id=run_id)
+    """默认零审批：空规则表下高风险 / 受保护命令在所有模式都直接执行。"""
     calls: list[str] = []
 
-    async def fake_raise(container, **kwargs):
+    async def fake_raise_rule(container, **kwargs):
         calls.append(kwargs["kind"])
-        return {"id": "d-1"}
+        return "allowed"
 
-    monkeypatch.setattr(terminal_tools, "raise_approval", fake_raise)
-    monkeypatch.setattr(terminal_tools, "wait_for_approval", lambda *a, **k: _allowed())
-
-    await terminal_tools._approve_if_needed(ctx, "rm -rf build")
-    assert calls == []
-
-    await terminal_tools._approve_if_needed(ctx, "systemctl restart nginx")
-    assert calls == ["protected_access"]
-
-
-async def _allowed() -> str:
-    return "allowed"
+    monkeypatch.setattr(terminal_tools, "raise_rule_approval", fake_raise_rule)
+    for mode in ("normal", "full", "unattended"):
+        _task, run_id = await _seed_task_and_run(apply_container, mode=mode)
+        ctx = _ctx(apply_container, mode=mode, run_id=run_id)
+        await terminal_tools._approve_if_needed(ctx, "rm -rf build")
+        await terminal_tools._approve_if_needed(ctx, "systemctl restart nginx")
+        await terminal_tools._approve_if_needed(ctx, "cat /root/.ssh/id_rsa")
+        assert calls == [], mode
 
 
-async def test_unattended_mode_never_asks_even_for_protected(apply_container, monkeypatch) -> None:
-    """免审核模式：高风险与受保护对象都不落审批卡，只留审计日志。"""
-    task, run_id = await _seed_task_and_run(apply_container, mode="unattended")
-    ctx = _ctx(apply_container, mode="unattended", run_id=run_id)
+async def test_rule_matches_in_full_and_unattended_modes(apply_container, monkeypatch) -> None:
+    """规则是用户策略：Full / Unattended 下命中规则仍然要问。"""
+    await _seed_rule(apply_container, params={"pattern": "systemctl *", "style": "glob"})
     calls: list[str] = []
 
-    async def fake_raise(container, **kwargs):
+    async def fake_raise_rule(container, **kwargs):
         calls.append(kwargs["kind"])
-        return {"id": "d-1"}
+        return "allowed"
 
-    monkeypatch.setattr(terminal_tools, "raise_approval", fake_raise)
-    monkeypatch.setattr(terminal_tools, "wait_for_approval", lambda *a, **k: _allowed())
+    monkeypatch.setattr(terminal_tools, "raise_rule_approval", fake_raise_rule)
+    for mode in ("normal", "full", "unattended"):
+        calls.clear()
+        _task, run_id = await _seed_task_and_run(apply_container, mode=mode)
+        ctx = _ctx(apply_container, mode=mode, run_id=run_id)
 
-    await terminal_tools._approve_if_needed(ctx, "rm -rf build")
-    await terminal_tools._approve_if_needed(ctx, "systemctl restart nginx")
-    await terminal_tools._approve_if_needed(ctx, "cat /root/.ssh/id_rsa")
+        await terminal_tools._approve_if_needed(ctx, "rm -rf build")
+        assert calls == [], mode
 
-    assert calls == []
-    fresh = await apply_container.task_repo.get(task.id)
-    assert (fresh.decisions or []) == []
+        await terminal_tools._approve_if_needed(ctx, "systemctl restart nginx")
+        assert calls == ["protected_access"], mode
 
 
-async def test_normal_mode_asks_for_high_risk(apply_container, monkeypatch) -> None:
-    task, run_id = await _seed_task_and_run(apply_container)
+async def test_normal_mode_only_asks_when_rule_matches(apply_container, monkeypatch) -> None:
+    _task, run_id = await _seed_task_and_run(apply_container)
     ctx = _ctx(apply_container, mode="normal", run_id=run_id)
     calls: list[str] = []
 
-    async def fake_raise(container, **kwargs):
+    async def fake_raise_rule(container, **kwargs):
         calls.append(kwargs["kind"])
-        return {"id": "d-1"}
+        return "allowed"
 
-    monkeypatch.setattr(terminal_tools, "raise_approval", fake_raise)
-    monkeypatch.setattr(terminal_tools, "wait_for_approval", lambda *a, **k: _allowed())
+    monkeypatch.setattr(terminal_tools, "raise_rule_approval", fake_raise_rule)
 
     await terminal_tools._approve_if_needed(ctx, "ls -la")
     assert calls == []
 
+    # 没有规则时高风险命令也不再自动询问
+    await terminal_tools._approve_if_needed(ctx, "npm install")
+    assert calls == []
+
+    await _seed_rule(apply_container, params={"pattern": "npm *", "style": "glob"})
     await terminal_tools._approve_if_needed(ctx, "npm install")
     assert calls == ["high_risk_command"]
 
 
-async def test_protected_without_run_is_fail_closed(apply_container) -> None:
+async def test_rule_applies_to_all_bots_of_the_same_user(apply_container, monkeypatch) -> None:
+    """规则属于云用户，不属于单个 Bot：同一用户的任意 Bot 都会命中。"""
+    await _seed_rule(
+        apply_container, cloud_user_id="2", params={"pattern": "rm -rf *", "style": "glob"}
+    )
+    calls: list[str] = []
+
+    async def fake_raise_rule(container, **kwargs):
+        calls.append(kwargs["kind"])
+        return "allowed"
+
+    monkeypatch.setattr(terminal_tools, "raise_rule_approval", fake_raise_rule)
+
+    bots = [await apply_container.bots.create(name=f"规则Bot{i}") for i in range(2)]
+    for bot in bots:
+        _task, run_id = await _seed_task_and_run(apply_container, cloud_user_id="2", bot_id=bot.id)
+        ctx = _ctx(apply_container, mode="normal", run_id=run_id)
+        await terminal_tools._approve_if_needed(ctx, "rm -rf build")
+
+    assert calls == ["high_risk_command", "high_risk_command"]
+
+
+async def test_other_users_rules_never_apply(apply_container, monkeypatch) -> None:
+    await _seed_rule(
+        apply_container, cloud_user_id="2", params={"pattern": "rm -rf *", "style": "glob"}
+    )
+    calls: list[str] = []
+
+    async def fake_raise_rule(container, **kwargs):
+        calls.append(kwargs["kind"])
+        return "allowed"
+
+    monkeypatch.setattr(terminal_tools, "raise_rule_approval", fake_raise_rule)
+
+    _task, run_id = await _seed_task_and_run(apply_container, cloud_user_id="3")
+    ctx = _ctx(apply_container, mode="normal", run_id=run_id)
+    await terminal_tools._approve_if_needed(ctx, "rm -rf build")
+
+    assert calls == []
+
+
+async def test_rule_match_without_run_is_fail_closed(apply_container) -> None:
+    await _seed_rule(apply_container, params={"pattern": "systemctl *", "style": "glob"})
     ctx = _ctx(apply_container, mode="full", run_id=None)
     with pytest.raises(ConflictError):
         await terminal_tools._approve_if_needed(ctx, "systemctl restart nginx")
@@ -697,54 +755,56 @@ async def test_opencode_permission_handler_error_is_rejected() -> None:
 async def _native(
     container, monkeypatch, *, command: str, mode: str, run_id: str
 ) -> tuple[bool, list[str]]:
-    """跑一次原生审批；返回(是否放行, 被发起的审批 kind 列表)。"""
+    """跑一次原生审批；返回(是否放行, 被规则触发的审批 kind 列表)。"""
     cli = importlib.import_module("flux.core.agent_runtime.runtimes.cli")
     kinds: list[str] = []
 
-    async def fake_raise(container, **kwargs):
+    async def fake_raise_rule(container, **kwargs):
         kinds.append(kwargs["kind"])
-        return {"id": "d-native"}
-
-    async def fake_wait(container, **kwargs):
         return "allowed"
 
-    monkeypatch.setattr(cli, "raise_approval", fake_raise)
-    monkeypatch.setattr(cli, "wait_for_approval", fake_wait)
+    monkeypatch.setattr(cli, "raise_rule_approval", fake_raise_rule)
     allowed = await cli.approve_native_command(
         container, runtime_id="codex", run_id=run_id, command=command, mode=mode
     )
     return allowed, kinds
 
 
-async def test_native_low_risk_runs_without_asking(apply_container, monkeypatch) -> None:
-    task, run_id = await _seed_task_and_run(apply_container)
-    allowed, kinds = await _native(
-        apply_container, monkeypatch, command="ls -la", mode="normal", run_id=run_id
-    )
-    assert allowed is True
-    assert kinds == []
+async def test_native_empty_rules_never_ask(apply_container, monkeypatch) -> None:
+    """默认零审批：没有规则时低风险、高风险、受保护命令都直接放行。"""
+    for command, mode in (
+        ("ls -la", "normal"),
+        ("rm -rf /tmp/probe", "normal"),
+        ("rm -rf /tmp/probe", "full"),
+        ("systemctl restart nginx", "full"),
+        ("cat /root/.ssh/id_ed25519", "unattended"),
+    ):
+        _task, run_id = await _seed_task_and_run(apply_container, mode=mode)
+        allowed, kinds = await _native(
+            apply_container, monkeypatch, command=command, mode=mode, run_id=run_id
+        )
+        assert allowed is True
+        assert kinds == []
 
 
-async def test_native_high_risk_in_full_runs_without_asking(apply_container, monkeypatch) -> None:
-    task, run_id = await _seed_task_and_run(apply_container, mode="full")
-    allowed, kinds = await _native(
-        apply_container, monkeypatch, command="rm -rf /tmp/probe", mode="full", run_id=run_id
-    )
-    assert allowed is True
-    assert kinds == []
+async def test_native_rule_match_asks_in_every_mode(apply_container, monkeypatch) -> None:
+    await _seed_rule(apply_container, params={"pattern": "rm -rf *", "style": "glob"})
+    for mode in ("normal", "full", "unattended"):
+        _task, run_id = await _seed_task_and_run(apply_container, mode=mode)
+        allowed, kinds = await _native(
+            apply_container,
+            monkeypatch,
+            command="rm -rf /tmp/probe",
+            mode=mode,
+            run_id=run_id,
+        )
+        assert allowed is True
+        assert kinds == ["high_risk_command"], mode
 
 
-async def test_native_high_risk_in_normal_asks_user(apply_container, monkeypatch) -> None:
-    task, run_id = await _seed_task_and_run(apply_container)
-    allowed, kinds = await _native(
-        apply_container, monkeypatch, command="rm -rf /tmp/probe", mode="normal", run_id=run_id
-    )
-    assert allowed is True
-    assert kinds == ["high_risk_command"]
-
-
-async def test_native_protected_asks_even_in_full(apply_container, monkeypatch) -> None:
-    task, run_id = await _seed_task_and_run(apply_container, mode="full")
+async def test_native_protected_rule_uses_protected_card(apply_container, monkeypatch) -> None:
+    await _seed_rule(apply_container, params={"pattern": "cat /root/.ssh/*", "style": "glob"})
+    _task, run_id = await _seed_task_and_run(apply_container, mode="full")
     allowed, kinds = await _native(
         apply_container,
         monkeypatch,
@@ -756,22 +816,8 @@ async def test_native_protected_asks_even_in_full(apply_container, monkeypatch) 
     assert kinds == ["protected_access"]
 
 
-async def test_native_unattended_never_asks(apply_container, monkeypatch) -> None:
-    """免审核模式下 codex 原生 shell 的高风险与受保护命令都直接放行。"""
-    task, run_id = await _seed_task_and_run(apply_container, mode="unattended")
-    allowed, kinds = await _native(
-        apply_container,
-        monkeypatch,
-        command="systemctl restart nginx",
-        mode="unattended",
-        run_id=run_id,
-    )
-    assert allowed is True
-    assert kinds == []
-
-
 async def test_native_plan_mode_never_allows(apply_container, monkeypatch) -> None:
-    task, run_id = await _seed_task_and_run(apply_container, mode="plan")
+    _task, run_id = await _seed_task_and_run(apply_container, mode="plan")
     allowed, kinds = await _native(
         apply_container, monkeypatch, command="ls", mode="plan", run_id=run_id
     )
@@ -795,19 +841,24 @@ def test_default_mode_has_no_direct_write_or_push_tools() -> None:
     assert classify_command("echo hi > app.py").level == LEVEL_HIGH
 
 
-async def test_default_mode_push_stops_for_approval(apply_container, monkeypatch) -> None:
-    """默认模式下 `git push` 不会直接执行：先落审批卡，等用户点「允许」。"""
+async def test_default_mode_push_stops_only_when_a_rule_matches(
+    apply_container, monkeypatch
+) -> None:
+    """`git push` 默认直接执行；用户添加命令规则后才落审批卡。"""
     task, run_id = await _seed_task_and_run(apply_container)
     ctx = _ctx(apply_container, mode=PermissionMode.NORMAL.value, run_id=run_id)
     calls: list[str] = []
 
-    async def fake_raise(container, **kwargs):
+    async def fake_raise_rule(container, **kwargs):
         calls.append(kwargs["kind"])
-        return {"id": "d-1"}
+        return "allowed"
 
-    monkeypatch.setattr(terminal_tools, "raise_approval", fake_raise)
-    monkeypatch.setattr(terminal_tools, "wait_for_approval", lambda *a, **k: _allowed())
+    monkeypatch.setattr(terminal_tools, "raise_rule_approval", fake_raise_rule)
 
+    await terminal_tools._approve_if_needed(ctx, "git push origin main")
+    assert calls == []
+
+    await _seed_rule(apply_container, params={"pattern": "git push*", "style": "glob"})
     await terminal_tools._approve_if_needed(ctx, "git push origin main")
     assert calls == ["high_risk_command"]
 

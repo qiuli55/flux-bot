@@ -65,3 +65,10 @@ def test_health_endpoints_present(client: TestClient) -> None:
     paths = _schema(client)["paths"]
     assert "/api/v1/health" in paths
     assert "/api/v1/health/ready" in paths
+
+
+def test_approval_rule_endpoints_are_exposed(client: TestClient) -> None:
+    """全局审批规则的 CRUD 必须在契约里可见（App 设置页依赖）。"""
+    paths = _schema(client)["paths"]
+    assert {"get", "post"} <= set(paths["/api/v1/approval-rules"])
+    assert {"get", "patch", "delete"} <= set(paths["/api/v1/approval-rules/{rule_id}"])

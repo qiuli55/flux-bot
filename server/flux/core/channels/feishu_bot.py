@@ -11,10 +11,10 @@ Bot 的对话轮次，出站也必须经过审批闸门，而不是直接把报�
   不要重推；
 - `message_id` 作为 `client_turn_id`，重推不会产生第二轮。
 
-出站红线：**任何发给外部联系人的文本都不得自动发送**。turn 完成后只把待发送
-正文落进 `outbound_drafts`（pending），并调用 `raise_approval` 在对话里挂一张
-「允许 / 拒绝」卡。只有用户选择「允许」后，`on_approval_resolved` 才会原子认领
-草稿并真正调用飞书发送接口；拒绝、超时或进程重启时草稿仍留在库里，绝不自动发送。
+出站默认**不需要审批**：turn 完成后把正文落进 `outbound_drafts`，没有命中该用户的
+出站规则时立即原子认领并走官方发送接口（草稿标 sent 作为审计记录）。只有命中规则
+时才调用 `raise_approval` 挂「允许 / 拒绝」卡；拒绝、超时或进程重启时草稿留在库里，
+绝不发送。规则按 Flux 云用户隔离，A 的规则永不用于 B 的出站消息。
 """
 
 from __future__ import annotations
@@ -33,6 +33,13 @@ from urllib.parse import quote
 
 import httpx
 
+from flux.core.approval_rules.evaluator import (
+    ACTION_OUTBOUND_MESSAGE,
+    ApprovalAction,
+    ApprovalRuleMatch,
+    evaluate_approval,
+    rule_meta,
+)
 from flux.core.channels.binding_flow import resolve_media_inbound, resolve_text_inbound
 from flux.core.channels.feishu_crypto import FeishuCryptoError, decrypt_payload, verify_signature
 from flux.core.channels.inbound_media import (
@@ -58,6 +65,7 @@ from flux.core.task_engine.approvals import (
     outbound_approval_options,
     raise_approval,
 )
+from flux.core.user_scope import normalize_cloud_user_id
 from flux.errors import AIOSError, NotFoundError, ValidationError
 from flux.logging import get_logger
 
@@ -583,6 +591,15 @@ class FeishuBotChannel:
         if draft is None:
             logger.info("飞书出站草稿不存在或已被处理 draft=%s", raw_draft_id)
             return
+        await self._deliver_claimed_draft(draft)
+
+    async def _deliver_claimed_draft(self, draft: Any) -> None:
+        """发送一条已被原子认领（pending → sending）的草稿并落终态。
+
+        审批路径与「无规则自动发送」路径共用这一段：正文与附件都走同一套官方
+        发送接口，失败标 failed 并保留正文，成功才 mark_sent。
+        """
+        service = self._container.outbound_drafts
         dest = draft.dest if isinstance(draft.dest, dict) else {}
         chat_id = str(dest.get("chat_id") or "").strip()
         if draft.channel != "feishu" or not chat_id:
@@ -599,7 +616,7 @@ class FeishuBotChannel:
             # 不是「取走即丢」：标 failed 并保留正文，配置好凭据后仍可在草稿箱看到。
             await service.mark_failed(draft.id, "sender_not_configured")
             logger.error(
-                "未配置飞书应用凭据，审批通过的草稿无法发送 draft=%s chat=%s",
+                "未配置飞书应用凭据，草稿无法发送 draft=%s chat=%s",
                 draft.id,
                 chat_id,
             )
@@ -771,10 +788,11 @@ class FeishuBotChannel:
         task.add_done_callback(_cleanup)
 
     async def _track_turn(self, *, bot: Any, turn: Any, chat_id: str, message_id: str) -> None:
-        """等这一轮结束；有回复就入队，能挂卡时立刻挂审批，绝不直接发送。
+        """等这一轮结束；有回复就落草稿，命中出站规则才挂审批卡。
 
-        对话里已有待决策项时不再丢弃回复：草稿照常落库（decision_id 留空表示
-        「排队中」），等上一张决策卡被解决后由 `on_approval_resolved` 自动提升。
+        没有命中规则时立即发送（默认零审批）；对话里已有待决策项时不再丢弃回复：
+        草稿照常落库（decision_id 留空表示「排队中」），等上一张决策卡被解决后由
+        `on_approval_resolved` 自动提升。
         """
         try:
             final = await self._container.bot_conversation.wait_for_turn(
@@ -833,22 +851,50 @@ class FeishuBotChannel:
         async with self._approval_lock:
             await self._promote_next_locked(task_id)
 
+    def _owner_cloud_user_id(self) -> str | None:
+        return normalize_cloud_user_id(
+            getattr(self._container.settings, "owner_cloud_user_id", None)
+        )
+
+    async def _outbound_rule(self, draft: Any) -> ApprovalRuleMatch | None:
+        cloud_user_id = (
+            normalize_cloud_user_id(getattr(draft, "cloud_user_id", None))
+            or self._owner_cloud_user_id()
+        )
+        return await evaluate_approval(
+            self._container,
+            cloud_user_id=cloud_user_id,
+            action=ApprovalAction(kind=ACTION_OUTBOUND_MESSAGE, channel="feishu"),
+        )
+
     async def _promote_next_locked(self, task_id: uuid.UUID) -> None:
-        """在已持有 `_approval_lock` 的前提下，按入队顺序挂出下一张出站审批卡。"""
+        """在已持有 `_approval_lock` 的前提下处理排队草稿。
+
+        默认零审批：没有命中出站规则的草稿直接原子认领并发送；命中规则的才挂
+        审批卡，只有「允许」后由 `on_approval_resolved` 发送。
+        """
         service = getattr(self._container, "outbound_drafts", None)
         if service is None:  # pragma: no cover - 装配错误，按 fail-closed 跳过
-            return
-        try:
-            task = await self._container.task_repo.get(task_id)
-        except NotFoundError:
-            return
-        if task.pending_decision() is not None:
-            # 同一对话同一时刻只挂一张卡；等这张卡被解决后会再次触发提升。
             return
 
         for _ in range(_MAX_QUEUE_PROMOTIONS):
             draft = await service.next_queued(channel="feishu", task_id=task_id)
             if draft is None:
+                return
+            match = await self._outbound_rule(draft)
+            if match is None:
+                claimed = await service.claim(draft.id)
+                if claimed is None:
+                    continue
+                await self._deliver_claimed_draft(claimed)
+                continue
+
+            try:
+                task = await self._container.task_repo.get(task_id)
+            except NotFoundError:
+                return
+            if task.pending_decision() is not None:
+                # 同一对话同一时刻只挂一张卡；等这张卡被解决后会再次触发提升。
                 return
             decision_id = uuid.uuid4().hex
             claimed = await service.claim_for_approval(draft.id, decision_id)
@@ -860,13 +906,15 @@ class FeishuBotChannel:
                 if task.pending_decision() is not None:
                     await service.release_approval(claimed.id, decision_id)
                     return
-                await self._raise_outbound_approval(claimed, decision_id)
+                await self._raise_outbound_approval(claimed, decision_id, match)
             except Exception:  # noqa: BLE001 - 挂卡失败退回队列，不丢草稿
                 await service.release_approval(claimed.id, decision_id)
                 logger.exception("飞书排队出站审批提升失败 draft=%s task=%s", claimed.id, task_id)
             return
 
-    async def _raise_outbound_approval(self, draft: Any, decision_id: str) -> None:
+    async def _raise_outbound_approval(
+        self, draft: Any, decision_id: str, match: ApprovalRuleMatch
+    ) -> None:
         """为一条已认领的草稿挂审批卡；文案只谈发送，不谈终端命令。"""
         dest = draft.dest if isinstance(draft.dest, dict) else {}
         chat_id = str(dest.get("chat_id") or "").strip()
@@ -874,6 +922,12 @@ class FeishuBotChannel:
         bot_id = str(draft.bot_id) if draft.bot_id is not None else ""
         turn_id = str(draft.turn_id) if draft.turn_id is not None else ""
         records = attachment_records(draft.attachments)
+        detail = render_outbound_detail(
+            f"准备发送到飞书会话 {chat_id}（消息 {message_id}）：",
+            draft.body,
+            records,
+        )
+        detail = f"{detail}\n\n触发规则：{match.rule.description or match.reason}"
         await raise_approval(
             self._container,
             task_id=draft.task_id,
@@ -881,11 +935,7 @@ class FeishuBotChannel:
             kind=FEISHU_OUTBOUND_KIND,
             decision_id=decision_id,
             title="飞书回复等待你确认",
-            detail=render_outbound_detail(
-                f"准备发送到飞书会话 {chat_id}（消息 {message_id}）：",
-                draft.body,
-                records,
-            ),
+            detail=detail,
             meta={
                 "channel": "feishu",
                 "draft_id": str(draft.id),
@@ -897,16 +947,18 @@ class FeishuBotChannel:
                 "chars": len(draft.body or ""),
                 "attachment_count": len(records),
                 "attachments": attachment_meta(records),
+                **rule_meta(match),
             },
             options=outbound_approval_options(CHANNEL_LABEL),
         )
         logger.info(
-            "飞书出站审批已创建 draft=%s task=%s hash=%s chars=%s files=%s",
+            "飞书出站审批已创建 draft=%s task=%s hash=%s chars=%s files=%s approval_rule=%s",
             draft.id,
             draft.task_id,
             draft.body_hash,
             len(draft.body or ""),
             len(records),
+            match.rule.id,
         )
 
 

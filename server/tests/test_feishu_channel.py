@@ -331,14 +331,28 @@ def _wait_next_pending(
 
 
 @contextmanager
-def _callback_client(settings: Settings) -> Iterator[tuple[TestClient, Container, dict]]:
-    """起 app、建一个 Bot、把频道指向它，并替换掉真实模型与发送端。"""
+def _callback_client(
+    settings: Settings, *, outbound_rule: bool = True
+) -> Iterator[tuple[TestClient, Container, dict]]:
+    """起 app、建一个 Bot、把频道指向它，并替换掉真实模型与发送端。
+
+    默认插入一条 outbound_message 规则，让审批相关用例保持「命中规则才挂卡」的
+    语义；验证默认零审批的用例传 `outbound_rule=False`。
+    """
     with _app(settings, feishu_verification_token=VERIFY_TOKEN) as (client, container):
         asyncio.run(
             container.channel_bindings.bind(
                 channel="feishu", external_user_id="ou_test", cloud_user_id="1"
             )
         )
+        if outbound_rule:
+            asyncio.run(
+                container.approval_rules.create(
+                    cloud_user_id="1",
+                    rule_type="outbound_message",
+                    params={"channel": "feishu"},
+                )
+            )
         container.assistant = _FakeAssistant()  # type: ignore[assignment]
         created = client.post(f"{PREFIX}/bots", json={"name": "飞书小助", "description": "接飞书"})
         assert created.status_code == 200, created.text
@@ -673,7 +687,51 @@ async def test_message_event_without_bot_id_is_fail_closed() -> None:
     assert "FLUX_FEISHU_BOT_ID" in result.payload["error"]
 
 
-# --- 入站 → 审批草稿 → 允许/拒绝 ---
+# --- 默认零审批：没有规则就直接发送 ---
+
+
+def _wait_sent(client: TestClient, channel: str, task_id: str, timeout: float = 8.0) -> list[dict]:
+    deadline = time.monotonic() + timeout
+    rows: list[dict] = []
+    while time.monotonic() < deadline:
+        data = client.get(f"{PREFIX}/outbound-drafts", params={"channel": channel}).json()["data"]
+        rows = [row for row in data if row["task_id"] == task_id and row["status"] == "sent"]
+        if rows:
+            return rows
+        time.sleep(0.02)
+    raise AssertionError("等待自动发送超时")
+
+
+def test_no_outbound_rule_auto_sends_without_a_card(settings: Settings, db_schema: None) -> None:
+    """空规则表 = 默认零审批：直接走同一套官方发送路径，不挂卡、不等待。"""
+    with _callback_client(settings, outbound_rule=False) as (client, _container, context):
+        assert client.post(WEBHOOK, json=_plain_body()).status_code == 200
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        sent = _wait_sent(client, "feishu", bot["chat_task_id"])
+        assert context["sender"].messages == [(CHAT_ID, "echo: 你好")]
+        assert sent[0]["decision_id"] is None
+        task = client.get(f"{PREFIX}/tasks/{bot['chat_task_id']}").json()["data"]
+        assert task["pending_decision"] is None
+
+
+def test_no_rule_auto_sends_media_without_a_card(
+    settings: Settings, db_schema: None, tmp_path: Path
+) -> None:
+    payload = b"\x89PNG auto"
+    with _callback_client(settings, outbound_rule=False) as (client, container, context):
+        workspace = _use_workspace(container, tmp_path / "workspace")
+        (workspace / "chart.png").write_bytes(payload)
+        container.assistant = AttachingAssistant(path="chart.png", reply="")  # type: ignore[assignment]
+        assert client.post(WEBHOOK, json=_plain_body()).status_code == 200
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        _wait_sent(client, "feishu", bot["chat_task_id"])
+        assert context["sender"].messages == []
+        assert context["sender"].media[0]["bytes"] == payload
+        task = client.get(f"{PREFIX}/tasks/{bot['chat_task_id']}").json()["data"]
+        assert task["pending_decision"] is None
+
+
+# --- 命中出站规则 → 审批草稿 → 允许/拒绝 ---
 
 
 def test_inbound_creates_turn_but_never_sends_automatically(

@@ -3,8 +3,9 @@
 正常模式下 Claude Code 以 `--permission-mode default` 跑在无头 `-p` 里：任何需要用户点头
 的工具调用都会因为"没人能应答"被**静默拒绝**。本工具就是那个应答方——`cli.py` 在正常模式
 且 flux MCP 端点存在时追加 `--permission-prompt-tool mcp__flux__permission_prompt`，
-Claude Code 每次需要审批就把请求交给这里；这里复用 Flux 既有审批卡
-（`raise_approval` / `wait_for_approval`），用户在对话里点「允许 / 拒绝」。
+Claude Code 每次需要审批就把请求交给这里。**默认不审批**：只有命中该用户的审批规则
+（工具名 / 命令模式）才复用既有审批卡（`raise_approval` / `wait_for_approval`），
+否则直接 allow；用户在对话里点「允许 / 拒绝」。
 
 契约（Claude Code 2.1.x，2026-11 实测 `claude-ds` 2.1.322）：
 
@@ -20,7 +21,7 @@ Claude Code 每次需要审批就把请求交给这里；这里复用 Flux 既�
 三条边界：
 
 - **失败一律拒绝**：拿不到 Run、参数不合法、内部异常、审批超时、Run 已取消，全部 deny；
-  绝不在审批链路出错时默认放行。
+  绝不在审批链路出错时默认放行。没有规则命中则直接 allow（默认零审批）。
 - **审批桥本身不再审批**：`permission_prompt` 由 CLI 直接调用（不经模型工具面，实测不会
   再触发权限询问）；万一模型自己调用它，这里直接拒绝，避免审批套娃。
 - **不记录输入值**：日志只记 run / 工具名 / 决定 / 风险规则；审批卡上的预览先按敏感键
@@ -34,15 +35,18 @@ import re
 import uuid
 from typing import Any
 
+from flux.core.approval_rules.evaluator import (
+    ACTION_TOOL,
+    ApprovalAction,
+    evaluate_approval,
+    raise_rule_approval,
+)
 from flux.core.context.redact import redact
 from flux.core.mcp.tools.base import ToolContext, ToolSpec
 from flux.core.permissions.modes import normalize_mode
 from flux.core.permissions.risk import classify_command
-from flux.core.task_engine.approvals import (
-    APPROVAL_KIND_TOOL_PROMPT,
-    raise_approval,
-    wait_for_approval,
-)
+from flux.core.task_engine.approvals import APPROVAL_KIND_TOOL_PROMPT
+from flux.core.user_scope import normalize_cloud_user_id
 from flux.enums import Capability, DshRunStatus, PermissionMode
 from flux.logging import get_logger
 
@@ -216,10 +220,25 @@ async def _handle(ctx: ToolContext, params: dict[str, Any]) -> dict[str, Any]:
         )
         return _deny("本次 Run 关联的任务标识非法，已拒绝")
 
+    # 默认不审批：只有用户规则命中（工具名 / 命令匹配）时才挂卡。
+    # 没有规则就是「用户已允许」，直接回填原始入参，绝不留悬空审批卡。
+    cloud_user_id = await _task_cloud_user_id(ctx.container, task_id)
+    command = _bash_command(tool_input)
+    action = ApprovalAction(
+        kind=ACTION_TOOL,
+        tool_name=tool_name,
+        command=command,
+    )
+    match = await evaluate_approval(ctx.container, cloud_user_id=cloud_user_id, action=action)
+    if match is None:
+        logger.info("claude_permission.allow run=%s tool=%s reason=no_rule", run_id, tool_name)
+        return {"behavior": "allow", "updatedInput": tool_input}
+
     detail, risk_meta = _summarize(tool_name, tool_input)
     tool_use_id = params.get("tool_use_id")
-    record = await raise_approval(
+    outcome = await raise_rule_approval(
         ctx.container,
+        match=match,
         task_id=task_id,
         run_id=run_id,
         kind=APPROVAL_KIND_TOOL_PROMPT,
@@ -233,14 +252,13 @@ async def _handle(ctx: ToolContext, params: dict[str, Any]) -> dict[str, Any]:
             **risk_meta,
         },
     )
-    outcome = await wait_for_approval(
-        ctx.container,
-        task_id=task_id,
-        decision_id=str(record["id"]),
-        run_id=run_id,
-    )
     if outcome == "allowed":
-        logger.info("claude_permission.allow run=%s tool=%s decision=allow", run_id, tool_name)
+        logger.info(
+            "claude_permission.allow run=%s tool=%s approval_rule=%s",
+            run_id,
+            tool_name,
+            match.rule.id,
+        )
         # 旧版 Claude Code 要求 allow 必须带 updatedInput；原样回填原始入参。
         return {"behavior": "allow", "updatedInput": tool_input}
 
@@ -250,13 +268,29 @@ async def _handle(ctx: ToolContext, params: dict[str, Any]) -> dict[str, Any]:
         "cancelled": "本次 Run 已取消，已拒绝",
     }.get(outcome, f"审批结果无法识别（{outcome}），已拒绝")
     logger.info(
-        "claude_permission.deny run=%s tool=%s decision=%s decision_id=%s",
+        "claude_permission.deny run=%s tool=%s decision=%s approval_rule=%s",
         run_id,
         tool_name,
         outcome,
-        record["id"],
+        match.rule.id,
     )
     return _deny(message)
+
+
+async def _task_cloud_user_id(container: Any, task_id: uuid.UUID) -> str | None:
+    """run → task 的云用户归属；历史 NULL 回退部署主用户。"""
+    task_repo = getattr(container, "task_repo", None)
+    task = None
+    if task_repo is not None:
+        try:
+            task = await task_repo.get(task_id)
+        except Exception:  # noqa: BLE001 - 查不到任务只影响规则归属
+            task = None
+    user = normalize_cloud_user_id(getattr(task, "cloud_user_id", None))
+    if user:
+        return user
+    settings = getattr(container, "settings", None)
+    return normalize_cloud_user_id(getattr(settings, "owner_cloud_user_id", None))
 
 
 def permission_tools() -> tuple[ToolSpec, ...]:

@@ -305,6 +305,17 @@ async def raise_rule_approval(
     )
 
 
+def ensure_outcome_allowed(match: ApprovalRuleMatch, outcome: str) -> None:
+    """把审批结果映射成调用方异常；allowed 直接返回。"""
+    if outcome == "allowed":
+        return
+    if outcome == "denied":
+        raise ApprovalDeniedError(f"用户拒绝了这次操作（规则：{match.rule.description}）")
+    if outcome == "timeout":
+        raise ApprovalTimeoutError("审批超时（10 分钟）：操作未执行。需要时请重新申请。")
+    raise ApprovalCancelledError("任务已取消或结束，操作未执行")
+
+
 async def require_approval_if_rule_matches(
     container: Any,
     *,
@@ -336,13 +347,8 @@ async def require_approval_if_rule_matches(
         meta=meta,
         options=options,
     )
-    if outcome == "allowed":
-        return match
-    if outcome == "denied":
-        raise ApprovalDeniedError(f"用户拒绝了这次操作（规则：{match.rule.description}）")
-    if outcome == "timeout":
-        raise ApprovalTimeoutError("审批超时（10 分钟）：操作未执行。需要时请重新申请。")
-    raise ApprovalCancelledError("任务已取消或结束，操作未执行")
+    ensure_outcome_allowed(match, outcome)
+    return match
 
 
 __all__ = [
@@ -354,6 +360,7 @@ __all__ = [
     "ApprovalAction",
     "ApprovalRuleMatch",
     "RuleSpec",
+    "ensure_outcome_allowed",
     "evaluate_approval",
     "evaluate_rules",
     "match_rule",

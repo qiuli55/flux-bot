@@ -16,6 +16,13 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+from flux.core.approval_rules.evaluator import (
+    ACTION_TERMINAL_COMMAND,
+    ApprovalAction,
+    ensure_outcome_allowed,
+    evaluate_approval,
+    raise_rule_approval,
+)
 from flux.core.context.redact import redact
 from flux.core.mcp.tools.base import (
     ToolContext,
@@ -29,14 +36,10 @@ from flux.core.permissions.risk import LEVEL_HIGH, LEVEL_PROTECTED, classify_com
 from flux.core.task_engine.approvals import (
     APPROVAL_KIND_HIGH_RISK,
     APPROVAL_KIND_PROTECTED,
-    ApprovalCancelledError,
-    ApprovalDeniedError,
-    ApprovalTimeoutError,
-    raise_approval,
-    wait_for_approval,
+    APPROVAL_KIND_RULE_MATCH,
 )
-from flux.enums import Capability, PermissionMode, TerminalEventKind, TerminalSource
-from flux.errors import ConflictError
+from flux.core.user_scope import normalize_cloud_user_id
+from flux.enums import Capability, TerminalEventKind, TerminalSource
 from flux.logging import get_logger
 
 logger = get_logger(__name__)
@@ -71,45 +74,50 @@ def _run_uuid(ctx: ToolContext) -> uuid.UUID | None:
 
 
 async def _approve_if_needed(ctx: ToolContext, command: str) -> None:
-    """执行前的审批闸门：受保护对象在 Plan/正常/完全访问模式都问；高风险只在正常模式问。
+    """执行前只按用户规则审批：没有命中规则就直接执行。
 
-    Full 模式跳过 high（用户已明确风险自负），但 protected 仍然逐次询问；
-    Unattended 模式两者都放行（无人值守，用户明确要求不被打断）；
-    Plan 模式在 MCP 白名单层已被拒绝，走不到这里。拒绝/超时/取消都抛错，命令不执行。
+    分类结果不再自动触发审批，只用于**命中规则后**把卡片写得更清楚（等级 / 原因）。
+    规则对所有权限模式生效，包括 UNATTENDED 与 FULL——规则是用户的显式策略。
+    Plan 模式在 MCP 白名单层已被硬拒绝，走不到这里。
+
+    命中规则但没有可挂卡的 Run / Task 时 fail-closed（抛 ConflictError），命令不执行。
     """
     mode = normalize_mode(ctx.identity.permission_mode)
     report = classify_command(command)
-    if mode == PermissionMode.UNATTENDED.value:
-        # 免审核（无人值守）：任何等级都不落审批卡；保留日志供事后审计
-        logger.warning(
-            "terminal.unattended_allow mode=%s rule=%s level=%s command=%s",
-            mode,
-            report.rule,
-            report.level,
-            redact(command).text[:200],
-        )
+    task_id = await _task_uuid(ctx)
+    cloud_user_id = await _task_cloud_user_id(ctx, task_id)
+    action = ApprovalAction(
+        kind=ACTION_TERMINAL_COMMAND,
+        command=command,
+        tool_name="terminal.execute",
+    )
+    match = await evaluate_approval(ctx.container, cloud_user_id=cloud_user_id, action=action)
+    logger.info(
+        "terminal.rule_check mode=%s level=%s rule=%s approval_rule=%s",
+        mode,
+        report.level,
+        report.rule,
+        match.rule.id if match is not None else None,
+    )
+    if match is None:
+        # 默认行为：没有任何规则命中，直接执行（mode 不改变这个结论）。
         return
+
     if report.level == LEVEL_PROTECTED:
         kind = APPROVAL_KIND_PROTECTED
         title = "受保护操作 · 需要你确认"
-    elif report.level == LEVEL_HIGH and mode != PermissionMode.FULL.value:
+    elif report.level == LEVEL_HIGH:
         kind = APPROVAL_KIND_HIGH_RISK
         title = "高风险命令 · 需要你确认"
     else:
-        logger.info("terminal.risk_allow mode=%s rule=%s level=%s", mode, report.rule, report.level)
-        return
-
-    task_id = await _task_uuid(ctx)
-    if task_id is None:
-        # 无 Run 归属就找不到对话去落审批卡：fail-closed，不允许绕过闸门直接执行
-        raise ConflictError(
-            f"该命令需要用户审批（{report.reason}），但当前调用没有关联的 Run，无法发起审批"
-        )
+        kind = APPROVAL_KIND_RULE_MATCH
+        title = "命令命中审批规则 · 需要你确认"
 
     display_command = redact(command).text
     detail = f"{report.reason}\n\n命令：\n{display_command}"
-    record = await raise_approval(
+    outcome = await raise_rule_approval(
         ctx.container,
+        match=match,
         task_id=task_id,
         run_id=ctx.identity.run_id,
         kind=kind,
@@ -122,22 +130,31 @@ async def _approve_if_needed(ctx: ToolContext, command: str) -> None:
             "reason": report.reason,
         },
     )
-    outcome = await wait_for_approval(
-        ctx.container,
-        task_id=task_id,
-        decision_id=str(record["id"]),
-        run_id=ctx.identity.run_id,
+    logger.info(
+        "terminal.rule_approval mode=%s rule=%s approval_rule=%s outcome=%s",
+        mode,
+        report.rule,
+        match.rule.id,
+        outcome,
     )
-    if outcome == "allowed":
-        logger.info(
-            "terminal.approved mode=%s rule=%s decision=%s", mode, report.rule, record["id"]
-        )
-        return
-    if outcome == "denied":
-        raise ApprovalDeniedError(f"用户拒绝了这条命令（{report.rule}），未执行：{display_command}")
-    if outcome == "timeout":
-        raise ApprovalTimeoutError("审批超时（10 分钟）：命令未执行。需要时请向用户重新申请。")
-    raise ApprovalCancelledError("任务已取消或结束，命令未执行")
+    ensure_outcome_allowed(match, outcome)
+
+
+async def _task_cloud_user_id(ctx: ToolContext, task_id: uuid.UUID | None) -> str | None:
+    """动作归属的云用户：优先 task.cloud_user_id，历史 NULL 回退部署主用户。
+
+    没有 Run / Task 时同样回退主用户（与仓库既有的 legacy 归属规则一致）；
+    规则若命中而 task_id 为空，`raise_rule_approval` 会 fail-closed 拒绝执行。
+    """
+    if task_id is not None:
+        try:
+            task = await ctx.container.task_repo.get(task_id)
+        except Exception:  # noqa: BLE001 - 查不到任务只影响归属，不阻断分类
+            task = None
+        user = normalize_cloud_user_id(getattr(task, "cloud_user_id", None))
+        if user:
+            return user
+    return normalize_cloud_user_id(getattr(ctx.container.settings, "owner_cloud_user_id", None))
 
 
 async def _task_uuid(ctx: ToolContext) -> uuid.UUID | None:

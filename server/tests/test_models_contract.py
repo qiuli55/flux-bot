@@ -150,6 +150,8 @@ SPEC_TABLES = {
     "bot_skills",
     # 统一出站草稿（迁移 e2c9b7a4d1f3）：各频道待审批出站正文的持久化真相源。
     "outbound_drafts",
+    # 全局审批规则（迁移 a9c4e7f1b2d6）：按 Flux 云用户配置，空表 = 零审批。
+    "approval_rules",
     # Phase 3（迁移 b9f3c1d8a4e2）：IM 账号绑定 / 一次性绑定码，以及共享空间与成员。
     "channel_user_bindings",
     "channel_bind_codes",

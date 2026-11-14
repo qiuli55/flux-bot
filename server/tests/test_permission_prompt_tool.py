@@ -25,6 +25,7 @@ from flux.core.agent_runtime.runtimes.cli import (
     CLAUDE_PERMISSION_PROMPT_TOOL,
     CliRuntime,
 )
+from flux.core.approval_rules.evaluator import ApprovalRuleMatch, RuleSpec
 from flux.core.mcp.auth import AgentIdentity
 from flux.core.mcp.server import McpServer
 from flux.core.mcp.tools import TOOLS
@@ -84,19 +85,31 @@ def _ctx(
     )
 
 
+def _rule_match(tool_name: str = "Write") -> ApprovalRuleMatch:
+    return ApprovalRuleMatch(
+        rule=RuleSpec(
+            id="rule-1",
+            type="tool_match",
+            params={"tool_name": tool_name},
+            description="测试规则：该工具需要确认",
+        ),
+        reason="命中测试规则",
+    )
+
+
 def _install_approval(monkeypatch: pytest.MonkeyPatch, outcome: str) -> dict[str, Any]:
     captured: dict[str, Any] = {}
 
-    async def fake_raise(container: Any, **kwargs: Any) -> dict[str, Any]:
-        captured["raise"] = kwargs
-        return {"id": "decision-1"}
+    async def fake_evaluate(container: Any, *, cloud_user_id: Any, action: Any) -> Any:
+        captured["evaluated_for"] = cloud_user_id
+        return _rule_match(action.tool_name or "Write")
 
-    async def fake_wait(container: Any, **kwargs: Any) -> str:
-        captured["wait"] = kwargs
+    async def fake_raise_rule(container: Any, **kwargs: Any) -> str:
+        captured["raise"] = kwargs
         return outcome
 
-    monkeypatch.setattr(permission_tools, "raise_approval", fake_raise)
-    monkeypatch.setattr(permission_tools, "wait_for_approval", fake_wait)
+    monkeypatch.setattr(permission_tools, "evaluate_approval", fake_evaluate)
+    monkeypatch.setattr(permission_tools, "raise_rule_approval", fake_raise_rule)
     return captured
 
 
@@ -134,7 +147,7 @@ async def test_allow_returns_original_input(monkeypatch: pytest.MonkeyPatch) -> 
     assert raised["meta"]["tool_use_id"] == "call-1"
     assert raised["meta"]["source"] == "claude-permission-prompt"
     assert "content" in raised["detail"]
-    assert captured["wait"]["decision_id"] == "decision-1"
+    assert raised["match"].rule.id == "rule-1"
 
 
 async def test_deny_maps_to_deny_message(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -224,13 +237,36 @@ async def test_recursive_call_to_the_bridge_denies(monkeypatch: pytest.MonkeyPat
     assert "raise" not in captured
 
 
+async def test_no_rule_allows_without_a_card(monkeypatch: pytest.MonkeyPatch) -> None:
+    """默认零审批：没有命中规则时直接 allow，绝不挂一张悬空卡。"""
+    captured: dict[str, Any] = {}
+
+    async def fake_evaluate(container: Any, *, cloud_user_id: Any, action: Any) -> None:
+        return None
+
+    async def fake_raise_rule(container: Any, **kwargs: Any) -> str:
+        captured["raise"] = kwargs
+        return "allowed"
+
+    monkeypatch.setattr(permission_tools, "evaluate_approval", fake_evaluate)
+    monkeypatch.setattr(permission_tools, "raise_rule_approval", fake_raise_rule)
+
+    result = await permission_prompt(_ctx(), {"tool_name": "Write", "input": TOOL_INPUT})
+    assert result == {"behavior": "allow", "updatedInput": TOOL_INPUT}
+    assert "raise" not in captured
+
+
 async def test_internal_error_denies_and_logs(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    async def boom(container: Any, **kwargs: Any) -> dict[str, Any]:
+    async def boom(container: Any, **kwargs: Any) -> str:
         raise RuntimeError("db down")
 
-    monkeypatch.setattr(permission_tools, "raise_approval", boom)
+    async def fake_evaluate(container: Any, *, cloud_user_id: Any, action: Any) -> Any:
+        return _rule_match()
+
+    monkeypatch.setattr(permission_tools, "evaluate_approval", fake_evaluate)
+    monkeypatch.setattr(permission_tools, "raise_rule_approval", boom)
     with caplog.at_level(logging.WARNING, logger="flux.core.mcp.tools.permission_tools"):
         result = await permission_prompt(_ctx(), {"tool_name": "Write", "input": TOOL_INPUT})
 
