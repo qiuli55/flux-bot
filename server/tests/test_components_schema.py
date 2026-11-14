@@ -236,6 +236,56 @@ def test_delivery_reference_is_accepted_and_validated() -> None:
         validate_component({"type": "image", "delivery_id": "../etc/passwd"})
 
 
+def test_upload_id_reference_is_accepted_for_image_file_audio() -> None:
+    image = validate_component(
+        {"type": "image", "upload_id": "abc123", "alt": "截图", "mime": "image/png"}
+    )
+    assert image == {
+        "type": "image",
+        "upload_id": "abc123",
+        "alt": "截图",
+        "mime": "image/png",
+    }
+    assert "index" not in image
+
+    document = validate_component(
+        {"type": "file", "name": "报告.pdf", "upload_id": "abc123", "size": 10}
+    )
+    assert document["upload_id"] == "abc123"
+    assert document["name"] == "报告.pdf"
+
+    audio = validate_component({"type": "audio", "upload_id": "voice_1"})
+    assert audio == {"type": "audio", "upload_id": "voice_1"}
+
+
+@pytest.mark.parametrize(
+    "node",
+    [
+        # url / delivery_id / upload_id 必须且只能有一个
+        {"type": "image", "url": "https://x.dev/a.png", "upload_id": "abc123"},
+        {"type": "image", "delivery_id": "d1", "upload_id": "abc123"},
+        {
+            "type": "file",
+            "name": "x",
+            "url": "https://x.dev/a",
+            "delivery_id": "d1",
+            "upload_id": "abc123",
+        },
+        {"type": "image"},
+        # index 只属于 delivery_id
+        {"type": "image", "upload_id": "abc123", "index": 1},
+        # upload_id 只允许目录名安全字符
+        {"type": "image", "upload_id": "../etc/passwd"},
+        {"type": "image", "upload_id": "a/b"},
+        {"type": "image", "upload_id": ""},
+        {"type": "image", "upload_id": "x" * 65},
+    ],
+)
+def test_upload_id_source_is_exclusive_and_validated(node: dict) -> None:
+    with pytest.raises(ValidationError):
+        validate_component(node)
+
+
 # --- 文本 / 动作 ---
 
 

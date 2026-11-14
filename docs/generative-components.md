@@ -27,9 +27,9 @@ payload = {
 | --- | --- |
 | `card` | `title?`、`subtitle?`、`children`（节点数组） |
 | `text` | `text`、`markdown?`（默认 false，只作为数据） |
-| `image` | `url` 或 `delivery_id`（+`index?`）、`alt?`、`mime?`、`width?`、`height?` |
-| `file` | `name`、`url` 或 `delivery_id`（+`index?`）、`mime?`、`size?` |
-| `audio` | `url` 或 `delivery_id`（+`index?`）、`duration_ms?`、`transcript?` |
+| `image` | `url`、`delivery_id` 或 `upload_id`（三选一；`index` 仅 delivery）、`alt?`、`mime?`、`width?`、`height?` |
+| `file` | `name`、`url` / `delivery_id` / `upload_id`（三选一；`index` 仅 delivery）、`mime?`、`size?` |
+| `audio` | `url`、`delivery_id` 或 `upload_id`（三选一；`index` 仅 delivery）、`duration_ms?`、`transcript?` |
 | `button` | `label`、`action` |
 | `choice` | `name` 或 `id`、`options`（`[{id,label}]`）、`multiple?`、`action?` |
 | `input` | `name`、`placeholder?`、`input_type?`（`text` / `secure`）、`label?`、`action?` |
@@ -92,8 +92,10 @@ POST /api/v1/tasks/{task_id}/messages/{message_id}/actions
 
 深度 8、节点 200、单节点子项 50、文本 4000 字符、选项 20、整棵树 64KB；
 URL 只允许 `https`（拒绝 `javascript:` / `data:` / `file:` / `http:`、带账号密码、
-本机与私有地址）；文本不接受 HTML / 脚本片段。校验失败抛中文 `ValidationError`，
-非法树**不会**写进数据库。
+本机与私有地址）；文本不接受 HTML / 脚本片段。`upload_id` 只接受目录名安全字符，
+本身不含路径；读取走 `GET /api/v1/uploads/{upload_id}`，由服务端按登录人鉴权
+（跨用户与不存在都返回 404）。校验失败抛中文 `ValidationError`，非法树**不会**
+写进数据库。
 
 ## 安全边界
 

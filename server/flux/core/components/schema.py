@@ -8,9 +8,9 @@
 
 - `card`      容器：title / subtitle / children
 - `text`      正文：text，可选 markdown（只作为数据，服务端不执行任何标记）
-- `image`     图片：https url 或 delivery_id，可选 alt / mime / width / height
-- `file`      文件：name + https url 或 delivery_id，可选 mime / size
-- `audio`     音频：https url 或 delivery_id，可选 duration_ms / transcript
+- `image`     图片：https url / delivery_id / upload_id（三选一），可选 alt / mime / width / height
+- `file`      文件：name + https url / delivery_id / upload_id（三选一），可选 mime / size
+- `audio`     音频：https url / delivery_id / upload_id（三选一），可选 duration_ms / transcript
 - `button`    按钮：label + action
 - `choice`    选项：name 或 id + options（每项 {id, label}），可选 multiple / action
 - `input`     输入：name，可选 placeholder / input_type（text | secure）/ label / action
@@ -26,9 +26,10 @@
   `action_id`；`component.emit` 工具禁止模型自带 server 动作。允许的服务端动作见
   `SERVER_ACTION_NAMES`，回调入口是 `POST /api/v1/tasks/{task_id}/messages/{id}/actions`。
 
-安全边界：只允许 https（以及服务端签发的 delivery_id 引用）；拒绝 javascript: / data: /
-file: / http:、带账号密码的 URL、本机与私有地址；拒绝 HTML/脚本片段；限制深度、节点数、
-子节点数、字符串长度与整棵树的大小。校验失败抛 `ValidationError`（中文消息）。
+安全边界：只允许 https（以及服务端签发的 delivery_id / upload_id 引用）；拒绝
+javascript: / data: / file: / http:、带账号密码的 URL、本机与私有地址；拒绝 HTML/脚本片段；
+限制深度、节点数、子节点数、字符串长度与整棵树的大小。`upload_id` 只是 id，不含路径，
+真正的读取由 `GET /uploads/{id}` 按人鉴权。校验失败抛 `ValidationError`（中文消息）。
 """
 
 from __future__ import annotations
@@ -84,14 +85,20 @@ INPUT_TYPES: frozenset[str] = frozenset({"text", "secure"})
 _DANGEROUS_KEYS: frozenset[str] = frozenset({"__proto__", "constructor", "prototype"})
 _HTML_PATTERN = re.compile(r"<\s*(?:script|iframe|object|embed|style|link|meta)\b", re.I)
 _DELIVERY_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+#: 上传附件 id：目录名安全字符；与 attachment_store 的保存规则保持一致。
+_UPLOAD_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _ACTION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 _ALLOWED_KEYS: dict[str, frozenset[str]] = {
     "card": frozenset({"type", "title", "subtitle", "children"}),
     "text": frozenset({"type", "text", "markdown"}),
-    "image": frozenset({"type", "url", "delivery_id", "index", "alt", "mime", "width", "height"}),
-    "file": frozenset({"type", "name", "url", "delivery_id", "index", "mime", "size"}),
-    "audio": frozenset({"type", "url", "delivery_id", "index", "duration_ms", "transcript"}),
+    "image": frozenset(
+        {"type", "url", "delivery_id", "upload_id", "index", "alt", "mime", "width", "height"}
+    ),
+    "file": frozenset({"type", "name", "url", "delivery_id", "upload_id", "index", "mime", "size"}),
+    "audio": frozenset(
+        {"type", "url", "delivery_id", "upload_id", "index", "duration_ms", "transcript"}
+    ),
     "button": frozenset({"type", "label", "action"}),
     "choice": frozenset({"type", "name", "id", "options", "multiple", "action"}),
     "input": frozenset({"type", "name", "placeholder", "input_type", "label", "action"}),
@@ -496,29 +503,40 @@ def _optional_int(
 
 
 def _source_fields(node: dict[str, Any], raw: dict[str, Any], *, path: str) -> None:
-    """图片 / 文件 / 音频的来源：https url 或服务端签发的 delivery_id，二选一。"""
-    has_url = "url" in raw
-    has_delivery = "delivery_id" in raw
-    if has_url == has_delivery:
+    """图片 / 文件 / 音频的来源：https url / delivery_id / upload_id，三选一。
+
+    `url` 用于外部图片；`delivery_id` 是服务端下发的文件清单（需要 `index`）；
+    `upload_id` 是用户上传或 Bot 登记进 attachment_store 的附件（按人鉴权读取）。
+    """
+    sources = [key for key in ("url", "delivery_id", "upload_id") if key in raw]
+    if len(sources) != 1:
         raise ValidationError(
-            "组件节点必须且只能提供 url 或 delivery_id 之一",
-            details={"path": path, "type": node["type"]},
+            "组件节点必须且只能提供 url、delivery_id 或 upload_id 之一",
+            details={"path": path, "type": node["type"], "sources": sources},
         )
-    if has_url:
+    if "index" in raw and "delivery_id" not in raw:
+        raise ValidationError(
+            "只有 delivery_id 引用才需要 index", details={"path": path, "field": "index"}
+        )
+    if "url" in raw:
         node["url"] = _https_url(raw.get("url"), field="url", path=path)
-        if "index" in raw:
+        return
+    if "upload_id" in raw:
+        upload_id = raw.get("upload_id")
+        if not isinstance(upload_id, str) or not _UPLOAD_ID_PATTERN.match(upload_id):
             raise ValidationError(
-                "只有 delivery_id 引用才需要 index", details={"path": path, "field": "index"}
+                "upload_id 格式不合法", details={"path": path, "field": "upload_id"}
             )
-    else:
-        delivery_id = raw.get("delivery_id")
-        if not isinstance(delivery_id, str) or not _DELIVERY_ID_PATTERN.match(delivery_id):
-            raise ValidationError(
-                "delivery_id 格式不合法", details={"path": path, "field": "delivery_id"}
-            )
-        node["delivery_id"] = delivery_id
-        index = _optional_int(raw, "index", path=path, minimum=0, maximum=9999)
-        node["index"] = index if index is not None else 0
+        node["upload_id"] = upload_id
+        return
+    delivery_id = raw.get("delivery_id")
+    if not isinstance(delivery_id, str) or not _DELIVERY_ID_PATTERN.match(delivery_id):
+        raise ValidationError(
+            "delivery_id 格式不合法", details={"path": path, "field": "delivery_id"}
+        )
+    node["delivery_id"] = delivery_id
+    index = _optional_int(raw, "index", path=path, minimum=0, maximum=9999)
+    node["index"] = index if index is not None else 0
 
 
 def _action(raw: Any, *, path: str) -> dict[str, Any]:
