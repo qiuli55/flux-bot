@@ -266,6 +266,132 @@ def test_unknown_kind_and_broken_payload_return_none() -> None:
     assert component_payload("file_card", "文件", {"files": []}, "m1") is None
 
 
+# --- 附件 ---
+
+
+def test_inbound_attachments_map_to_upload_id_media_nodes() -> None:
+    node = _node(
+        "attachments",
+        {
+            "files": [
+                {
+                    "id": "a" * 32,
+                    "name": "chart.png",
+                    "size": 10,
+                    "mime": "image/png",
+                    # 历史 payload 里可能有内部路径：组件树绝不能带出去
+                    "path": "/opt/flux/uploads/legacy/chart.png",
+                },
+                {"id": "b" * 32, "name": "note.pdf", "size": 20, "mime": "application/pdf"},
+                {"id": "c" * 32, "name": "voice.amr", "size": 30, "mime": "audio/amr"},
+            ]
+        },
+        content="chart.png、note.pdf、voice.amr",
+    )
+    assert node["type"] == "card"
+    assert [child["type"] for child in node["children"]] == ["text", "image", "file", "audio"]
+    image, document, audio = node["children"][1:]
+    assert image["upload_id"] == "a" * 32
+    assert image["alt"] == "chart.png"
+    assert document["name"] == "note.pdf"
+    assert document["upload_id"] == "b" * 32
+    assert audio["upload_id"] == "c" * 32
+    assert "/opt/flux/uploads" not in str(node)
+    assert "path" not in str(node)
+
+
+def test_multiple_inbound_images_share_one_card_for_stacked_deck() -> None:
+    node = _node(
+        "attachments",
+        {
+            "files": [
+                {"id": "a" * 32, "name": "one.png", "size": 1, "mime": "image/png"},
+                {"id": "b" * 32, "name": "two.jpg", "size": 2, "mime": "image/jpeg"},
+            ]
+        },
+        content="one.png、two.jpg",
+    )
+    images = [child for child in node["children"] if child["type"] == "image"]
+    assert len(images) == 2
+    assert all(child["upload_id"] for child in images)
+
+
+def test_outbound_text_with_attachments_keeps_body_and_adds_media() -> None:
+    payload = {
+        "attachments": [
+            {
+                "upload_id": "up_image_1",
+                "name": "chart.png",
+                "mime": "image/png",
+                "size": 10,
+                "kind": "image",
+            },
+            {
+                "upload_id": "up_file_1",
+                "name": "report.pdf",
+                "mime": "application/pdf",
+                "size": 20,
+                "kind": "file",
+            },
+        ]
+    }
+    enriched = component_payload("text", "这是结果", payload, "m1")
+    assert enriched is not None
+    node = validate_component(enriched["component"])
+    assert node["type"] == "card"
+    assert node["children"][0]["type"] == "text"
+    assert node["children"][0]["text"] == "这是结果"
+    assert [child["type"] for child in node["children"]] == ["text", "image", "file"]
+    assert node["children"][1]["upload_id"] == "up_image_1"
+    assert node["children"][2]["name"] == "report.pdf"
+    # 原 payload 的附件记录保持不变（老客户端仍可读）。
+    assert enriched["attachments"] == payload["attachments"]
+    assert enriched["fallback_text"] == "这是结果"
+
+
+def test_outbound_secure_input_keeps_input_and_appends_attachment() -> None:
+    node = _node(
+        "secure_input",
+        {
+            "secure_input": dict(_SECURE_CARD),
+            "attachments": [
+                {
+                    "upload_id": "up_audio_1",
+                    "name": "voice.mp3",
+                    "mime": "audio/mpeg",
+                    "size": 30,
+                    "kind": "file",
+                }
+            ],
+        },
+        content="key 只会显示一次",
+        message_id="card-123",
+    )
+    types = [child["type"] for child in node["children"]]
+    assert "input" in types
+    assert types[-1] == "audio"
+    audio = node["children"][-1]
+    assert audio["upload_id"] == "up_audio_1"
+
+
+def test_attachment_records_with_unsafe_ids_are_skipped() -> None:
+    assert (
+        component_payload(
+            "attachments",
+            "x",
+            {"files": [{"id": "../escape", "name": "x.png", "mime": "image/png"}]},
+            "m1",
+        )
+        is None
+    )
+    assert (
+        component_payload(
+            "text", "x", {"attachments": [{"upload_id": "/etc/passwd", "name": "x"}]}, "m1"
+        )
+        is None
+    )
+
+
 # --- 接口兼容 ---
 
 
@@ -352,3 +478,95 @@ def test_bot_conversation_api_returns_component(client: TestClient) -> None:
     assert message["kind"] == "confirmation"
     assert message["payload"]["component"]["type"] == "card"
     assert message["payload"]["confirmation"]["items"][0]["value"] == "支持修改邮箱"
+
+
+def test_task_messages_api_maps_inbound_attachments_without_path(client: TestClient) -> None:
+    created = client.post(f"{PREFIX}/tasks", json={"description": "看图"})
+    task_id = created.json()["data"]["id"]
+    container: Container = client.app.state.container
+    _seed(
+        container,
+        uuid.UUID(task_id),
+        "attachments",
+        "chart.png、report.pdf",
+        {
+            "files": [
+                {
+                    "id": "a" * 32,
+                    "name": "chart.png",
+                    "size": 10,
+                    "mime": "image/png",
+                    "path": "/opt/flux/uploads/a/chart.png",
+                },
+                {
+                    "id": "b" * 32,
+                    "name": "report.pdf",
+                    "size": 20,
+                    "mime": "application/pdf",
+                    "path": "/opt/flux/uploads/b/report.pdf",
+                },
+            ]
+        },
+    )
+
+    response = client.get(f"{PREFIX}/tasks/{task_id}/messages")
+    assert response.status_code == 200, response.text
+    message = response.json()["data"][-1]
+    assert message["kind"] == "attachments"
+    assert message["payload"]["component"]["type"] == "card"
+    assert [child["type"] for child in message["payload"]["component"]["children"]] == [
+        "text",
+        "image",
+        "file",
+    ]
+    assert message["payload"]["component"]["children"][1]["upload_id"] == "a" * 32
+    # 客户端 JSON 不出现宿主路径；原始 payload 的展示字段仍在。
+    assert all("path" not in item for item in message["payload"]["files"])
+    assert "/opt/flux/uploads" not in response.text
+
+
+def test_bot_conversation_api_maps_outbound_attachments(client: TestClient) -> None:
+    bot = _create_bot(client, "出站附件 Bot")
+    container: Container = client.app.state.container
+
+    async def _seed_chat() -> uuid.UUID:
+        task = await container.task_repo.create(
+            task_id=uuid.uuid4(),
+            description="聊天",
+            priority=100,
+            project_id=None,
+            agent_id=None,
+            bot_id=uuid.UUID(bot["id"]),
+            cloud_user_id="1",
+        )
+        return task.id
+
+    task_id = asyncio.run(_seed_chat())
+    attachments = [
+        {
+            "upload_id": "up_image_1",
+            "name": "chart.png",
+            "mime": "image/png",
+            "size": 10,
+            "kind": "image",
+        }
+    ]
+    _seed(
+        container,
+        task_id,
+        "text",
+        "已经生成图表",
+        {"attachments": attachments},
+    )
+
+    response = client.get(f"{PREFIX}/bots/{bot['id']}/conversation")
+    assert response.status_code == 200, response.text
+    message = response.json()["data"]["messages"][-1]
+    assert message["kind"] == "text"
+    # 原有正文与 payload 不变，组件树额外带上附件节点。
+    assert message["content"] == "已经生成图表"
+    assert message["payload"]["attachments"] == attachments
+    component = message["payload"]["component"]
+    assert component["type"] == "card"
+    assert [child["type"] for child in component["children"]] == ["text", "image"]
+    assert component["children"][1]["upload_id"] == "up_image_1"
