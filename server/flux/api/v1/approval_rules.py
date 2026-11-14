@@ -5,7 +5,8 @@
 带 `created_by_kind` / `created_by_bot_id`，前端因此能显示「这条规则是谁加的」。
 
 跨用户读取 / 修改 / 删除一律按不存在处理（404），不泄露 id 是否存在。
-Bot 只有「新增」工具，没有 update / delete；本 API 需要用户登录身份。
+用户与 Bot 都可以新增规则；Bot 修改 / 删除前必须在对话里挂审批卡二次确认，
+确认通过后才会调用本 API 的更新 / 删除逻辑。本 API 需要用户登录身份。
 """
 
 from __future__ import annotations

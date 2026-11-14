@@ -39,6 +39,8 @@ APPROVAL_KIND_TOOL_PROMPT = "tool_permission_prompt"
 APPROVAL_KIND_RULE_MATCH = "rule_match"
 #: 支付规则命中时的卡片类型（未来支付集成直接复用）
 APPROVAL_KIND_PAYMENT_AMOUNT = "payment_amount"
+#: Bot 请求修改 / 删除审批规则时的二次确认卡片
+APPROVAL_KIND_RULE_CHANGE = "approval_rule_change"
 
 #: 审批卡上的两个选项（label 就是回传给 choose 接口的值）
 APPROVAL_ALLOW = "允许"
@@ -85,6 +87,25 @@ def outbound_approval_options(channel_label: str) -> list[dict[str, Any]]:
             "label": APPROVAL_DENY,
             "description": "默认建议：先拒绝，核对内容后再决定是否重发",
             "impact": "拒绝后不会发送，草稿仍保留在草稿箱",
+            "recommended": True,
+        },
+    ]
+
+
+def rule_change_approval_options(action_label: str) -> list[dict[str, Any]]:
+    """规则变更审批卡的文案：只描述改 / 删这条规则，不提终端命令。"""
+    label = (action_label or "").strip() or "修改"
+    return [
+        {
+            "label": APPROVAL_ALLOW,
+            "description": "仅本次有效，确认后立即落库",
+            "impact": f"允许后会立即{label}这条审批规则，对该用户的所有 Bot 生效",
+            "recommended": False,
+        },
+        {
+            "label": APPROVAL_DENY,
+            "description": "默认建议：先拒绝，核对规则作用范围后再决定",
+            "impact": f"拒绝后不会{label}规则，配置保持不变",
             "recommended": True,
         },
     ]
@@ -303,6 +324,8 @@ __all__ = [
     "APPROVAL_DENY",
     "APPROVAL_KIND_HIGH_RISK",
     "APPROVAL_KIND_PROTECTED",
+    "APPROVAL_KIND_RULE_CHANGE",
+    "APPROVAL_KIND_RULE_MATCH",
     "APPROVAL_KIND_TOOL_PROMPT",
     "APPROVAL_TIMEOUT_SECONDS",
     "ApprovalCancelledError",
@@ -310,5 +333,6 @@ __all__ = [
     "ApprovalTimeoutError",
     "outbound_approval_options",
     "raise_approval",
+    "rule_change_approval_options",
     "wait_for_approval",
 ]

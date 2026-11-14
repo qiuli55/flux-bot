@@ -45,7 +45,7 @@ ALL_TOOLS: tuple[ToolSpec, ...] = (
     *supervisor_tools(),
     *knowledge_tools(),
     *routine_tools(),
-    # Bot 只能新增 / 查看审批规则；没有 update / delete 工具（不允许放宽）。
+    # Bot 可新增 / 查看审批规则；修改 / 删除要挂审批卡等用户二次确认。
     *approval_rule_tools(),
     *permission_tools(),
 )

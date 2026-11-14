@@ -18,6 +18,7 @@ from flux.api.auth import require_rest_auth
 from flux.api.errors import register_exception_handlers
 from flux.api.v1 import (
     agents,
+    approval_rules,
     billing,
     bot_subtasks,
     bots,
@@ -76,6 +77,8 @@ _BOT_ROUTERS = (
     tasks.router,
     bots.router,
     outbound_drafts.router,
+    # 审批规则：用户可以在 App 里自己加 / 改 / 删（与 Bot 共用同一份全局规则）。
+    approval_rules.router,
     # 只读状态接口同样要求 REST 鉴权（运维信息，不能公开）。
     channels_status.router,
     browser.router,

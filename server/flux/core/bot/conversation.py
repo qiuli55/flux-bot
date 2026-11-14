@@ -42,6 +42,12 @@ from flux.core.mcp.tools.component_tools import (
 )
 from flux.core.mcp.tools.routine_tools import ROUTINE_TOOLS, run_routine_tool
 from flux.core.model_gateway.base import ChatMessage
+from flux.core.task_engine.approvals import (
+    APPROVAL_KIND_RULE_CHANGE,
+    raise_approval,
+    rule_change_approval_options,
+    wait_for_approval,
+)
 from flux.core.task_engine.assistant import AssistantTurn
 from flux.core.task_engine.context_usage import CONTEXT_MESSAGE_KINDS
 from flux.core.task_engine.repository import MessageDraft
@@ -568,6 +574,26 @@ class BotConversationService:
                     cloud_user_id=account_key or None,
                 )
 
+            async def _confirm_rule_change(title: str, detail: str, meta: dict[str, Any]) -> str:
+                """把「改 / 删规则」挂成本轮任务上的审批卡，等用户在对话里二次确认。"""
+                action_label = "修改" if meta.get("action") == "update" else "删除"
+                record = await raise_approval(
+                    container,
+                    task_id=task.id,
+                    run_id=None,
+                    kind=APPROVAL_KIND_RULE_CHANGE,
+                    title=title,
+                    detail=detail,
+                    meta={"source": "bot-conversation", **meta},
+                    options=rule_change_approval_options(action_label),
+                )
+                return await wait_for_approval(
+                    container,
+                    task_id=task.id,
+                    decision_id=record["id"],
+                    run_id=None,
+                )
+
             async def _run_approval_rule(name: str, arguments: dict[str, Any]) -> Any:
                 return await run_approval_rule_tool(
                     container.approval_rules,
@@ -576,6 +602,7 @@ class BotConversationService:
                     arguments,
                     cloud_user_id=account_key or None,
                     owner_cloud_user_id=self._owner(),
+                    confirm=_confirm_rule_change,
                 )
 
             async def _run_component(name: str, arguments: dict[str, Any]) -> Any:
@@ -633,8 +660,10 @@ class BotConversationService:
                 "默认情况下任何操作都不需要审批。用户说「某类操作前先问我」"
                 "（例如「支付超过 500 元先问我」「执行 rm 先问我」）时，调用 "
                 "approval_rule_add 为当前 Bot 所属用户添加规则；规则对该用户的所有 Bot "
-                "生效。Bot 只能新增更严格的规则，不能删除、停用或放宽；"
-                "修改前先用 approval_rule_list 查看已有规则，避免重复添加。"
+                "生效。修改或删除规则用 approval_rule_update / approval_rule_delete，"
+                "这两个操作会挂审批卡，必须由用户在对话里点「允许」才生效；"
+                "被拒绝或超时就不要重试，直接告诉用户规则未改动。"
+                "新增或修改前先用 approval_rule_list 查看已有规则，避免重复添加。"
             )
             attach_note = (
                 "需要把图片或文件发给用户时，调用 attach_file 登记出站附件：path 必须是 "

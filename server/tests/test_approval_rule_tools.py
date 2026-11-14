@@ -1,7 +1,8 @@
-"""Bot 侧审批规则工具：只能新增/查看，不能删除、停用或放宽。"""
+"""Bot 侧审批规则工具：新增 / 查看直接执行，修改 / 删除必须等用户二次确认。"""
 
 from __future__ import annotations
 
+import importlib
 import uuid
 from dataclasses import dataclass
 
@@ -12,12 +13,20 @@ from flux.core.mcp.tools import TOOLS
 from flux.core.mcp.tools.approval_rule_tools import (
     APPROVAL_RULE_TOOL_NAMES,
     approval_rule_add,
+    approval_rule_delete,
     approval_rule_list,
+    approval_rule_update,
     run_approval_rule_tool,
 )
 from flux.core.mcp.tools.base import ToolContext
+from flux.core.task_engine.approvals import (
+    APPROVAL_KIND_RULE_CHANGE,
+    ApprovalDeniedError,
+)
 from flux.enums import Capability, DshRunStatus
 from flux.errors import BadRequestError, ValidationError
+
+approval_rule_tools = importlib.import_module("flux.core.mcp.tools.approval_rule_tools")
 
 
 @dataclass
@@ -62,12 +71,20 @@ async def _bot_run(container, *, cloud_user_id: str = "2") -> _BotRun:
     return _BotRun(bot=bot, task=task, ctx=ctx)
 
 
-def test_only_add_and_list_tools_exist() -> None:
-    assert "approval_rule.add" in TOOLS
-    assert "approval_rule.list" in TOOLS
-    assert "approval_rule.update" not in TOOLS
-    assert "approval_rule.delete" not in TOOLS
-    assert {"approval_rule_add", "approval_rule_list"} == APPROVAL_RULE_TOOL_NAMES
+def test_all_four_tools_exist() -> None:
+    for name in (
+        "approval_rule.add",
+        "approval_rule.list",
+        "approval_rule.update",
+        "approval_rule.delete",
+    ):
+        assert name in TOOLS
+    assert {
+        "approval_rule_add",
+        "approval_rule_list",
+        "approval_rule_update",
+        "approval_rule_delete",
+    } == APPROVAL_RULE_TOOL_NAMES
 
 
 async def test_bot_adds_and_lists_rule_for_its_owner(apply_container) -> None:
@@ -164,7 +181,72 @@ async def test_list_is_scoped_to_the_bots_owner(apply_container) -> None:
     assert [row["cloud_user_id"] for row in listed["rules"]] == ["2"]
 
 
-async def test_conversation_path_cannot_update_or_delete(apply_container) -> None:
+async def _noop_allow(*args, **kwargs) -> str:
+    return "allowed"
+
+
+async def _noop_deny(*args, **kwargs) -> str:
+    return "denied"
+
+
+async def test_bot_updates_rule_only_after_confirmation(apply_container, monkeypatch) -> None:
+    seed = await _bot_run(apply_container, cloud_user_id="2")
+    rule = (
+        await approval_rule_add(
+            seed.ctx,
+            {"type": "tool_match", "params": {"tool_name": "terminal.execute"}},
+        )
+    )["rule"]
+
+    monkeypatch.setattr(approval_rule_tools, "wait_for_approval", _noop_allow)
+
+    updated = await approval_rule_update(
+        seed.ctx, {"rule_id": rule["id"], "description": "改过的说明"}
+    )
+    assert updated["confirmed"] is True
+    assert updated["rule"]["description"] == "改过的说明"
+
+    task = await apply_container.task_repo.get(seed.task.id)
+    record = task.decisions[-1]
+    assert record["kind"] == APPROVAL_KIND_RULE_CHANGE
+    assert record["meta"]["action"] == "update"
+    assert record["meta"]["rule_id"] == rule["id"]
+
+
+async def test_bot_delete_denied_leaves_the_rule(apply_container, monkeypatch) -> None:
+    seed = await _bot_run(apply_container, cloud_user_id="2")
+    rule = (
+        await approval_rule_add(
+            seed.ctx,
+            {"type": "outbound_message", "params": {"channel": "feishu"}},
+        )
+    )["rule"]
+
+    monkeypatch.setattr(approval_rule_tools, "wait_for_approval", _noop_deny)
+
+    with pytest.raises(ApprovalDeniedError):
+        await approval_rule_delete(seed.ctx, {"rule_id": rule["id"]})
+    kept = await apply_container.approval_rules.get(rule["id"], cloud_user_id="2")
+    assert kept.id == uuid.UUID(rule["id"])
+
+
+async def test_bot_delete_with_confirmation(apply_container, monkeypatch) -> None:
+    seed = await _bot_run(apply_container, cloud_user_id="2")
+    rule = (
+        await approval_rule_add(
+            seed.ctx,
+            {"type": "outbound_message", "params": {"channel": "feishu"}},
+        )
+    )["rule"]
+
+    monkeypatch.setattr(approval_rule_tools, "wait_for_approval", _noop_allow)
+
+    deleted = await approval_rule_delete(seed.ctx, {"rule_id": rule["id"]})
+    assert deleted == {"deleted": True, "rule_id": rule["id"], "confirmed": True}
+    assert await apply_container.approval_rules.list("2") == []
+
+
+async def test_conversation_path_requires_confirm_for_update(apply_container) -> None:
     seed = await _bot_run(apply_container)
     rule = await run_approval_rule_tool(
         apply_container.approval_rules,
@@ -173,23 +255,81 @@ async def test_conversation_path_cannot_update_or_delete(apply_container) -> Non
         {"type": "tool_match", "params": {"tool_name": "terminal.execute"}},
         cloud_user_id="2",
     )
-    assert rule["rule"]["created_by_kind"] == "bot"
-    assert rule["rule"]["created_by_bot_id"] == str(seed.bot.id)
+    rule_id = rule["rule"]["id"]
 
-    listed = await run_approval_rule_tool(
-        apply_container.approval_rules, seed.bot, "approval_rule_list", {}, cloud_user_id="2"
+    with pytest.raises(BadRequestError):
+        await run_approval_rule_tool(
+            apply_container.approval_rules,
+            seed.bot,
+            "approval_rule_update",
+            {"rule_id": rule_id, "description": "没有确认通道的修改"},
+            cloud_user_id="2",
+        )
+    with pytest.raises(BadRequestError):
+        await run_approval_rule_tool(
+            apply_container.approval_rules,
+            seed.bot,
+            "approval_rule_delete",
+            {"rule_id": rule_id},
+            cloud_user_id="2",
+        )
+    kept = await apply_container.approval_rules.get(rule_id, cloud_user_id="2")
+    assert kept.description != "没有确认通道的修改"
+
+
+async def test_conversation_path_applies_change_after_confirm(apply_container) -> None:
+    seed = await _bot_run(apply_container)
+    rule = await run_approval_rule_tool(
+        apply_container.approval_rules,
+        seed.bot,
+        "approval_rule_add",
+        {"type": "tool_match", "params": {"tool_name": "terminal.execute"}},
+        cloud_user_id="2",
     )
-    assert listed["count"] == 1
+    rule_id = rule["rule"]["id"]
 
-    for forbidden in ("approval_rule_update", "approval_rule_delete", "approval_rule_disable"):
-        with pytest.raises(ValidationError):
-            await run_approval_rule_tool(
-                apply_container.approval_rules,
-                seed.bot,
-                forbidden,
-                {"rule_id": rule["rule"]["id"]},
-                cloud_user_id="2",
-            )
+    async def confirm(title: str, detail: str, meta: dict) -> str:
+        assert "确认" in title
+        assert meta["action"] == "update"
+        return "allowed"
+
+    updated = await run_approval_rule_tool(
+        apply_container.approval_rules,
+        seed.bot,
+        "approval_rule_update",
+        {"rule_id": rule_id, "description": "对话里确认后的说明"},
+        cloud_user_id="2",
+        confirm=confirm,
+    )
+    assert updated["confirmed"] is True
+    assert updated["rule"]["description"] == "对话里确认后的说明"
+
+
+async def test_conversation_path_denied_keeps_the_rule(apply_container) -> None:
+    seed = await _bot_run(apply_container)
+    rule = await run_approval_rule_tool(
+        apply_container.approval_rules,
+        seed.bot,
+        "approval_rule_add",
+        {"type": "tool_match", "params": {"tool_name": "terminal.execute"}},
+        cloud_user_id="2",
+    )
+    rule_id = rule["rule"]["id"]
+
+    async def deny(*args, **kwargs) -> str:
+        return "denied"
+
+    with pytest.raises(ApprovalDeniedError):
+        await run_approval_rule_tool(
+            apply_container.approval_rules,
+            seed.bot,
+            "approval_rule_delete",
+            {"rule_id": rule_id},
+            cloud_user_id="2",
+            confirm=deny,
+        )
+    kept = await apply_container.approval_rules.get(rule_id, cloud_user_id="2")
+    assert kept.id == uuid.UUID(rule_id)
 
 
 async def test_conversation_path_requires_a_known_user(apply_container) -> None:
