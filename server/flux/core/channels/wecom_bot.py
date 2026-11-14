@@ -29,6 +29,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -173,34 +174,79 @@ class WeComBotSender:
         _install_httpx_redaction()
 
     async def send_text(self, dest: Mapping[str, Any], text: str) -> None:
+        content = _clip_text(text or "", MAX_TEXT_BYTES)
+        await self._send_message(dest, "text", {"content": content}, label="发送企业微信消息")
+
+    async def upload_media(self, *, path: str, name: str, mime: str, media_type: str) -> str:
+        """上传临时素材，返回 media_id（官方 /cgi-bin/media/upload?type=image|file）。
+
+        官方上限：图片 10MB（JPG/PNG），文件 20MB；频道在调用前已按上限校验。
+        """
+        token = await self._access_token()
+        response = await self._request(
+            "POST",
+            "/cgi-bin/media/upload",
+            params={"access_token": token, "type": media_type},
+            files={
+                "media": (name, _read_media(path, "企业微信"), mime or "application/octet-stream")
+            },
+        )
+        data = _payload(response, "上传企业微信媒体")
+        media_id = str(data.get("media_id") or "")
+        if not media_id:
+            raise RuntimeError("上传企业微信媒体失败：响应缺少 media_id")
+        return media_id
+
+    async def send_image(self, dest: Mapping[str, Any], media_id: str) -> None:
+        await self._send_message(dest, "image", {"media_id": media_id}, label="发送企业微信图片")
+
+    async def send_file(self, dest: Mapping[str, Any], media_id: str) -> None:
+        await self._send_message(dest, "file", {"media_id": media_id}, label="发送企业微信文件")
+
+    async def send_media(
+        self, dest: Mapping[str, Any], *, path: str, name: str, mime: str, kind: str
+    ) -> None:
+        """按类型走官方上传 + 发送；调用方必须先按平台上限校验。"""
+        media_type = "image" if kind == "image" else "file"
+        media_id = await self.upload_media(path=path, name=name, mime=mime, media_type=media_type)
+        if kind == "image":
+            await self.send_image(dest, media_id)
+        else:
+            await self.send_file(dest, media_id)
+
+    async def _send_message(
+        self,
+        dest: Mapping[str, Any],
+        msgtype: str,
+        body: dict[str, Any],
+        *,
+        label: str,
+    ) -> None:
+        """按 dest 选择应用消息 / 群聊接口，token 只放查询串（httpx 日志已脱敏）。"""
+        path, payload = self._message_target(dest, msgtype, body)
+        token = await self._access_token()
+        response = await self._request("POST", path, params={"access_token": token}, json=payload)
+        _payload(response, label)
+
+    def _message_target(
+        self, dest: Mapping[str, Any], msgtype: str, body: dict[str, Any]
+    ) -> tuple[str, dict[str, Any]]:
         touser = str(dest.get("touser") or "").strip()
         chatid = str(dest.get("chatid") or "").strip()
         if not touser and not chatid:
             raise RuntimeError("企业微信出站草稿缺少 touser / chatid")
-        content = _clip_text(text or "", MAX_TEXT_BYTES)
-        token = await self._access_token()
         if chatid:
-            path = "/cgi-bin/appchat/send"
-            payload: dict[str, Any] = {
+            return "/cgi-bin/appchat/send", {
                 "chatid": chatid,
-                "msgtype": "text",
-                "text": {"content": content},
+                "msgtype": msgtype,
+                msgtype: body,
             }
-        else:
-            path = "/cgi-bin/message/send"
-            payload = {
-                "touser": touser,
-                "msgtype": "text",
-                "agentid": self._agent_id,
-                "text": {"content": content},
-            }
-        response = await self._request(
-            "POST",
-            path,
-            params={"access_token": token},
-            json=payload,
-        )
-        _payload(response, "发送企业微信消息")
+        return "/cgi-bin/message/send", {
+            "touser": touser,
+            "msgtype": msgtype,
+            "agentid": self._agent_id,
+            msgtype: body,
+        }
 
     async def download_media(self, media_id: str) -> DownloadedMedia:
         """按官方 media/get 下载临时素材（MediaId 有效 3 天）。
@@ -259,6 +305,15 @@ class WeComBotSender:
             self._client = client
             self._owns_client = True
         return client
+
+
+def _read_media(path: str, channel_label: str) -> bytes:
+    """读取出站附件字节；错误信息只带文件名，不回显宿主目录。"""
+    target = Path(path)
+    try:
+        return target.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"读取出站附件失败（{channel_label}）：{target.name}") from exc
 
 
 def _int_or_zero(value: str | int | None) -> int:

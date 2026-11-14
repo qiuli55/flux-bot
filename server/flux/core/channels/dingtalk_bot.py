@@ -23,6 +23,7 @@ import uuid
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -136,14 +137,92 @@ class DingTalkBotSender:
 
     async def send_text(self, dest: Mapping[str, Any], text: str) -> None:
         """按 dest 选择单聊或群聊接口发送文本，绝不静默丢弃。"""
+        content = (text or "")[:MAX_TEXT_CHARS]
+        msg_param = json.dumps({"content": content}, ensure_ascii=False)
+        await self._send_robot(dest, "sampleText", msg_param, label="发送钉钉消息")
+
+    async def upload_media(
+        self,
+        *,
+        path: str,
+        name: str,
+        mime: str,
+        media_type: str,
+        robot_code: str = "",
+    ) -> str:
+        """上传机器人消息素材，返回 mediaId。
+
+        官方 robot 消息文件接口：POST /v1.0/robot/messageFiles/upload（multipart）。
+        保守上限：图片 10MB、文件 20MB；频道在调用前已按上限校验。
+        """
+        code = (robot_code or self._default_robot_code or "").strip()
+        if not code:
+            raise RuntimeError("钉钉上传媒体缺少 robot_code")
+        token = await self._access_token()
+        response = await self._request(
+            "POST",
+            "/v1.0/robot/messageFiles/upload",
+            params={"robotCode": code},
+            headers={"x-acs-dingtalk-access-token": token},
+            data={"robotCode": code, "mediaType": media_type},
+            files={"file": (name, _read_media(path, "钉钉"), mime or "application/octet-stream")},
+        )
+        data = _payload(response, "上传钉钉媒体")
+        media_id = str(data.get("mediaId") or data.get("media_id") or "")
+        if not media_id:
+            raise RuntimeError("上传钉钉媒体失败：响应缺少 mediaId")
+        return media_id
+
+    async def send_image(self, dest: Mapping[str, Any], media_id: str) -> None:
+        """发送图片：官方 msgKey=sampleImageMsg，msgParam 里的 photoURL 用 mediaId。"""
+        await self._send_robot(
+            dest,
+            "sampleImageMsg",
+            json.dumps({"photoURL": media_id}, ensure_ascii=False),
+            label="发送钉钉图片",
+        )
+
+    async def send_file(self, dest: Mapping[str, Any], media_id: str, name: str) -> None:
+        """发送文件：官方 msgKey=sampleFile，msgParam 为 mediaId + fileName + fileType。"""
+        suffix = Path(name).suffix.lstrip(".").lower() or "file"
+        await self._send_robot(
+            dest,
+            "sampleFile",
+            json.dumps(
+                {"mediaId": media_id, "fileName": name, "fileType": suffix},
+                ensure_ascii=False,
+            ),
+            label="发送钉钉文件",
+        )
+
+    async def send_media(
+        self, dest: Mapping[str, Any], *, path: str, name: str, mime: str, kind: str
+    ) -> None:
+        """按类型走官方上传 + 发送；调用方必须先按平台上限校验。"""
+        robot_code = str(dest.get("robot_code") or self._default_robot_code or "").strip()
+        media_type = "image" if kind == "image" else "file"
+        media_id = await self.upload_media(
+            path=path,
+            name=name,
+            mime=mime,
+            media_type=media_type,
+            robot_code=robot_code,
+        )
+        if kind == "image":
+            await self.send_image(dest, media_id)
+        else:
+            await self.send_file(dest, media_id, name)
+
+    async def _send_robot(
+        self, dest: Mapping[str, Any], msg_key: str, msg_param: str, *, label: str
+    ) -> None:
+        """复用既有单聊 / 群聊机器人接口，只替换 msgKey / msgParam。"""
         robot_code = str(dest.get("robot_code") or self._default_robot_code).strip()
         if not robot_code:
             raise RuntimeError("钉钉发送缺少 robot_code")
         conversation_id = str(dest.get("conversation_id") or "").strip()
         staff_id = str(dest.get("staff_id") or "").strip()
         conversation_type = str(dest.get("conversation_type") or "").strip()
-        content = (text or "")[:MAX_TEXT_CHARS]
-        msg_param = json.dumps({"content": content}, ensure_ascii=False)
 
         token = await self._access_token()
         headers = {"x-acs-dingtalk-access-token": token}
@@ -157,7 +236,7 @@ class DingTalkBotSender:
                 json={
                     "robotCode": robot_code,
                     "userIds": [staff_id],
-                    "msgKey": "sampleText",
+                    "msgKey": msg_key,
                     "msgParam": msg_param,
                 },
             )
@@ -169,13 +248,13 @@ class DingTalkBotSender:
                 json={
                     "robotCode": robot_code,
                     "openConversationId": conversation_id,
-                    "msgKey": "sampleText",
+                    "msgKey": msg_key,
                     "msgParam": msg_param,
                 },
             )
         else:
             raise RuntimeError("钉钉发送缺少 conversation_id / staff_id")
-        _raise_for_dingtalk(response, "发送钉钉消息")
+        _raise_for_dingtalk(response, label)
 
     @property
     def default_robot_code(self) -> str:
@@ -248,6 +327,15 @@ class DingTalkBotSender:
             self._client = client
             self._owns_client = True
         return client
+
+
+def _read_media(path: str, channel_label: str) -> bytes:
+    """读取出站附件字节；错误信息只带文件名，不回显宿主目录。"""
+    target = Path(path)
+    try:
+        return target.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"读取出站附件失败（{channel_label}）：{target.name}") from exc
 
 
 def _payload(response: httpx.Response, label: str) -> dict[str, Any]:

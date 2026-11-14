@@ -1161,3 +1161,85 @@ def test_wecom_sender_rejects_json_error_body() -> None:
             await sender.aclose()
 
     asyncio.run(scenario())
+
+
+def test_wecom_sender_uploads_then_sends_image_and_file(tmp_path: Path) -> None:
+    """官方链路：media/upload?type=image|file 拿 media_id，再按 msgtype 发送。"""
+    image = tmp_path / "chart.png"
+    image.write_bytes(b"\x89PNG fake")
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"%PDF-1.4 fake")
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/cgi-bin/gettoken":
+            return httpx.Response(
+                200,
+                json={
+                    "errcode": 0,
+                    "access_token": "wecom-access-token",
+                    "expires_in": 7200,
+                },
+            )
+        if request.url.path == "/cgi-bin/media/upload":
+            media_type = request.url.params["type"]
+            return httpx.Response(
+                200,
+                json={"errcode": 0, "media_id": f"media-{media_type}"},
+            )
+        return httpx.Response(200, json={"errcode": 0, "errmsg": "ok"})
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            sender = WeComBotSender(
+                corp_id=CORP_ID,
+                secret=SECRET,
+                agent_id=AGENT_ID,
+                client=http_client,
+            )
+            await sender.send_media(
+                {"touser": USER_ID},
+                path=str(image),
+                name="chart.png",
+                mime="image/png",
+                kind="image",
+            )
+            await sender.send_media(
+                {"chatid": "chat-1"},
+                path=str(document),
+                name="report.pdf",
+                mime="application/pdf",
+                kind="file",
+            )
+            await sender.aclose()
+
+    asyncio.run(scenario())
+
+    assert [request.url.path for request in requests] == [
+        "/cgi-bin/gettoken",
+        "/cgi-bin/media/upload",
+        "/cgi-bin/message/send",
+        "/cgi-bin/media/upload",
+        "/cgi-bin/appchat/send",
+    ]
+    image_upload, image_send, file_upload, file_send = requests[1:]
+    assert image_upload.url.params["access_token"] == "wecom-access-token"
+    assert image_upload.url.params["type"] == "image"
+    assert b'name="media"' in image_upload.content
+    assert b"chart.png" in image_upload.content
+    assert json.loads(image_send.content) == {
+        "touser": USER_ID,
+        "msgtype": "image",
+        "agentid": int(AGENT_ID),
+        "image": {"media_id": "media-image"},
+    }
+
+    assert file_upload.url.params["type"] == "file"
+    assert b"report.pdf" in file_upload.content
+    assert json.loads(file_send.content) == {
+        "chatid": "chat-1",
+        "msgtype": "file",
+        "file": {"media_id": "media-file"},
+    }

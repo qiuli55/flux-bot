@@ -27,6 +27,7 @@ import uuid
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
@@ -146,6 +147,72 @@ class FeishuBotSender:
         )
         _raise_for_feishu(response, "发送飞书消息")
 
+    async def upload_image(self, *, path: str, name: str, mime: str) -> str:
+        """上传图片素材，返回 image_key（官方 /open-apis/im/v1/images，上限 10MB）。"""
+        token = await self._tenant_token()
+        response = await self._request(
+            "POST",
+            "/open-apis/im/v1/images",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"image_type": "message"},
+            files={"image": (name, _read_media(path, "飞书"), mime or "application/octet-stream")},
+        )
+        data = _payload(response, "上传飞书图片")
+        image_key = str((data.get("data") or {}).get("image_key") or "")
+        if not image_key:
+            raise RuntimeError("上传飞书图片失败：响应缺少 image_key")
+        return image_key
+
+    async def upload_file(self, *, path: str, name: str, mime: str) -> str:
+        """上传文件素材，返回 file_key（官方 /open-apis/im/v1/files，上限 30MB）。"""
+        token = await self._tenant_token()
+        response = await self._request(
+            "POST",
+            "/open-apis/im/v1/files",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"file_type": "stream", "file_name": name},
+            files={"file": (name, _read_media(path, "飞书"), mime or "application/octet-stream")},
+        )
+        data = _payload(response, "上传飞书文件")
+        file_key = str((data.get("data") or {}).get("file_key") or "")
+        if not file_key:
+            raise RuntimeError("上传飞书文件失败：响应缺少 file_key")
+        return file_key
+
+    async def send_image(self, chat_id: str, image_key: str) -> None:
+        """发送图片消息（msg_type=image，content 只放 image_key）。"""
+        await self._send_message(chat_id, "image", {"image_key": image_key}, label="发送飞书图片")
+
+    async def send_file(self, chat_id: str, file_key: str) -> None:
+        """发送文件消息（msg_type=file，content 只放 file_key）。"""
+        await self._send_message(chat_id, "file", {"file_key": file_key}, label="发送飞书文件")
+
+    async def send_media(self, chat_id: str, *, path: str, name: str, mime: str, kind: str) -> None:
+        """按类型走官方上传 + 发送；调用方必须先按平台上限校验。"""
+        if kind == "image":
+            image_key = await self.upload_image(path=path, name=name, mime=mime)
+            await self.send_image(chat_id, image_key)
+            return
+        file_key = await self.upload_file(path=path, name=name, mime=mime)
+        await self.send_file(chat_id, file_key)
+
+    async def _send_message(
+        self, chat_id: str, msg_type: str, content: dict[str, Any], *, label: str
+    ) -> None:
+        token = await self._tenant_token()
+        response = await self._request(
+            "POST",
+            "/open-apis/im/v1/messages",
+            params={"receive_id_type": "chat_id"},
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "receive_id": chat_id,
+                "msg_type": msg_type,
+                "content": json.dumps(content, ensure_ascii=False),
+            },
+        )
+        _raise_for_feishu(response, label)
+
     async def download_media(
         self,
         *,
@@ -212,6 +279,15 @@ class FeishuBotSender:
             self._client = client
             self._owns_client = True
         return client
+
+
+def _read_media(path: str, channel_label: str) -> bytes:
+    """读取出站附件字节；错误信息只带文件名，不回显宿主目录。"""
+    target = Path(path)
+    try:
+        return target.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"读取出站附件失败（{channel_label}）：{target.name}") from exc
 
 
 def _payload(response: httpx.Response, label: str) -> dict[str, Any]:

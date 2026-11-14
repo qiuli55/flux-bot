@@ -1303,3 +1303,78 @@ def test_dingtalk_sender_requires_download_url() -> None:
             await sender.aclose()
 
     asyncio.run(scenario())
+
+
+def test_dingtalk_sender_uploads_then_sends_image_and_file(tmp_path: Path) -> None:
+    """官方链路：messageFiles/upload 拿 mediaId，再用 sampleImageMsg / sampleFile 发送。"""
+    image = tmp_path / "chart.png"
+    image.write_bytes(b"\x89PNG fake")
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"%PDF-1.4 fake")
+
+    requests: list[httpx.Request] = []
+    uploads = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal uploads
+        requests.append(request)
+        if request.url.path.endswith("/v1.0/oauth2/accessToken"):
+            return httpx.Response(200, json={"accessToken": "ding-token", "expireIn": 7200})
+        if request.url.path.endswith("/v1.0/robot/messageFiles/upload"):
+            uploads += 1
+            return httpx.Response(
+                200, json={"mediaId": "mid-image" if uploads == 1 else "mid-file"}
+            )
+        return httpx.Response(200, json={"processQueryKey": "pqk"})
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            sender = DingTalkBotSender(app_key=APP_KEY, app_secret=APP_SECRET, client=http_client)
+            await sender.send_media(
+                {
+                    "conversation_id": CONVERSATION_ID,
+                    "staff_id": STAFF_ID,
+                    "robot_code": ROBOT_CODE,
+                    "conversation_type": "2",
+                },
+                path=str(image),
+                name="chart.png",
+                mime="image/png",
+                kind="image",
+            )
+            await sender.send_media(
+                {"staff_id": STAFF_ID, "robot_code": ROBOT_CODE, "conversation_type": "1"},
+                path=str(document),
+                name="report.pdf",
+                mime="application/pdf",
+                kind="file",
+            )
+            await sender.aclose()
+
+    asyncio.run(scenario())
+
+    assert [request.url.path for request in requests] == [
+        "/v1.0/oauth2/accessToken",
+        "/v1.0/robot/messageFiles/upload",
+        "/v1.0/robot/groupMessages/send",
+        "/v1.0/robot/messageFiles/upload",
+        "/v1.0/robot/oToMessages/batchSend",
+    ]
+    image_upload, image_send, file_upload, file_send = requests[1:]
+    assert image_upload.url.params["robotCode"] == ROBOT_CODE
+    assert image_upload.headers["x-acs-dingtalk-access-token"] == "ding-token"
+    assert b'name="mediaType"' in image_upload.content
+    assert b"image" in image_upload.content
+    assert b"chart.png" in image_upload.content
+    assert json.loads(image_send.content)["msgKey"] == "sampleImageMsg"
+    assert json.loads(json.loads(image_send.content)["msgParam"]) == {"photoURL": "mid-image"}
+
+    assert b'name="mediaType"' in file_upload.content
+    assert b"file" in file_upload.content
+    assert b"report.pdf" in file_upload.content
+    assert json.loads(file_send.content)["msgKey"] == "sampleFile"
+    assert json.loads(json.loads(file_send.content)["msgParam"]) == {
+        "mediaId": "mid-file",
+        "fileName": "report.pdf",
+        "fileType": "pdf",
+    }

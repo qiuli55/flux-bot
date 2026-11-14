@@ -1016,3 +1016,72 @@ def test_feishu_sender_surfaces_json_error_instead_of_saving_it() -> None:
             await sender.aclose()
 
     asyncio.run(scenario())
+
+
+def test_feishu_sender_uploads_then_sends_image_and_file(tmp_path: Path) -> None:
+    """官方链路：images/files 上传拿 key，再用 msg_type=image/file 发到同一 chat。"""
+    image = tmp_path / "chart.png"
+    image.write_bytes(b"\x89PNG fake")
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"%PDF-1.4 fake")
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/tenant_access_token/internal"):
+            return httpx.Response(
+                200, json={"code": 0, "tenant_access_token": "t-token", "expire": 7200}
+            )
+        if request.url.path.endswith("/im/v1/images"):
+            return httpx.Response(200, json={"code": 0, "data": {"image_key": "img_key"}})
+        if request.url.path.endswith("/im/v1/files"):
+            return httpx.Response(200, json={"code": 0, "data": {"file_key": "file_key"}})
+        return httpx.Response(200, json={"code": 0, "data": {"message_id": "om_sent"}})
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            sender = FeishuBotSender(app_id="app", app_secret="secret", client=http_client)
+            await sender.send_media(
+                CHAT_ID,
+                path=str(image),
+                name="chart.png",
+                mime="image/png",
+                kind="image",
+            )
+            await sender.send_media(
+                CHAT_ID,
+                path=str(document),
+                name="report.pdf",
+                mime="application/pdf",
+                kind="file",
+            )
+            await sender.aclose()
+
+    asyncio.run(scenario())
+
+    assert [request.url.path for request in requests] == [
+        "/open-apis/auth/v3/tenant_access_token/internal",
+        "/open-apis/im/v1/images",
+        "/open-apis/im/v1/messages",
+        "/open-apis/im/v1/files",
+        "/open-apis/im/v1/messages",
+    ]
+    image_upload, image_send, file_upload, file_send = requests[1:]
+    assert image_upload.headers["Authorization"] == "Bearer t-token"
+    assert b'name="image_type"' in image_upload.content
+    assert b"message" in image_upload.content
+    assert b'name="image"' in image_upload.content
+    assert b"chart.png" in image_upload.content
+
+    assert image_send.url.params["receive_id_type"] == "chat_id"
+    assert image_send.headers["Authorization"] == "Bearer t-token"
+    assert json.loads(image_send.content)["msg_type"] == "image"
+    assert json.loads(json.loads(image_send.content)["content"]) == {"image_key": "img_key"}
+
+    assert b'name="file_type"' in file_upload.content
+    assert b"stream" in file_upload.content
+    assert b'name="file_name"' in file_upload.content
+    assert b"report.pdf" in file_upload.content
+    assert json.loads(file_send.content)["msg_type"] == "file"
+    assert json.loads(json.loads(file_send.content)["content"]) == {"file_key": "file_key"}
