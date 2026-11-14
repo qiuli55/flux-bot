@@ -163,10 +163,13 @@ def component_for_message(
 
 def _attachments_node(content: str, files: Any) -> dict[str, Any] | None:
     """用户入站附件（kind=attachments，payload.files）。"""
-    nodes = _attachment_nodes(files, id_keys=("id", "upload_id"))
+    body = _text(content, MAX_TEXT_LENGTH)
+    # 正文会占一个 text 子节点，附件节点数要给卡片上限留出位置。
+    room = MAX_CHILDREN - 1 if body else MAX_CHILDREN
+    nodes = _attachment_nodes(files, id_keys=("id", "upload_id"))[:room]
     if not nodes:
         return None
-    return _card("附件", content=_text(content, MAX_TEXT_LENGTH), children=nodes)
+    return _card("附件", content=body, children=nodes)
 
 
 def _attachment_nodes(
