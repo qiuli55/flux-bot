@@ -473,7 +473,12 @@ async def create_bot_turn(
     Bot 暂停时同样 409，恢复后才能继续对话。
     """
     bot = await container.bots.get(_bot_id(bot_id))
-    files = resolve_uploads(container.settings, payload.attachment_ids)
+    files = resolve_uploads(
+        container.settings,
+        payload.attachment_ids,
+        cloud_user_id=cloud_user_id,
+        owner_cloud_user_id=container.settings.owner_cloud_user_id,
+    )
     turn, created = await container.bot_conversation.create_turn(
         bot,
         content=payload.content,

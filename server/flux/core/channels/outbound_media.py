@@ -29,6 +29,7 @@ from flux.core.attachment_store import (
     resolve_upload,
     size_label,
 )
+from flux.core.user_scope import normalize_cloud_user_id
 from flux.errors import ValidationError
 
 if TYPE_CHECKING:
@@ -320,6 +321,8 @@ async def run_attach_file_tool(
     bot: Bot,
     arguments: dict[str, Any],
     targets: list[UploadedFile],
+    *,
+    cloud_user_id: str | None = None,
 ) -> dict[str, Any]:
     """`attach_file` 的实现：校验来源、登记到 attachment_store、记在本轮列表里。
 
@@ -339,14 +342,25 @@ async def run_attach_file_tool(
         raise ValidationError(f"一条回复最多带 {MAX_OUTBOUND_ATTACHMENTS} 个附件")
 
     settings = container.settings
+    current = normalize_cloud_user_id(cloud_user_id)
     uploaded: UploadedFile | None
     if upload_id:
         uploaded = resolve_upload(settings, upload_id)
-        if uploaded is None:
+        # 已经登记归属人的附件只能由本人复用；老无主附件保持内部兼容。
+        if uploaded is None or (
+            current is not None
+            and normalize_cloud_user_id(uploaded.cloud_user_id) not in (None, current)
+        ):
             raise ValidationError(f"附件不存在或已被清理：{upload_id}")
     else:
         root = Path(container.bots.workspace_path(bot))
-        uploaded = register_workspace_file(settings, root, raw_path, name=display_name or None)
+        uploaded = register_workspace_file(
+            settings,
+            root,
+            raw_path,
+            name=display_name or None,
+            cloud_user_id=current,
+        )
 
     record = attachment_record(uploaded)
     if any(item.id == uploaded.id for item in targets):

@@ -17,20 +17,25 @@
 - `secure_input`  → card + secure input（服务端动作 secure_input.submit）
 - `secure_input_result` → 仅文本回执，不含任何密钥材料
 - `decision` / `decision_auto` / `decision_result` → card + 选项按钮（仅 pending 时）
+- `attachments`  → card + image/file/audio（`upload_id` 引用，用户入站附件）
+- `text` / 其它映射类型附带 `payload.attachments` → 原卡片（或文本卡片）+ 出站附件节点
 - `component`     → 原样返回（写入时已校验）
 
 卡片是写入时的快照：决策 / 密钥提交后会另写一条 `decision_result` /
 `secure_input_result`。客户端以结果消息为准收起原卡片；服务端在动作回调里仍会
 重新校验 pending 状态与回执，重复提交不会执行两次。
 
-`attachments`（用户上传的图片/文件/语音）暂不映射：附件目前只有服务端绝对路径，
-没有按 upload_id 取回内容的鉴权接口，贸然给 App 一个取不到的引用没有意义。
-后续补上附件读取端点后，再映射成 image/file/audio 节点即可。
+附件统一用 `upload_id` 引用（`GET /api/v1/uploads/{upload_id}` 按人鉴权读取）：
+入站消息的 `payload.files`（`id`/`name`/`size`/`mime`）与出站回复的
+`payload.attachments`（`upload_id`/`name`/`mime`/`size`/`kind`，来自 `attach_file`）
+都映射成 image / file / audio 子节点。原始 payload 里的 `path` 只在服务端内部给
+Agent 用，下发前由 `public_payload` 剥掉；组件节点里永远不含路径。
 """
 
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any
 
 from flux.core.components.schema import (
@@ -43,6 +48,28 @@ from flux.core.components.schema import (
 from flux.errors import ValidationError
 
 COMPONENT_KIND = "component"
+
+
+def public_payload(payload: Any) -> Any:
+    """返回可下发给客户端的 payload 副本。
+
+    附件内部记录（`files` / `attachments`）会带服务端绝对路径供 Agent 读文件；
+    对外 JSON 必须剥掉 `path`。这里不改写数据库、也不递归改写其他业务字段。
+    """
+    if not isinstance(payload, dict):
+        return payload
+    copy = dict(payload)
+    for key in ("files", "attachments"):
+        items = copy.get(key)
+        if isinstance(items, list):
+            copy[key] = [
+                {field: value for field, value in item.items() if field != "path"}
+                if isinstance(item, dict)
+                else item
+                for item in items
+            ]
+    return copy
+
 
 #: 读取时会附带 `payload["component"]` 的既有消息类型。
 MAPPED_KINDS: frozenset[str] = frozenset(
@@ -58,10 +85,16 @@ MAPPED_KINDS: frozenset[str] = frozenset(
         "decision",
         "decision_auto",
         "decision_result",
+        "attachments",
+        "text",
     }
 )
 
 _HTML_TAG = re.compile(r"<\s*(?:script|iframe|object|embed|style|link|meta)\b", re.I)
+#: 组件里的 upload_id 必须是目录名安全字符；不合法的历史记录直接跳过。
+_UPLOAD_ID_REF = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif"})
+_AUDIO_EXTS = frozenset({".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".opus", ".amr", ".silk"})
 
 
 def component_payload(
@@ -104,17 +137,105 @@ def component_for_message(
     message_id: str | None,
 ) -> dict[str, Any] | None:
     """把一条既有类型消息映射成组件树；不是映射类型或数据不完整时返回 None。"""
+    if kind == "attachments":
+        return _attachments_node(content, payload.get("files"))
     if kind in {"decision", "decision_auto", "decision_result"}:
-        return _decision_node(content, payload)
-    if kind == "secure_input":
-        return _secure_input_node(content, payload, message_id)
-    mapper = _MAPPERS.get(kind)
-    if mapper is None:
-        return None
-    return mapper(content, payload)
+        base = _decision_node(content, payload)
+    elif kind == "secure_input":
+        base = _secure_input_node(content, payload, message_id)
+    elif kind == "text":
+        base = None
+    else:
+        mapper = _MAPPERS.get(kind)
+        base = mapper(content, payload) if mapper is not None else None
+    # 出站回复可能同时带正文和 attach_file 登记的附件：在原有卡片/文本后追加节点。
+    extra = _attachment_nodes(payload.get("attachments"))
+    if not extra:
+        return base
+    if base is None:
+        # 纯文本 + 附件（或 secure_input 缺少 spec）：给正文一个文本卡片。
+        base = _card("附件", content=_text(content, MAX_TEXT_LENGTH), children=[])
+    return _append_children(base, extra)
 
 
 # ---------------------------------------------------------------- 各类型
+
+
+def _attachments_node(content: str, files: Any) -> dict[str, Any] | None:
+    """用户入站附件（kind=attachments，payload.files）。"""
+    body = _text(content, MAX_TEXT_LENGTH)
+    # 正文会占一个 text 子节点，附件节点数要给卡片上限留出位置。
+    room = MAX_CHILDREN - 1 if body else MAX_CHILDREN
+    nodes = _attachment_nodes(files, id_keys=("id", "upload_id"))[:room]
+    if not nodes:
+        return None
+    return _card("附件", content=body, children=nodes)
+
+
+def _attachment_nodes(
+    records: Any, *, id_keys: tuple[str, ...] = ("upload_id", "id")
+) -> list[dict[str, Any]]:
+    """把入站 files / 出站 attachments 记录折成 image / file / audio 节点。
+
+    只认 `upload_id`，绝不把记录里的 `path` 带进组件树；多个图片节点挂在同一张
+    卡片下，App 的堆叠卡片渲染器（2+ 图片子节点）可直接生效。
+    """
+    if not isinstance(records, list):
+        return []
+    nodes: list[dict[str, Any]] = []
+    for item in records[:MAX_CHILDREN]:
+        if not isinstance(item, dict):
+            continue
+        upload_id = ""
+        for key in id_keys:
+            candidate = item.get(key)
+            if isinstance(candidate, str) and _UPLOAD_ID_REF.match(candidate):
+                upload_id = candidate
+                break
+        if not upload_id:
+            continue
+        name = _text(item.get("name"), MAX_LABEL_LENGTH) or "附件"
+        mime = _text(item.get("mime"), 128) or ""
+        kind = _media_kind(mime, name, str(item.get("kind") or ""))
+        if kind == "image":
+            node: dict[str, Any] = {"type": "image", "upload_id": upload_id, "alt": name}
+            if mime:
+                node["mime"] = mime
+        elif kind == "audio":
+            node = {"type": "audio", "upload_id": upload_id}
+        else:
+            node = {"type": "file", "name": name, "upload_id": upload_id}
+            if mime:
+                node["mime"] = mime
+            size = item.get("size")
+            if isinstance(size, int) and not isinstance(size, bool) and 0 <= size <= 5 * 1024**3:
+                node["size"] = size
+        nodes.append(node)
+    return nodes
+
+
+def _media_kind(mime: str, name: str, hint: str = "") -> str:
+    """按 MIME / 扩展名归类；出站记录自带的 kind 只能用来辅助确认图片。"""
+    normalized = (mime or "").strip().lower()
+    ext = Path(name or "").suffix.lower()
+    if normalized.startswith("audio/") or ext in _AUDIO_EXTS:
+        return "audio"
+    if hint == "image" or normalized.startswith("image/") or ext in _IMAGE_EXTS:
+        return "image"
+    return "file"
+
+
+def _append_children(base: dict[str, Any], extra: list[dict[str, Any]]) -> dict[str, Any]:
+    """把附件节点追加到原卡片；非卡片节点（理论上不会有）则包一张新卡。"""
+    if base.get("type") != "card":
+        return _card("附件", children=[base, *extra][:MAX_CHILDREN])
+    children = base.get("children")
+    if not isinstance(children, list):
+        children = []
+    room = MAX_CHILDREN - len(children)
+    if room <= 0:
+        return base
+    return {**base, "children": [*children, *extra[:room]]}
 
 
 def _file_card_node(content: str, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -509,4 +630,5 @@ __all__ = [
     "MAPPED_KINDS",
     "component_for_message",
     "component_payload",
+    "public_payload",
 ]

@@ -27,9 +27,9 @@ payload = {
 | --- | --- |
 | `card` | `title?`、`subtitle?`、`children`（节点数组） |
 | `text` | `text`、`markdown?`（默认 false，只作为数据） |
-| `image` | `url` 或 `delivery_id`（+`index?`）、`alt?`、`mime?`、`width?`、`height?` |
-| `file` | `name`、`url` 或 `delivery_id`（+`index?`）、`mime?`、`size?` |
-| `audio` | `url` 或 `delivery_id`（+`index?`）、`duration_ms?`、`transcript?` |
+| `image` | `url`、`delivery_id` 或 `upload_id`（三选一；`index` 仅 delivery）、`alt?`、`mime?`、`width?`、`height?` |
+| `file` | `name`、`url` / `delivery_id` / `upload_id`（三选一；`index` 仅 delivery）、`mime?`、`size?` |
+| `audio` | `url`、`delivery_id` 或 `upload_id`（三选一；`index` 仅 delivery）、`duration_ms?`、`transcript?` |
 | `button` | `label`、`action` |
 | `choice` | `name` 或 `id`、`options`（`[{id,label}]`）、`multiple?`、`action?` |
 | `input` | `name`、`placeholder?`、`input_type?`（`text` / `secure`）、`label?`、`action?` |
@@ -84,16 +84,38 @@ POST /api/v1/tasks/{task_id}/messages/{message_id}/actions
 | `secure_input` | card + secure input（`secure_input.submit`） |
 | `secure_input_result` | 仅文本回执，不含密钥材料 |
 | `decision` / `decision_auto` / `decision_result` | card + 选项按钮（仅 pending 时） |
+| `attachments` | card + image/file/audio（`upload_id` 引用，用户入站附件） |
+| `text` 等带 `payload.attachments` | 正文文本卡片 / 原卡片 + image/file/audio（`upload_id` 引用） |
 
-`attachments`（用户上传的图片/文件/语音）暂不映射：目前没有按 upload_id
-取回内容的鉴权接口，App 拿到引用也取不到文件。
+附件节点只引用 `upload_id`，组件树与原 payload 里都不会出现服务端绝对路径。
+入站 `kind="attachments"` 的 `payload.files` 与出站回复（`attach_file` 登记）的
+`payload.attachments` 都会映射成 image / file / audio；多个图片节点在同一张卡片下，
+客户端可套用堆叠卡片渲染。原始 `kind` / `content` / payload 键保持不变。
+
+### 附件读取
+
+```
+GET /api/v1/uploads/{upload_id}
+Authorization: Bearer <Flux access token>   # 或登录 cookie flux_auth_token
+```
+
+- 只允许附件的归属人读取；跨用户 / 不存在统一返回 404（中文 `附件不存在或无权访问`）。
+- Phase 2 之前没有归属人的老附件：只有当前用户自己的任务消息引用过该 id 时才放行。
+- 响应带 `X-Content-Type-Options: nosniff` 与 `Cache-Control: private`；
+  `Content-Disposition` 使用 RFC 5987 的 `filename*`。
+- 可安全内联的图片 / 音视频 / PDF / 纯文本默认 `inline`；其余（含 HTML / SVG /
+  脚本 / XML）强制 `application/octet-stream` + `attachment`。加 `?download=true`
+  一律按附件下载。
+- 超过 50MB、路径越界、`meta.json` 与目录 id 不一致都拒绝读取。
 
 ## 校验上限
 
 深度 8、节点 200、单节点子项 50、文本 4000 字符、选项 20、整棵树 64KB；
 URL 只允许 `https`（拒绝 `javascript:` / `data:` / `file:` / `http:`、带账号密码、
-本机与私有地址）；文本不接受 HTML / 脚本片段。校验失败抛中文 `ValidationError`，
-非法树**不会**写进数据库。
+本机与私有地址）；文本不接受 HTML / 脚本片段。`upload_id` 只接受目录名安全字符，
+本身不含路径；读取走 `GET /api/v1/uploads/{upload_id}`，由服务端按登录人鉴权
+（跨用户与不存在都返回 404）。校验失败抛中文 `ValidationError`，非法树**不会**
+写进数据库。
 
 ## 安全边界
 

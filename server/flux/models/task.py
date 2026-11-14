@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
-from flux.core.components.mapping import component_payload
+from flux.core.components.mapping import component_payload, public_payload
 from flux.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 
@@ -178,7 +178,7 @@ class TaskMessage(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         # 既有类型在读取时附带统一组件树（payload["component"]），原 kind / content /
         # payload 字段保持不变；kind="component" 的消息原样返回。
         enriched = component_payload(self.kind, self.content, self.payload, str(self.id))
-        payload = enriched if enriched is not None else self.payload
+        payload = public_payload(enriched if enriched is not None else self.payload)
         return {
             "id": str(self.id),
             "task_id": str(self.task_id),

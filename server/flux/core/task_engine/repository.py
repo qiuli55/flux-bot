@@ -50,6 +50,19 @@ class MessageDraft:
     payload: dict[str, Any] | None = None
 
 
+def _payload_references_upload(value: Any, upload_id: str) -> bool:
+    """payload 里是否出现某个 upload_id（兼容 files / attachments / component 树）。"""
+    if isinstance(value, dict):
+        if str(value.get("upload_id") or "") == upload_id:
+            return True
+        if str(value.get("id") or "") == upload_id:
+            return True
+        return any(_payload_references_upload(item, upload_id) for item in value.values())
+    if isinstance(value, list):
+        return any(_payload_references_upload(item, upload_id) for item in value)
+    return False
+
+
 @dataclass(frozen=True)
 class ConversationSummary:
     """一条对话的列表项：任务本身 + 消息条数 + 最后一条消息的时间与摘录。
@@ -653,6 +666,37 @@ class TaskRepository:
                     TaskMessage.task_id == task_id, TaskMessage.id == message_id
                 )
             )
+
+    async def references_upload(
+        self,
+        *,
+        upload_id: str,
+        cloud_user_id: str | None,
+        owner_cloud_user_id: str | None,
+    ) -> bool:
+        """当前用户自己的任务里，是否有消息引用过该 upload_id。
+
+        只用于 Phase 2 之前写入、`meta.json` 里没有归属人的老附件：
+        没有归属信息时，用「这条消息在当前用户自己的对话里」作为最小授权依据。
+        跨用户任务按 `owned_clause` 过滤，绝不会因为别人引用过而放行。
+        """
+        current = normalize_cloud_user_id(cloud_user_id) or normalize_cloud_user_id(
+            owner_cloud_user_id
+        )
+        if current is None or not upload_id:
+            return False
+        statement = (
+            select(TaskMessage.payload)
+            .join(Task, TaskMessage.task_id == Task.id)
+            .where(
+                owned_clause(Task.cloud_user_id, current, owner_cloud_user_id),
+                TaskMessage.payload.is_not(None),
+                TaskMessage.kind.in_(("attachments", "text", "secure_input", "component")),
+            )
+        )
+        async with self._session_factory() as session:
+            rows = await session.scalars(statement)
+            return any(_payload_references_upload(payload, upload_id) for payload in rows)
 
     async def messages_of_kind(self, task_id: uuid.UUID, kind: str) -> list[TaskMessage]:
         """取任务里某一类型的全部消息（seq 升序）。

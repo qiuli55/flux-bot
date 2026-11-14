@@ -179,13 +179,19 @@ async def media_from_response(
     return DownloadedMedia(name=name, mime=mime, chunks=_bytes_chunks(raw))
 
 
-async def save_media(settings: Settings, media: DownloadedMedia) -> UploadedFile:
-    """延用手机上传同一条落盘链路（50MB 上限 + 半成品清理）。"""
+async def save_media(
+    settings: Settings,
+    media: DownloadedMedia,
+    *,
+    cloud_user_id: str | None = None,
+) -> UploadedFile:
+    """延用手机上传同一条落盘链路（50MB 上限 + 半成品清理 + 按人归属）。"""
     return await save_upload(
         settings,
         name=safe_name(media.name or "file"),
         mime=media.mime,
         chunks=media.chunks,
+        cloud_user_id=cloud_user_id,
     )
 
 

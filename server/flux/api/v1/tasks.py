@@ -164,8 +164,13 @@ async def create_task(
     )
     avatar_shape, avatar_color = normalize_avatar(payload.avatar_shape, payload.avatar_color)
 
-    # 附件先校验：不合格就别把任务建出来，免得留下一条空对话
-    files = resolve_uploads(container.settings, payload.attachment_ids)
+    # 附件先校验（含按人归属）：不合格就别把任务建出来，免得留下一条空对话
+    files = resolve_uploads(
+        container.settings,
+        payload.attachment_ids,
+        cloud_user_id=cloud_user_id,
+        owner_cloud_user_id=container.settings.owner_cloud_user_id,
+    )
     task = await container.task_repo.create(
         task_id=uuid.uuid4(),
         description=payload.description,
@@ -457,7 +462,12 @@ async def create_task_message(
     task_uuid = _task_id(task_id)
     task = await _owned_task(container, task_uuid, cloud_user_id)
     content = payload.content.strip()
-    files = resolve_uploads(container.settings, payload.attachment_ids)
+    files = resolve_uploads(
+        container.settings,
+        payload.attachment_ids,
+        cloud_user_id=cloud_user_id,
+        owner_cloud_user_id=container.settings.owner_cloud_user_id,
+    )
     if not content and not files:
         raise ValidationError(
             "消息内容不能为空", details={"task_id": task_id, "attachments": len(files)}
@@ -644,7 +654,12 @@ async def continue_task(
     task_uuid = _task_id(task_id)
     task = await _owned_task(container, task_uuid, cloud_user_id)
     content = payload.content.strip()
-    files = resolve_uploads(container.settings, payload.attachment_ids)
+    files = resolve_uploads(
+        container.settings,
+        payload.attachment_ids,
+        cloud_user_id=cloud_user_id,
+        owner_cloud_user_id=container.settings.owner_cloud_user_id,
+    )
     if not content and not files:
         raise ValidationError(
             "消息内容不能为空", details={"task_id": task_id, "attachments": len(files)}

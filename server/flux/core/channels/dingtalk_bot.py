@@ -542,7 +542,7 @@ class DingTalkBotChannel:
                 )
                 return self._success()
             try:
-                files, content = await self._load_media(parsed)
+                files, content = await self._load_media(parsed, cloud_user_id=cloud_user_id)
             except ValidationError as exc:
                 logger.warning(
                     "钉钉入站媒体被拒绝 message=%s kind=%s reason=%s",
@@ -769,7 +769,9 @@ class DingTalkBotChannel:
             return
         await sender.send_text(dict(dest), text)
 
-    async def _load_media(self, parsed: _InboundMessage) -> tuple[list[Any], str]:
+    async def _load_media(
+        self, parsed: _InboundMessage, *, cloud_user_id: str | None = None
+    ) -> tuple[list[Any], str]:
         """下载一条图片/语音/文件并落盘；缺凭据时给中文说明而不是静默忽略。"""
         label = _KIND_LABELS[parsed.kind]
         sender = self._sender
@@ -803,6 +805,7 @@ class DingTalkBotChannel:
         uploaded = await save_media(
             self._container.settings,
             DownloadedMedia(name=name, mime=media.mime, chunks=media.chunks),
+            cloud_user_id=cloud_user_id,
         )
         if parsed.kind == "audio":
             content = parsed.recognition or await transcribe_audio(self._transcriber, uploaded)
