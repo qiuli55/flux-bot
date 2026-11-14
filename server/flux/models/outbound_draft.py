@@ -10,6 +10,8 @@
 - sent / denied / cancelled / failed：终态。终态一律不自动重试、不自动发送。
 
 `body_hash` 是正文的 sha256，审批卡与日志只引用哈希，不打印正文。
+`attachments` 保存出站图片 / 文件的元数据（upload_id / 文件名 / mime / 大小 / 类型），
+文件本体仍在 attachment_store，发送时按 upload_id 还原。
 """
 
 from __future__ import annotations
@@ -43,6 +45,12 @@ class OutboundDraft(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     body: Mapped[str] = mapped_column(Text, nullable=False)
     #: 正文的 sha256（hex），日志与审批 meta 只放它。
     body_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: 出站附件清单（JSON 数组），每项含 upload_id / name / mime / size / kind。
+    #: 只存 attachment_store 的 upload_id 与展示元数据，不存绝对路径与文件内容；
+    #: 进程重启后按 upload_id 仍能还原文件。纯文本草稿为空数组。
+    attachments: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list, server_default="[]"
+    )
     #: 频道相关的投递目标，如飞书的 {"chat_id": ..., "message_id": ...}。
     dest: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     #: 来源归属。不设外键：草稿是审计记录，任务/Bot 被清理后仍应可查。
@@ -66,6 +74,7 @@ class OutboundDraft(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "status": self.status,
             "body": self.body,
             "body_hash": self.body_hash,
+            "attachments": list(self.attachments or []),
             "dest": dict(self.dest or {}),
             "bot_id": str(self.bot_id) if self.bot_id is not None else None,
             "task_id": str(self.task_id) if self.task_id is not None else None,

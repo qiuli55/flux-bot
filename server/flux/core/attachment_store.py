@@ -10,6 +10,7 @@ Agent 拿到的就是这个绝对路径——它用原生读文件能力/终端�
 from __future__ import annotations
 
 import json
+import mimetypes
 import re
 import uuid
 from collections.abc import AsyncIterator
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from flux.config import Settings
+from flux.core.virtual_workspace.path_guard import resolve_within_root
 from flux.errors import ValidationError
 from flux.logging import get_logger
 
@@ -105,6 +107,117 @@ async def save_upload(
         raise
 
 
+def save_local_file(
+    settings: Settings,
+    source: Path,
+    *,
+    name: str | None = None,
+    mime: str = "",
+) -> UploadedFile:
+    """把一个已在磁盘上的文件复制进 attachment_store（同步，供出站附件用）。
+
+    与 `save_upload` 同一套目录结构与上限：Bot 从工作区登记文件时也走这里，
+    平台发送端永远只拿到 attachment_store 里的副本，不直接读用户工作区路径。
+    """
+    try:
+        source_stat = source.stat()
+    except OSError as exc:
+        raise ValidationError(
+            f"找不到要发送的文件：{source}", details={"path": str(source)}
+        ) from exc
+    if not source.is_file():
+        raise ValidationError(f"要发送的路径不是文件：{source}", details={"path": str(source)})
+    if source_stat.st_size == 0:
+        raise ValidationError("附件内容为空", details={"name": name or source.name})
+    if source_stat.st_size > ATTACHMENT_MAX_BYTES:
+        raise ValidationError(
+            f"单个附件不能超过 {ATTACHMENT_MAX_BYTES // (1024 * 1024)}MB",
+            details={"name": name or source.name, "limit": ATTACHMENT_MAX_BYTES},
+        )
+
+    upload_id = uuid.uuid4().hex
+    folder = uploads_root(settings) / upload_id
+    folder.mkdir(parents=True, exist_ok=False)
+    target = folder / safe_name(name or source.name)
+    size = 0
+    try:
+        with source.open("rb") as src, target.open("wb") as dst:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > ATTACHMENT_MAX_BYTES:
+                    raise ValidationError(
+                        f"单个附件不能超过 {ATTACHMENT_MAX_BYTES // (1024 * 1024)}MB",
+                        details={"name": target.name, "limit": ATTACHMENT_MAX_BYTES},
+                    )
+                dst.write(chunk)
+        if size == 0:
+            raise ValidationError("附件内容为空", details={"name": target.name})
+        uploaded = UploadedFile(
+            id=upload_id,
+            name=target.name,
+            size=size,
+            mime=(mime or mimetypes.guess_type(target.name)[0] or ""),
+            path=str(target),
+        )
+        (folder / "meta.json").write_text(
+            json.dumps(uploaded.to_dict(), ensure_ascii=False), encoding="utf-8"
+        )
+        return uploaded
+    except Exception:
+        for path in (target, folder / "meta.json"):
+            path.unlink(missing_ok=True)
+        folder.rmdir()
+        raise
+
+
+def register_workspace_file(
+    settings: Settings,
+    root: str | Path,
+    raw_path: str,
+    *,
+    name: str | None = None,
+) -> UploadedFile:
+    """校验一个 Bot 工作区内的文件并复制进 attachment_store。
+
+    路径安全是硬红线：绝对路径必须落在 `root` 内，相对路径不允许 `..`，沿途任何
+    软链都 fail-closed（复用 `resolve_within_root`）。通过后再按 50MB 上限复制。
+    """
+    raw = (raw_path or "").strip()
+    if not raw or "\x00" in raw:
+        raise ValidationError("附件路径不能为空", details={"path": raw})
+    root_path = Path(root).expanduser()
+    root_path.mkdir(parents=True, exist_ok=True)
+    root_path = root_path.resolve()
+
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        try:
+            relative = candidate.resolve().relative_to(root_path)
+        except ValueError as exc:
+            raise ValidationError(
+                "文件必须位于 Bot 工作区内，已拒绝该路径",
+                details={"path": raw},
+            ) from exc
+    else:
+        if any(part == ".." for part in candidate.parts):
+            raise ValidationError("附件路径不能包含 ..", details={"path": raw})
+        relative = candidate
+
+    resolved = resolve_within_root(root_path, relative)
+    if not resolved.is_file():
+        raise ValidationError(f"工作区内找不到文件：{raw}", details={"path": str(relative)})
+    target_name = safe_name(name or resolved.name)
+    return save_local_file(
+        settings,
+        resolved,
+        name=target_name,
+        mime=mimetypes.guess_type(target_name)[0] or "",
+    )
+
+
 def resolve_upload(settings: Settings, upload_id: str) -> UploadedFile | None:
     """按 id 还原附件；目录或元数据缺失时返回 None（老消息里的附件可能已被清理）。"""
     if not upload_id or "/" in upload_id or "\\" in upload_id:
@@ -163,9 +276,11 @@ __all__ = [
     "ATTACHMENT_MAX_BYTES",
     "ATTACHMENT_MAX_FILES",
     "UploadedFile",
+    "register_workspace_file",
     "resolve_upload",
     "resolve_uploads",
     "safe_name",
+    "save_local_file",
     "save_upload",
     "size_label",
     "uploads_root",
