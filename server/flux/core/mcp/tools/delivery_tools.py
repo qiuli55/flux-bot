@@ -18,6 +18,7 @@ from typing import Any
 from flux.core.delivery_store import DELIVERY_MAX_FILES, Delivery, create_delivery
 from flux.core.mcp.tools.base import ToolContext, ToolSpec, optional_str, reject_unknown
 from flux.core.task_engine.repository import MessageDraft
+from flux.core.user_scope import normalize_cloud_user_id
 from flux.core.virtual_workspace.apply_engine import (
     resolve_workspace_root,
     safe_relative_path,
@@ -31,7 +32,13 @@ from flux.enums import Capability, TaskMessageRole
 from flux.errors import NotFoundError, ValidationError
 
 
-async def _task_for_run(ctx: ToolContext) -> uuid.UUID:
+async def _task_scope(ctx: ToolContext) -> tuple[uuid.UUID, str | None]:
+    """本次下发所属的任务与云用户：run → task → tasks.cloud_user_id。
+
+    历史 NULL（Phase 之前创建的任务）回退配置的主用户，与其它按人隔离的功能
+    保持一致；这样老对话里由 `file.deliver` 产出的文件仍归主用户可读。
+    归属只来自服务端记录，绝不取工具入参。
+    """
     run_id = getattr(ctx.identity, "run_id", None)
     if not run_id:
         raise ValidationError(
@@ -43,7 +50,18 @@ async def _task_for_run(ctx: ToolContext) -> uuid.UUID:
             f"{ctx.tool_name} 找不到当前 Run 归属的任务，无法写入对话",
             details={"run_id": run_id},
         )
-    return run.task_id
+    task = None
+    try:
+        task = await ctx.container.task_repo.get(run.task_id)
+    except NotFoundError:
+        # 查不到任务只影响归属解析，交给后面的主用户兜底。
+        task = None
+    cloud_user_id = normalize_cloud_user_id(getattr(task, "cloud_user_id", None))
+    if cloud_user_id is None:
+        cloud_user_id = normalize_cloud_user_id(
+            getattr(ctx.container.settings, "owner_cloud_user_id", None)
+        )
+    return run.task_id, cloud_user_id
 
 
 def _sources(ctx: ToolContext, raw_paths: list[Any]) -> list[tuple[str, Path]]:
@@ -98,10 +116,14 @@ async def file_deliver(ctx: ToolContext, params: dict[str, Any]) -> dict[str, An
             details={"count": len(raw_paths), "limit": DELIVERY_MAX_FILES},
         )
     note = optional_str(params, "note") or ""
-    task_id = await _task_for_run(ctx)
+    task_id, cloud_user_id = await _task_scope(ctx)
     sources = _sources(ctx, raw_paths)
     delivery = await asyncio.to_thread(
-        create_delivery, ctx.container.settings, sources=sources, note=note
+        create_delivery,
+        ctx.container.settings,
+        sources=sources,
+        note=note,
+        cloud_user_id=cloud_user_id,
     )
     message = (
         await ctx.container.task_repo.add_messages(
