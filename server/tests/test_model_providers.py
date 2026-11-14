@@ -302,6 +302,121 @@ async def test_anthropic_missing_content_raises_provider_error() -> None:
     assert excinfo.value.code == "provider_error"
 
 
+async def test_anthropic_chat_with_tools_maps_schema_and_tool_use() -> None:
+    recorder = _Recorder()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        recorder.body = _json_body(request)
+        return httpx.Response(
+            200,
+            json={
+                "content": [
+                    {"type": "text", "text": "我先查一下规则。"},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "approval_rule_list",
+                        "input": {},
+                    },
+                ],
+                "usage": {"input_tokens": 12, "output_tokens": 8},
+            },
+        )
+
+    provider = AnthropicProvider(
+        model_name="claude-sonnet-5-5",
+        api_key="test-anthropic-key",
+        base_url="https://api.anthropic.com",
+        client=_client(handler),
+        max_retries=0,
+    )
+    result = await provider.chat_with_tools(
+        [ChatMessage(role="user", content="看看有哪些规则")],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "approval_rule_list",
+                    "description": "列出当前用户的审批规则",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+    )
+
+    assert recorder.body["tools"] == [
+        {
+            "name": "approval_rule_list",
+            "description": "列出当前用户的审批规则",
+            "input_schema": {"type": "object", "properties": {}},
+        }
+    ]
+    assert result.content == "我先查一下规则。"
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0]["id"] == "toolu_1"
+    assert result.tool_calls[0]["function"]["name"] == "approval_rule_list"
+    assert result.tool_calls[0]["function"]["arguments"] == "{}"
+
+
+async def test_anthropic_chat_with_tools_rewrites_tool_results() -> None:
+    recorder = _Recorder()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        recorder.body = _json_body(request)
+        return httpx.Response(200, json=_anthropic_response())
+
+    provider = AnthropicProvider(
+        model_name="claude-sonnet-5-5",
+        api_key="test-anthropic-key",
+        base_url="https://api.anthropic.com",
+        client=_client(handler),
+        max_retries=0,
+    )
+    await provider.chat_with_tools(
+        [
+            ChatMessage(role="user", content="删掉那条规则"),
+            ChatMessage(
+                role="assistant",
+                content="",
+                tool_calls=(
+                    {
+                        "id": "toolu_1",
+                        "type": "function",
+                        "function": {
+                            "name": "approval_rule_delete",
+                            "arguments": '{"rule_id": "r-1"}',
+                        },
+                    },
+                ),
+            ),
+            ChatMessage(
+                role="tool",
+                content='{"ok": true}',
+                tool_call_id="toolu_1",
+                name="approval_rule_delete",
+            ),
+        ],
+        tools=[],
+    )
+
+    assistant, tool_result = recorder.body["messages"][1], recorder.body["messages"][2]
+    assert assistant == {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "approval_rule_delete",
+                "input": {"rule_id": "r-1"},
+            }
+        ],
+    }
+    assert tool_result == {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": '{"ok": true}'}],
+    }
+
+
 # --- 错误映射 ---
 
 

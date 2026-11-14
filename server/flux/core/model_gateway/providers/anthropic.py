@@ -87,17 +87,41 @@ class AnthropicProvider(ModelProviderBase):
         self._ensure_configured()
 
         payload = self._build_payload(messages, stream=False, **kwargs)
+        started = time.perf_counter()
+        data = await self._post_messages(payload)
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return self._result_from(data, kwargs, latency_ms=latency_ms)
 
+    async def chat_with_tools(
+        self,
+        messages: list[ChatMessage],
+        *,
+        tools: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> ChatResult:
+        """带工具定义的对话：把 OpenAI 形状的工具 schema 转成 Anthropic `tools`。
+
+        Anthropic 用内容块表达工具往来：assistant 的 `tool_use` 块发起调用，
+        紧接着的 user 消息里用 `tool_result` 块回灌结果。这里负责两端的形状转换，
+        对上层（Solo 助手工具循环）保持 OpenAI 口径不变。
+        """
+        self._ensure_configured()
+
+        payload = self._build_payload(messages, stream=False, tools=tools, **kwargs)
+        started = time.perf_counter()
+        data = await self._post_messages(payload)
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return self._result_from(data, kwargs, latency_ms=latency_ms, with_tools=True)
+
+    async def _post_messages(self, payload: dict[str, Any]) -> dict[str, Any]:
         headers = {
             "x-api-key": f"{self.api_key}",
             "anthropic-version": ANTHROPIC_VERSION,
             "Content-Type": "application/json",
         }
         url = f"{self.base_url.rstrip('/')}/v1/messages"
-
-        started = time.perf_counter()
         if self._client is not None:
-            data = await post_json(
+            return await post_json(
                 self._client,
                 url,
                 payload=payload,
@@ -106,19 +130,25 @@ class AnthropicProvider(ModelProviderBase):
                 timeout=self.timeout,
                 max_retries=self.max_retries,
             )
-        else:
-            async with httpx.AsyncClient() as client:
-                data = await post_json(
-                    client,
-                    url,
-                    payload=payload,
-                    headers=headers,
-                    provider=str(self.provider),
-                    timeout=self.timeout,
-                    max_retries=self.max_retries,
-                )
-        latency_ms = int((time.perf_counter() - started) * 1000)
+        async with httpx.AsyncClient() as client:
+            return await post_json(
+                client,
+                url,
+                payload=payload,
+                headers=headers,
+                provider=str(self.provider),
+                timeout=self.timeout,
+                max_retries=self.max_retries,
+            )
 
+    def _result_from(
+        self,
+        data: dict[str, Any],
+        kwargs: dict[str, Any],
+        *,
+        latency_ms: int,
+        with_tools: bool = False,
+    ) -> ChatResult:
         blocks = data.get("content")
         if not isinstance(blocks, list) or not blocks:
             raise ProviderError(
@@ -129,6 +159,16 @@ class AnthropicProvider(ModelProviderBase):
             block.get("text", "")
             for block in blocks
             if isinstance(block, dict) and block.get("type") == "text"
+        )
+        tool_calls = (
+            tuple(
+                call
+                for block in blocks
+                if isinstance(block, dict) and block.get("type") == "tool_use"
+                if (call := _tool_call_from_block(block)) is not None
+            )
+            if with_tools
+            else ()
         )
 
         raw_usage = data.get("usage") or {}
@@ -144,6 +184,7 @@ class AnthropicProvider(ModelProviderBase):
             latency_ms=latency_ms,
             cost=self.calculate_cost(usage),
             raw=data,
+            tool_calls=tool_calls,
         )
 
     async def stream(self, messages: list[ChatMessage], **kwargs: Any) -> AsyncIterator[str]:
@@ -184,10 +225,15 @@ class AnthropicProvider(ModelProviderBase):
                 await client.aclose()
 
     def _build_payload(
-        self, messages: list[ChatMessage], *, stream: bool, **kwargs: Any
+        self,
+        messages: list[ChatMessage],
+        *,
+        stream: bool,
+        tools: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any]:
         system_prompt = "\n\n".join(m.content for m in messages if m.role == "system")
-        dialog = [{"role": m.role, "content": m.content} for m in messages if m.role != "system"]
+        dialog = [_message_payload(m) for m in messages if m.role != "system"]
 
         payload: dict[str, Any] = {
             "model": resolve_model_name(kwargs, self.model_name),
@@ -197,6 +243,10 @@ class AnthropicProvider(ModelProviderBase):
         }
         if system_prompt:
             payload["system"] = system_prompt
+        if tools:
+            converted = [_tool_schema(tool) for tool in tools]
+            if converted:
+                payload["tools"] = converted
 
         temperature = kwargs.get("temperature")
         if temperature is not None:
@@ -210,6 +260,96 @@ class AnthropicProvider(ModelProviderBase):
                 )
             payload["temperature"] = clamped
         return payload
+
+
+def _message_payload(message: ChatMessage) -> dict[str, Any]:
+    """把一条 ChatMessage 转成 Anthropic 消息。
+
+    普通文本消息原样下发；assistant 的工具调用改成 `tool_use` 内容块，
+    role=tool 的结果改写成 user 侧的 `tool_result` 块（Anthropic 的固定形状）。
+    """
+    if message.role == "tool":
+        return {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": message.tool_call_id,
+                    "content": message.content,
+                }
+            ],
+        }
+    if message.role == "assistant" and message.tool_calls:
+        blocks: list[dict[str, Any]] = []
+        if message.content:
+            blocks.append({"type": "text", "text": message.content})
+        for call in message.tool_calls:
+            function = call.get("function") or {}
+            name = str(function.get("name") or "")
+            if not name:
+                continue
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": str(call.get("id") or ""),
+                    "name": name,
+                    "input": _tool_arguments(function.get("arguments")),
+                }
+            )
+        return {"role": "assistant", "content": blocks}
+    return {"role": message.role, "content": message.content}
+
+
+def _tool_arguments(raw: Any) -> dict[str, Any]:
+    """OpenAI 的 arguments 是 JSON 字符串；Anthropic 要的是对象。"""
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _tool_schema(tool: dict[str, Any]) -> dict[str, Any]:
+    """OpenAI `{"type": "function", "function": {...}}` → Anthropic 扁平 schema。"""
+    function = tool.get("function") if tool.get("type") == "function" else tool
+    if not isinstance(function, dict):
+        return {}
+    name = str(function.get("name") or "")
+    if not name:
+        return {}
+    item: dict[str, Any] = {"name": name}
+    description = function.get("description")
+    if description:
+        item["description"] = str(description)
+    parameters = function.get("parameters")
+    item["input_schema"] = (
+        parameters
+        if isinstance(parameters, dict)
+        else {
+            "type": "object",
+            "properties": {},
+        }
+    )
+    return item
+
+
+def _tool_call_from_block(block: dict[str, Any]) -> dict[str, Any] | None:
+    """`tool_use` 内容块 → OpenAI 形状的 tool_call。"""
+    name = str(block.get("name") or "")
+    if not name:
+        return None
+    return {
+        "id": str(block.get("id") or ""),
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+        },
+    }
 
 
 def _anthropic_stream_text(line: str) -> str:
