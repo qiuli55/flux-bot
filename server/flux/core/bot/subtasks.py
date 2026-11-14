@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 from flux.core.event.bus import Events
 from flux.core.task_engine.repository import MessageDraft
+from flux.core.user_scope import normalize_cloud_user_id
 from flux.enums import (
     DecisionMode,
     PermissionMode,
@@ -106,6 +107,11 @@ class BotSubtaskService:
         #: 已回写过父对话终态的子任务：完成/失败/取消只回写一次。
         self._published: set[uuid.UUID] = set()
 
+    def _owner(self) -> str | None:
+        return normalize_cloud_user_id(
+            getattr(self._container.settings, "owner_cloud_user_id", None)
+        )
+
     # --- 创建 / 查询 ---
 
     async def create(
@@ -114,8 +120,13 @@ class BotSubtaskService:
         *,
         instruction: str,
         title: str | None = None,
+        cloud_user_id: str | None = None,
     ) -> Task:
-        """派一条后台子任务并立即返回；真正的内核 Run 在后台协程里跑。"""
+        """派一条后台子任务并立即返回；真正的内核 Run 在后台协程里跑。
+
+        `cloud_user_id` 是本轮对话的人格：父对话任务与子任务都必须落在同一个人名下，
+        否则子任务结果会写进另一个人的聊天记录。
+        """
         text = (instruction or "").strip()
         if not text:
             raise ValidationError(
@@ -124,7 +135,9 @@ class BotSubtaskService:
 
         container = self._container
         # 复用对话服务已有的懒创建逻辑：父对话必须与聊天轮次是同一条 tasks 行。
-        parent = await container.bot_conversation._chat_task(bot)  # noqa: SLF001 - 单一懒创建路径
+        parent = await container.bot_conversation._chat_task(  # noqa: SLF001 - 单一懒创建路径
+            bot, cloud_user_id
+        )
         task = await container.task_repo.create(
             task_id=uuid.uuid4(),
             description=text,
@@ -142,6 +155,7 @@ class BotSubtaskService:
             bot_id=bot.id,
             workspace=str(container.bots.workspace_path(bot)),
             parent_task_id=parent.id,
+            cloud_user_id=cloud_user_id or parent.cloud_user_id,
         )
         job = asyncio.create_task(
             self._run(task.id, text, title),
@@ -157,18 +171,40 @@ class BotSubtaskService:
         *,
         status: TaskStatus | None = None,
         limit: int = 50,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
+        scoped: bool = False,
     ) -> list[Task]:
-        """某个 Bot 的子任务，按创建时间倒序；可按状态过滤。"""
+        """某个 Bot 的子任务，按创建时间倒序；可按状态过滤（REST 面按人过滤）。"""
         return await self._container.task_repo.list(
             bot_id=bot.id,
             origin=TaskOrigin.SUBTASK,
             status=status,
             limit=limit,
+            cloud_user_id=cloud_user_id,
+            owner_cloud_user_id=owner_cloud_user_id or self._owner(),
+            scope_to_user=scoped,
         )
 
-    async def get(self, bot: Bot, subtask_id: uuid.UUID) -> Task:
-        """取一条属于该 Bot 的子任务；不属于时按不存在处理（不泄露其他 Bot 的 id）。"""
-        task = await self._container.task_repo.get(subtask_id)
+    async def get(
+        self,
+        bot: Bot,
+        subtask_id: uuid.UUID,
+        *,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
+        scoped: bool = False,
+    ) -> Task:
+        """取一条属于该 Bot（且属于当前人）的子任务；否则按不存在处理。"""
+        task = (
+            await self._container.task_repo.get_owned(
+                subtask_id,
+                cloud_user_id=cloud_user_id,
+                owner_cloud_user_id=owner_cloud_user_id or self._owner(),
+            )
+            if scoped
+            else await self._container.task_repo.get(subtask_id)
+        )
         if task.origin != TaskOrigin.SUBTASK.value or task.bot_id != bot.id:
             raise NotFoundError(
                 f"子任务 {subtask_id} 不存在",
@@ -178,9 +214,23 @@ class BotSubtaskService:
 
     # --- 取消 / 停机 ---
 
-    async def cancel(self, bot: Bot, subtask_id: uuid.UUID) -> Task:
+    async def cancel(
+        self,
+        bot: Bot,
+        subtask_id: uuid.UUID,
+        *,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
+        scoped: bool = False,
+    ) -> Task:
         """取消仍在执行的子任务；终态任务返回 409。"""
-        task = await self.get(bot, subtask_id)
+        task = await self.get(
+            bot,
+            subtask_id,
+            cloud_user_id=cloud_user_id,
+            owner_cloud_user_id=owner_cloud_user_id or self._owner(),
+            scoped=scoped,
+        )
         if task.status in TERMINAL_STATUSES:
             raise ConflictError(
                 f"子任务已结束（{task.status}），不能再取消",
@@ -816,8 +866,14 @@ async def run_subtask_tool(
     bot: Bot,
     name: str,
     arguments: dict[str, Any],
+    *,
+    cloud_user_id: str | None = None,
+    owner_cloud_user_id: str | None = None,
 ) -> Any:
-    """执行一个子任务工具；只接受 SUBTASK_TOOLS 里声明的名字。"""
+    """执行一个子任务工具；只接受 SUBTASK_TOOLS 里声明的名字。
+
+    `cloud_user_id` 是本轮对话的人格：创建/查询/取消都只允许碰这个人的子任务。
+    """
     args = arguments or {}
     if name == "subtask_start":
         instruction = str(args.get("instruction") or "").strip()
@@ -826,6 +882,7 @@ async def run_subtask_tool(
             bot,
             instruction=instruction,
             title=str(title).strip() if title else None,
+            cloud_user_id=cloud_user_id,
         )
         return {
             "subtask_id": str(task.id),
@@ -834,7 +891,13 @@ async def run_subtask_tool(
         }
     if name == "subtask_get":
         subtask_id = _tool_uuid(args.get("subtask_id"), "subtask_id")
-        task = await service.get(bot, subtask_id)
+        task = await service.get(
+            bot,
+            subtask_id,
+            cloud_user_id=cloud_user_id,
+            owner_cloud_user_id=owner_cloud_user_id,
+            scoped=True,
+        )
         return task.to_dict()
     if name == "subtask_list":
         raw_status = args.get("status")
@@ -852,7 +915,14 @@ async def run_subtask_tool(
         except (TypeError, ValueError) as exc:
             raise BadRequestError("limit 必须是整数", details={"limit": args.get("limit")}) from exc
         limit = max(1, min(limit, 50))
-        tasks = await service.list(bot, status=wanted, limit=limit)
+        tasks = await service.list(
+            bot,
+            status=wanted,
+            limit=limit,
+            cloud_user_id=cloud_user_id,
+            owner_cloud_user_id=owner_cloud_user_id,
+            scoped=True,
+        )
         return {"subtasks": [task.to_dict() for task in tasks], "count": len(tasks)}
     raise BadRequestError(
         f"未知的子任务工具：{name}",

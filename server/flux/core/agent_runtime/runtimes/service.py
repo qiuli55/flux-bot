@@ -322,10 +322,11 @@ _REMEMBER_HINT = (
 
 
 async def _user_memory_instruction(container: Container, cloud_user_id: str | None = None) -> str:
-    """把当前人格的三层记忆压成背景（User 最近 8 条 / 1200 字 + 共享空间）。
+    """把当前人格的记忆压成背景（User 最近 8 条 / 1200 字 + 共享空间 + 画像/日志）。
 
     `cloud_user_id` 来自任务行（例程创建者 / 绑定的 IM 用户）；None 时沿用
-    MemoryService 的主用户回退口径，兼容历史任务。
+    MemoryService 的主用户回退口径，兼容历史任务。画像/日志同样按人读取，
+    别人的私有条目不会进入这段指令；两人共享的内容走共享空间。
     """
     blocks: list[str] = []
     prefs = getattr(container, "memory_prefs", None)
@@ -346,6 +347,16 @@ async def _user_memory_instruction(container: Container, cloud_user_id: str | No
         shared = ""
     if shared:
         blocks.append(shared.rstrip())
+    # 本人的画像 / 日志（Phase 4 起按人隔离）：只注入当前任务代表的那个用户。
+    shared_user = getattr(container, "shared_user_memory", None)
+    if shared_user is not None:
+        try:
+            profile_block = await shared_user.render_block(cloud_user_id=cloud_user_id)
+        except Exception:  # noqa: BLE001 - 画像/日志失败不能挡住任务启动
+            logger.warning("读取用户画像/日志失败", exc_info=True)
+            profile_block = ""
+        if profile_block:
+            blocks.append(profile_block.rstrip())
     if entries:
         picked = entries[-_USER_MEMORY_MAX_ENTRIES:]
         lines: list[str] = []

@@ -14,8 +14,9 @@ import uuid
 from typing import Any
 
 from flux.core.mcp.tools.base import ToolContext, ToolSpec, optional_str, reject_unknown
+from flux.core.user_scope import normalize_cloud_user_id
 from flux.enums import Capability, TaskOrigin, TaskStatus
-from flux.errors import ValidationError
+from flux.errors import NotFoundError, ValidationError
 
 __all__ = ["supervisor_tools"]
 
@@ -57,14 +58,40 @@ async def assistant_timeline(ctx: ToolContext, params: dict[str, Any]) -> dict[s
     return {"events": events}
 
 
+async def _user_scope(ctx: ToolContext) -> tuple[bool, str | None]:
+    """本次 Run 是否有可解析的用户上下文（run → task → tasks.cloud_user_id）。
+
+    有 Run 时一律按人过滤（解析不到人也 fail-closed 成空）；没有 Run 的全局助理
+    保持历史口径（可通读全部对话）。
+    """
+    run_id = ctx.identity.run_id
+    if not run_id:
+        return False, None
+    run = await ctx.container.run_repo.get(run_id)
+    if run is None or run.task_id is None:
+        return True, None
+    try:
+        task = await ctx.container.task_repo.get(run.task_id)
+    except NotFoundError:
+        return True, None
+    user = normalize_cloud_user_id(getattr(task, "cloud_user_id", None))
+    if user is None:
+        user = normalize_cloud_user_id(ctx.container.settings.owner_cloud_user_id)
+    return True, user
+
+
 async def assistant_conversations(ctx: ToolContext, params: dict[str, Any]) -> dict[str, Any]:
     reject_unknown(params, {"limit", "project_id", "status", "keyword", "include_assistant"})
+    scoped, user = await _user_scope(ctx)
     summaries = await ctx.container.task_repo.list_conversations(
         project_id=_optional_uuid(optional_str(params, "project_id"), "project_id"),
         status=_status(params.get("status")),
         origin=None if _bool(params, "include_assistant") else TaskOrigin.CHAT,
         keyword=optional_str(params, "keyword"),
         limit=_limit(params),
+        cloud_user_id=user,
+        owner_cloud_user_id=ctx.container.settings.owner_cloud_user_id,
+        scope_to_user=scoped,
     )
     return {
         "conversations": [
@@ -92,7 +119,15 @@ async def assistant_conversations(ctx: ToolContext, params: dict[str, Any]) -> d
 async def assistant_conversation(ctx: ToolContext, params: dict[str, Any]) -> dict[str, Any]:
     reject_unknown(params, {"task_id", "limit", "before"})
     task_id = _uuid(params.get("task_id"), "task_id")
-    task = await ctx.container.task_repo.get(task_id)
+    scoped, user = await _user_scope(ctx)
+    if scoped:
+        task = await ctx.container.task_repo.get_owned(
+            task_id,
+            cloud_user_id=user,
+            owner_cloud_user_id=ctx.container.settings.owner_cloud_user_id,
+        )
+    else:
+        task = await ctx.container.task_repo.get(task_id)
     messages, has_more = await ctx.container.task_repo.list_messages(
         task_id,
         limit=_limit(params),

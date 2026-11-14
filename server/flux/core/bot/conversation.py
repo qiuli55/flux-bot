@@ -29,6 +29,7 @@ from flux.core.model_gateway.base import ChatMessage
 from flux.core.task_engine.assistant import AssistantTurn
 from flux.core.task_engine.context_usage import CONTEXT_MESSAGE_KINDS
 from flux.core.task_engine.repository import MessageDraft
+from flux.core.user_scope import normalize_cloud_user_id
 from flux.enums import (
     BotStatus,
     DecisionMode,
@@ -149,6 +150,17 @@ class BotConversationService:
     def repository(self) -> BotTurnRepository:
         return self._turns
 
+    # --- 按人隔离 ---
+
+    def _owner(self) -> str | None:
+        return normalize_cloud_user_id(
+            getattr(self._container.settings, "owner_cloud_user_id", None)
+        )
+
+    def _current(self, cloud_user_id: str | None) -> str | None:
+        """当前轮次的人格：显式传入优先，内部调用回退配置的主用户。"""
+        return normalize_cloud_user_id(cloud_user_id) or self._owner()
+
     # --- 创建 / 查询 ---
 
     async def create_turn(
@@ -172,7 +184,14 @@ class BotConversationService:
         if not text and not files:
             raise ValidationError("消息内容不能为空", details={"field": "content"})
 
-        existing = await self._turns.find_by_client_id(bot.id, client_turn_id)
+        current = self._current(cloud_user_id)
+        existing = await self._turns.find_by_client_id(
+            bot.id,
+            client_turn_id,
+            cloud_user_id=current,
+            owner_cloud_user_id=self._owner(),
+            scoped=current is not None,
+        )
         if existing is not None:
             return existing, False
 
@@ -195,12 +214,12 @@ class BotConversationService:
                 },
             )
 
-        task = await self._chat_task(bot)
+        task = await self._chat_task(bot, current)
         turn, created = await self._turns.create(
             bot_id=bot.id,
             task_id=task.id,
             client_turn_id=client_turn_id,
-            cloud_user_id=cloud_user_id,
+            cloud_user_id=current,
         )
         if created:
             self._enqueue(
@@ -209,7 +228,7 @@ class BotConversationService:
                     bot_id=bot.id,
                     content=text,
                     files=tuple(files),
-                    cloud_user_id=cloud_user_id,
+                    cloud_user_id=current,
                 )
             )
         return turn, created
@@ -218,23 +237,79 @@ class BotConversationService:
         """按幂等键查已有轮次；频道在下载媒体前用它避免重推时重复下载。"""
         return await self._turns.find_by_client_id(bot.id, client_turn_id)
 
-    async def get_turn(self, bot_id: uuid.UUID, turn_id: uuid.UUID) -> BotTurn:
-        return await self._turns.get(bot_id, turn_id)
+    async def get_turn(
+        self,
+        bot_id: uuid.UUID,
+        turn_id: uuid.UUID,
+        *,
+        cloud_user_id: str | None = None,
+        scoped: bool = False,
+    ) -> BotTurn:
+        return await self._turns.get(
+            bot_id,
+            turn_id,
+            cloud_user_id=cloud_user_id,
+            owner_cloud_user_id=self._owner(),
+            scoped=scoped,
+        )
 
     async def list_turns(
-        self, bot_id: uuid.UUID, *, limit: int = 50, before: datetime | None = None
+        self,
+        bot_id: uuid.UUID,
+        *,
+        limit: int = 50,
+        before: datetime | None = None,
+        cloud_user_id: str | None = None,
+        scoped: bool = False,
     ) -> list[BotTurn]:
-        return await self._turns.list(bot_id, limit=limit, before=before)
+        return await self._turns.list(
+            bot_id,
+            limit=limit,
+            before=before,
+            cloud_user_id=cloud_user_id,
+            owner_cloud_user_id=self._owner(),
+            scoped=scoped,
+        )
+
+    async def chat_task_id_for(
+        self, bot: Bot, *, cloud_user_id: str | None = None
+    ) -> uuid.UUID | None:
+        """当前用户在该 Bot 下的活动对话任务 id；没有则该用户还没有历史。"""
+        task = await self._container.task_repo.find_active_chat_task(
+            bot.id,
+            cloud_user_id=self._current(cloud_user_id),
+            owner_cloud_user_id=self._owner(),
+        )
+        return task.id if task is not None else None
+
+    async def chat_task_ids_for(
+        self, bots: list[Bot], *, cloud_user_id: str | None = None
+    ) -> dict[uuid.UUID, uuid.UUID]:
+        return await self._container.task_repo.active_chat_task_ids(
+            [bot.id for bot in bots],
+            cloud_user_id=self._current(cloud_user_id),
+            owner_cloud_user_id=self._owner(),
+        )
 
     async def conversation(
-        self, bot: Bot, *, limit: int = 50, before_id: int | None = None
+        self,
+        bot: Bot,
+        *,
+        limit: int = 50,
+        before_id: int | None = None,
+        cloud_user_id: str | None = None,
     ) -> tuple[uuid.UUID | None, list[TaskMessage]]:
-        """Bot 当前对话任务的最近一页消息（seq 升序）；没有对话任务时返回空页。"""
-        if bot.chat_task_id is None:
-            return None, []
-        try:
-            task = await self._container.task_repo.get(bot.chat_task_id)
-        except NotFoundError:
+        """当前用户在该 Bot 下的最近一页消息（seq 升序）；没有对话任务时返回空页。
+
+        会话载体是「该用户自己的 chat 任务」，绝不再读 `bots.chat_task_id`——
+        那个指针可能属于另一个人。
+        """
+        task = await self._container.task_repo.find_active_chat_task(
+            bot.id,
+            cloud_user_id=self._current(cloud_user_id),
+            owner_cloud_user_id=self._owner(),
+        )
+        if task is None:
             return None, []
         messages, _ = await self._container.task_repo.list_messages(
             task.id, limit=limit, before=before_id
@@ -265,10 +340,22 @@ class BotConversationService:
         }
 
     async def wait_for_turn(
-        self, bot_id: uuid.UUID, turn_id: uuid.UUID, *, wait_seconds: float
+        self,
+        bot_id: uuid.UUID,
+        turn_id: uuid.UUID,
+        *,
+        wait_seconds: float,
+        cloud_user_id: str | None = None,
+        scoped: bool = False,
     ) -> BotTurn:
         """长轮询：终态立即返回，否则等一次状态变化或超时（不轮询数据库）。"""
-        turn = await self._turns.get(bot_id, turn_id)
+        turn = await self._turns.get(
+            bot_id,
+            turn_id,
+            cloud_user_id=cloud_user_id,
+            owner_cloud_user_id=self._owner(),
+            scoped=scoped,
+        )
         if turn.status in TERMINAL_TURN_STATUSES or wait_seconds <= 0:
             return turn
 
@@ -280,7 +367,13 @@ class BotConversationService:
                 # 先记 revision 再读库：通知若落在两者之间或进入 condition 之前，
                 # revision 会变化并触发下一轮读库，不会丢失唤醒。
                 revision = self._revisions.get(turn_id, 0)
-                turn = await self._turns.get(bot_id, turn_id)
+                turn = await self._turns.get(
+                    bot_id,
+                    turn_id,
+                    cloud_user_id=cloud_user_id,
+                    owner_cloud_user_id=self._owner(),
+                    scoped=scoped,
+                )
                 if turn.status in TERMINAL_TURN_STATUSES:
                     break
                 remaining = deadline - loop.time()
@@ -437,7 +530,14 @@ class BotConversationService:
             service = container.bot_subtasks
 
             async def _run_subtask(name: str, arguments: dict[str, Any]) -> Any:
-                return await run_subtask_tool(service, subtask_bot, name, arguments)
+                return await run_subtask_tool(
+                    service,
+                    subtask_bot,
+                    name,
+                    arguments,
+                    cloud_user_id=account_key or None,
+                    owner_cloud_user_id=self._owner(),
+                )
 
             async def _run_routine(name: str, arguments: dict[str, Any]) -> Any:
                 return await run_routine_tool(
@@ -584,21 +684,40 @@ class BotConversationService:
 
     # --- 内部：对话任务 / 队列 / worker ---
 
-    async def _chat_task(self, bot: Bot) -> Task:
-        """取 Bot 的唯一对话任务；不存在/已终态时新建一条普通 tasks 行。"""
+    async def _chat_task(self, bot: Bot, cloud_user_id: str | None = None) -> Task:
+        """取「当前用户 × 这个 Bot」的对话任务；没有就新建一条普通 tasks 行。
+
+        Phase 4 起对话任务按人隔离：同一个人复用自己最近一条未结束的 chat 任务，
+        另一个人会拿到自己的新任务。`bots.chat_task_id` 仅作为主用户/历史兼容指针，
+        绝不会被指向另一个用户的任务。
+        """
+        container = self._container
+        owner = self._owner()
+        current = self._current(cloud_user_id)
         task: Task | None = None
-        if bot.chat_task_id is not None:
+        if current is not None:
+            task = await container.task_repo.find_active_chat_task(
+                bot.id,
+                cloud_user_id=current,
+                owner_cloud_user_id=owner,
+            )
+        elif bot.chat_task_id is not None:
+            # 无法解析人（未配置主用户、也没有登录态）：保持旧行为，只复用已有指针。
             try:
-                task = await self._container.task_repo.get(bot.chat_task_id)
+                legacy = await container.task_repo.get(bot.chat_task_id)
             except NotFoundError:
-                task = None
-            if task is not None and task.status in _FINAL_TASK_STATUSES:
-                task = None
+                legacy = None
+            if legacy is not None and legacy.status not in _FINAL_TASK_STATUSES:
+                task = legacy
         if task is not None:
+            if current == owner and bot.chat_task_id != task.id:
+                # 指针原来指向别人的/已过期的任务时纠正回主用户自己的任务。
+                await container.bots.set_chat_task_id(bot.id, task.id)
+                bot.chat_task_id = task.id
             return task
 
         description = (bot.description or "").strip() or bot.name
-        task = await self._container.task_repo.create(
+        task = await container.task_repo.create(
             task_id=uuid.uuid4(),
             description=description,
             priority=100,
@@ -613,10 +732,12 @@ class BotConversationService:
             avatar_shape=bot.avatar_shape,
             avatar_color=bot.avatar_color,
             bot_id=bot.id,
-            workspace=str(self._container.bots.workspace_path(bot)),
+            workspace=str(container.bots.workspace_path(bot)),
+            cloud_user_id=current,
         )
-        await self._container.bots.set_chat_task_id(bot.id, task.id)
-        bot.chat_task_id = task.id
+        if current is None or current == owner:
+            await container.bots.set_chat_task_id(bot.id, task.id)
+            bot.chat_task_id = task.id
         return task
 
     def _enqueue(self, pending: _PendingTurn) -> None:
@@ -734,20 +855,31 @@ class BotConversationService:
             self._active_turns.pop(pending.bot_id, None)
 
     async def _memory_block(self, cloud_user_id: str | None) -> str:
-        """按本轮人格读取三层记忆（Environment + User + 共享空间 Shared）。
+        """按本轮人格读取记忆（Environment + User + 共享空间 + 本人的画像/日志）。
 
         读取失败只降级为「没有记忆块」，不影响本轮对话。没有可解析的人时，
-        MemoryService 的既有口径是回退到配置的主用户（兼容历史行为）。
+        既有口径是回退到配置的主用户（兼容历史行为）；画像/日志同样只注入
+        那个人的条目，别人的私有画像不会出现在这里。
         """
+        parts: list[str] = []
         memory = getattr(self._container, "memory", None)
-        if memory is None:
-            return ""
-        try:
-            data = await memory.recall(cloud_user_id=cloud_user_id)
-            return str(data.get("content") or "")
-        except Exception:  # noqa: BLE001 - 记忆只是上下文增强，失败不能打断 turn
-            logger.warning("Bot 记忆渲染失败，本轮仅使用 Bot 记忆", exc_info=True)
-            return ""
+        if memory is not None:
+            try:
+                data = await memory.recall(cloud_user_id=cloud_user_id)
+                content = str(data.get("content") or "")
+                if content:
+                    parts.append(content)
+            except Exception:  # noqa: BLE001 - 记忆只是上下文增强，不能打断 turn
+                logger.warning("Bot 记忆渲染失败，本轮仅使用 Bot 记忆", exc_info=True)
+        shared_user = getattr(self._container, "shared_user_memory", None)
+        if shared_user is not None:
+            try:
+                block = await shared_user.render_block(cloud_user_id=cloud_user_id)
+                if block:
+                    parts.append(block.rstrip())
+            except Exception:  # noqa: BLE001 - 画像/日志同样只是上下文增强
+                logger.warning("用户画像/日志渲染失败，本轮不注入", exc_info=True)
+        return "\n\n".join(parts)
 
     async def _skills_block(self, bot: Bot) -> str:
         """读取分配给该 Bot 的启用技能；任何失败都降级为空串，不影响本轮对话。"""

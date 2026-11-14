@@ -18,7 +18,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import ForeignKey, Index, String, Text, UniqueConstraint, Uuid
+from sqlalchemy import ForeignKey, Index, String, Text, UniqueConstraint, Uuid, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from flux.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -29,13 +29,31 @@ def _iso(value: datetime | None) -> str | None:
 
 
 class UserProfileEntry(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """用户画像的一条键值事实（name / locale / timezone ...）。"""
+    """用户画像的一条键值事实（name / locale / timezone ...）。
+
+    Phase 4 起按 Flux 云用户隔离：同一个小 key（例如 name）在两个人身上各存一份，
+    但同一个人同一个 key 仍然唯一。历史行 `cloud_user_id IS NULL` 只属于
+    `FLUX_OWNER_CLOUD_USER_ID`（读取时由 `owned_clause` 兼容）。
+    """
 
     __tablename__ = "user_profile_entries"
-    __table_args__ = (UniqueConstraint("key", name="uq_user_profile_entries_key"),)
+    __table_args__ = (
+        # 同一用户内 key 唯一；SQL NULL 在唯一约束里互不相等，所以历史 NULL 行
+        # 另用部分唯一索引兜住（旧的全表唯一约束保证最多只剩一行）。
+        UniqueConstraint("cloud_user_id", "key", name="uq_user_profile_entries_user_key"),
+        Index(
+            "uq_user_profile_entries_legacy_key",
+            "key",
+            unique=True,
+            sqlite_where=text("cloud_user_id IS NULL"),
+            postgresql_where=text("cloud_user_id IS NULL"),
+        ),
+    )
 
     key: Mapped[str] = mapped_column(String(64), nullable=False)
     value: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    #: 归属人；NULL = Phase 4 之前写入的老数据（只对主用户可见）。
+    cloud_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -51,7 +69,15 @@ class UserJournalEntry(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     __tablename__ = "user_journal_entries"
     __table_args__ = (
-        UniqueConstraint("content_hash", name="uq_user_journal_entries_hash"),
+        # 同一用户内按规范化文本去重；不同用户可以有完全相同的观察。
+        UniqueConstraint("cloud_user_id", "content_hash", name="uq_user_journal_entries_user_hash"),
+        Index(
+            "uq_user_journal_entries_legacy_hash",
+            "content_hash",
+            unique=True,
+            sqlite_where=text("cloud_user_id IS NULL"),
+            postgresql_where=text("cloud_user_id IS NULL"),
+        ),
         Index("ix_user_journal_entries_created", "created_at"),
     )
 
@@ -69,6 +95,8 @@ class UserJournalEntry(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         index=True,
         nullable=True,
     )
+    #: 归属人；NULL = Phase 4 之前写入的老数据（只对主用户可见）。
+    cloud_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
     def to_dict(self) -> dict[str, Any]:
         return {

@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
+from flux.core.user_scope import normalize_cloud_user_id, owned_clause
 from flux.enums import (
     DecisionMode,
     DecisionStatus,
@@ -136,12 +137,101 @@ class TaskRepository:
             return task
 
     async def get(self, task_id: uuid.UUID) -> Task:
-        """不存在时抛 NotFoundError（消息含 task_id）。"""
+        """不存在时抛 NotFoundError（消息含 task_id）。
+
+        这是内部/后台路径：调用方已经持有任务 id 且不面向最终用户（Agent 执行、
+        Run 桥接、恢复流程）。**REST/流式接口必须用 `get_owned`**，否则会泄露
+        别人的任务。
+        """
         async with self._session_factory() as session:
             task = await session.get(Task, task_id)
             if task is None:
                 raise NotFoundError(f"任务 {task_id} 不存在", details={"task_id": str(task_id)})
             return task
+
+    async def get_owned(
+        self,
+        task_id: uuid.UUID,
+        *,
+        cloud_user_id: str | None,
+        owner_cloud_user_id: str | None,
+    ) -> Task:
+        """按人取任务：当前用户的行，或（仅主用户）历史 NULL 行。
+
+        不属于当前人时与不存在同一口径（404），不泄露任务是否存在。
+        """
+        current = normalize_cloud_user_id(cloud_user_id) or normalize_cloud_user_id(
+            owner_cloud_user_id
+        )
+        if current is None:
+            raise NotFoundError(f"任务 {task_id} 不存在", details={"task_id": str(task_id)})
+        async with self._session_factory() as session:
+            task = await session.scalar(
+                select(Task).where(
+                    Task.id == task_id,
+                    owned_clause(Task.cloud_user_id, current, owner_cloud_user_id),
+                )
+            )
+            if task is None:
+                raise NotFoundError(f"任务 {task_id} 不存在", details={"task_id": str(task_id)})
+            return task
+
+    async def find_active_chat_task(
+        self,
+        bot_id: uuid.UUID,
+        *,
+        cloud_user_id: str | None,
+        owner_cloud_user_id: str | None,
+    ) -> Task | None:
+        """某个用户在该 Bot 下尚未结束的对话任务（Bot 会话按人隔离的载体）。"""
+        current = normalize_cloud_user_id(cloud_user_id) or normalize_cloud_user_id(
+            owner_cloud_user_id
+        )
+        if current is None:
+            return None
+        statement = (
+            select(Task)
+            .where(
+                Task.bot_id == bot_id,
+                Task.origin == TaskOrigin.CHAT.value,
+                Task.status.notin_(tuple(_TERMINAL_TASK_STATUSES)),
+                owned_clause(Task.cloud_user_id, current, owner_cloud_user_id),
+            )
+            .order_by(Task.created_at.desc(), Task.id.desc())
+            .limit(1)
+        )
+        async with self._session_factory() as session:
+            return await session.scalar(statement)
+
+    async def active_chat_task_ids(
+        self,
+        bot_ids: Sequence[uuid.UUID],
+        *,
+        cloud_user_id: str | None,
+        owner_cloud_user_id: str | None,
+    ) -> dict[uuid.UUID, uuid.UUID]:
+        """批量版 `find_active_chat_task`：bot_id → 当前用户的活动对话任务 id。"""
+        current = normalize_cloud_user_id(cloud_user_id) or normalize_cloud_user_id(
+            owner_cloud_user_id
+        )
+        if current is None or not bot_ids:
+            return {}
+        statement = (
+            select(Task.bot_id, Task.id)
+            .where(
+                Task.bot_id.in_(tuple(bot_ids)),
+                Task.origin == TaskOrigin.CHAT.value,
+                Task.status.notin_(tuple(_TERMINAL_TASK_STATUSES)),
+                owned_clause(Task.cloud_user_id, current, owner_cloud_user_id),
+            )
+            .order_by(Task.created_at.desc(), Task.id.desc())
+        )
+        async with self._session_factory() as session:
+            rows = await session.execute(statement)
+            found: dict[uuid.UUID, uuid.UUID] = {}
+            for bot_id, task_id in rows.all():
+                found.setdefault(bot_id, task_id)
+            return found
 
     async def list(
         self,
@@ -152,6 +242,9 @@ class TaskRepository:
         bot_id: uuid.UUID | None = None,
         exclude_bot_tasks: bool = False,
         limit: int = 50,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
+        scope_to_user: bool = False,
     ) -> list[Task]:
         """按创建时间倒序列出任务；project_id / status / origin 为可选过滤条件（列表页用）。
 
@@ -160,8 +253,21 @@ class TaskRepository:
 
         后台子任务（origin=subtask）默认不出现在任何任务/对话列表里：它们属于父对话的
         执行细节，有独立接口（/bots/{id}/subtasks）。显式传 origin=subtask 时才返回。
+
+        `scope_to_user=True` 用于面向用户的列表：只返回当前用户的行（历史 NULL
+        仅对主用户可见）；没有可解析的人时返回空列表（fail-closed）。内部后台
+        调用不传该参数，保持跨用户的任务可见性。
         """
         statement = select(Task).order_by(Task.created_at.desc(), Task.id.desc()).limit(limit)
+        if scope_to_user:
+            current = normalize_cloud_user_id(cloud_user_id) or normalize_cloud_user_id(
+                owner_cloud_user_id
+            )
+            if current is None:
+                return []
+            statement = statement.where(
+                owned_clause(Task.cloud_user_id, current, owner_cloud_user_id)
+            )
         if project_id is not None:
             statement = statement.where(Task.project_id == project_id)
         if status is not None:
@@ -186,6 +292,9 @@ class TaskRepository:
         keyword: str | None = None,
         include_bot_tasks: bool = False,
         limit: int = 50,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
+        scope_to_user: bool = False,
     ) -> list[ConversationSummary]:
         """对话列表 + 每条的消息条数 / 最后消息时间与摘录（助理通读全部对话用）。
 
@@ -194,6 +303,7 @@ class TaskRepository:
 
         默认排除常驻 Bot 的开工任务：它们有独立入口，混进对话列表会淹没人工对话。
         后台子任务同样默认隐藏；显式 origin=subtask 时才参与列表。
+        `scope_to_user` 的语义与 `list()` 完全一致。
         """
         stats = (
             select(
@@ -217,6 +327,15 @@ class TaskRepository:
             .order_by(func.coalesce(last.created_at, Task.created_at).desc(), Task.id.desc())
             .limit(limit)
         )
+        if scope_to_user:
+            current = normalize_cloud_user_id(cloud_user_id) or normalize_cloud_user_id(
+                owner_cloud_user_id
+            )
+            if current is None:
+                return []
+            statement = statement.where(
+                owned_clause(Task.cloud_user_id, current, owner_cloud_user_id)
+            )
         if project_id is not None:
             statement = statement.where(Task.project_id == project_id)
         if status is not None:

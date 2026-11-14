@@ -103,7 +103,11 @@ def _turn_before(value: str | None) -> datetime | None:
 
 
 async def _resolve_turn_before(
-    container: Container, bot: Bot, value: str | None
+    container: Container,
+    bot: Bot,
+    value: str | None,
+    *,
+    cloud_user_id: str | None,
 ) -> datetime | None:
     if not value:
         return None
@@ -111,12 +115,23 @@ async def _resolve_turn_before(
         turn_uuid = uuid.UUID(value)
     except ValueError:
         return _turn_before(value)
-    turn = await container.bot_conversation.get_turn(bot.id, turn_uuid)
+    turn = await container.bot_conversation.get_turn(
+        bot.id, turn_uuid, cloud_user_id=cloud_user_id, scoped=True
+    )
     return turn.created_at
 
 
-def _bot_dict(container: Container, bot: Bot, *, tokens_used: int = 0) -> dict[str, Any]:
+def _bot_dict(
+    container: Container,
+    bot: Bot,
+    *,
+    tokens_used: int = 0,
+    chat_task_id: Any = None,
+) -> dict[str, Any]:
     data = bot.to_dict()
+    # 对话任务按人隔离：响应里的 chat_task_id 必须是「当前登录人」自己的，
+    # 绝不能把 bots.chat_task_id 原样返回（它可能属于另一个人）。
+    data["chat_task_id"] = str(chat_task_id) if chat_task_id is not None else None
     # 默认工作目录是派生值，不进库；接口里直接给前端可读的绝对路径
     data["workspace_path"] = str(container.bots.workspace_path(bot))
     # 每日预算的实时用量：账本是唯一权威，按需聚合，不额外落库
@@ -127,14 +142,45 @@ def _bot_dict(container: Container, bot: Bot, *, tokens_used: int = 0) -> dict[s
     return data
 
 
-async def _bot_payload(container: Container, bot: Bot) -> dict[str, Any]:
+async def _bot_payload(
+    container: Container,
+    bot: Bot,
+    *,
+    cloud_user_id: str | None = None,
+) -> dict[str, Any]:
     usage = await container.bots.tokens_used_today()
-    return _bot_dict(container, bot, tokens_used=usage.get(bot.id, 0))
+    chat_task_id = await container.bot_conversation.chat_task_id_for(
+        bot, cloud_user_id=cloud_user_id
+    )
+    return _bot_dict(
+        container,
+        bot,
+        tokens_used=usage.get(bot.id, 0),
+        chat_task_id=chat_task_id,
+    )
 
 
-async def _bot_payloads(container: Container, bots: list[Bot]) -> list[dict[str, Any]]:
+async def _bot_payloads(
+    container: Container,
+    bots: list[Bot],
+    *,
+    cloud_user_id: str | None = None,
+) -> list[dict[str, Any]]:
     usage = await container.bots.tokens_used_today() if bots else {}
-    return [_bot_dict(container, bot, tokens_used=usage.get(bot.id, 0)) for bot in bots]
+    chat_task_ids = (
+        await container.bot_conversation.chat_task_ids_for(bots, cloud_user_id=cloud_user_id)
+        if bots
+        else {}
+    )
+    return [
+        _bot_dict(
+            container,
+            bot,
+            tokens_used=usage.get(bot.id, 0),
+            chat_task_id=chat_task_ids.get(bot.id),
+        )
+        for bot in bots
+    ]
 
 
 @router.get("")
@@ -142,6 +188,7 @@ async def list_bots(
     status: str | None = None,
     limit: int = 100,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """列出全部 Bot；status=active / paused 用于分组展示。"""
     if status is not None:
@@ -156,14 +203,16 @@ async def list_bots(
         raise BadRequestError("limit 必须在 1~200 之间", details={"limit": limit})
     bots = await container.bots.list(status=status, limit=limit)
     return ok(
-        await _bot_payloads(container, bots),
+        await _bot_payloads(container, bots, cloud_user_id=cloud_user_id),
         metadata={"count": len(bots)},
     )
 
 
 @router.post("")
 async def create_bot(
-    payload: BotCreateRequest, container: Container = Depends(get_container)
+    payload: BotCreateRequest,
+    container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """创建 Bot。带 schedule 时立刻算出 next_run_at，后台调度器随即接管。"""
     bot = await container.bots.create(
@@ -188,7 +237,7 @@ async def create_bot(
         allowed_commands=payload.allowed_commands,
         allowed_paths=payload.allowed_paths,
     )
-    return ok(await _bot_payload(container, bot))
+    return ok(await _bot_payload(container, bot, cloud_user_id=cloud_user_id))
 
 
 # --- 固定路径必须排在 /{bot_id} 之前，否则会被路径参数吃掉 ---
@@ -306,9 +355,13 @@ async def delete_bot_routine(
 
 
 @router.get("/{bot_id}")
-async def get_bot(bot_id: str, container: Container = Depends(get_container)) -> dict[str, object]:
+async def get_bot(
+    bot_id: str,
+    container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
+) -> dict[str, object]:
     bot = await container.bots.get(_bot_id(bot_id))
-    return ok(await _bot_payload(container, bot))
+    return ok(await _bot_payload(container, bot, cloud_user_id=cloud_user_id))
 
 
 @router.patch("/{bot_id}")
@@ -316,11 +369,12 @@ async def update_bot(
     bot_id: str,
     payload: BotUpdateRequest,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """部分更新：只改请求里出现的字段（exclude_unset 保留「没传」与「传 null」的区别）。"""
     changes = payload.model_dump(exclude_unset=True)
     bot = await container.bots.update(_bot_id(bot_id), changes)
-    return ok(await _bot_payload(container, bot))
+    return ok(await _bot_payload(container, bot, cloud_user_id=cloud_user_id))
 
 
 @router.post("/{bot_id}/model")
@@ -328,6 +382,7 @@ async def set_bot_model(
     bot_id: str,
     payload: TaskModelRequest,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """切换 Bot 的默认执行模型；`model` 留空 = 回到平台默认。
 
@@ -338,7 +393,7 @@ async def set_bot_model(
         _bot_id(bot_id),
         {"model": payload.model, "key_id": payload.key_id},
     )
-    return ok(await _bot_payload(container, bot))
+    return ok(await _bot_payload(container, bot, cloud_user_id=cloud_user_id))
 
 
 @router.delete("/{bot_id}")
@@ -356,6 +411,7 @@ async def run_bot(
     bot_id: str,
     payload: BotRunRequest | None = None,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """手动开工一次。`instruction` 留空则用 Bot 自己的 description。"""
     target = _bot_id(bot_id)
@@ -363,7 +419,12 @@ async def run_bot(
         target, instruction=(payload.instruction if payload else None)
     )
     bot = await container.bots.get(target)
-    return ok({"bot": await _bot_payload(container, bot), "task": task.to_dict()})
+    return ok(
+        {
+            "bot": await _bot_payload(container, bot, cloud_user_id=cloud_user_id),
+            "task": task.to_dict(),
+        }
+    )
 
 
 @router.get("/{bot_id}/tasks")
@@ -372,6 +433,7 @@ async def list_bot_tasks(
     status: str | None = None,
     limit: int = 50,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """某个 Bot 的开工记录（按创建时间倒序）。"""
     target = await container.bots.get(_bot_id(bot_id))
@@ -386,7 +448,14 @@ async def list_bot_tasks(
             ) from exc
     if limit < 1 or limit > 200:
         raise BadRequestError("limit 必须在 1~200 之间", details={"limit": limit})
-    tasks = await container.task_repo.list(bot_id=target.id, status=wanted, limit=limit)
+    tasks = await container.task_repo.list(
+        bot_id=target.id,
+        status=wanted,
+        limit=limit,
+        cloud_user_id=cloud_user_id,
+        owner_cloud_user_id=container.settings.owner_cloud_user_id,
+        scope_to_user=True,
+    )
     return ok([t.to_dict() for t in tasks], metadata={"count": len(tasks)})
 
 
@@ -422,13 +491,18 @@ async def list_bot_turns(
     limit: int = 50,
     before: str | None = None,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
-    """最近的 Bot 对话轮次（按创建时间倒序）；before 为上一页最后一条的 created_at。"""
+    """当前用户最近的 Bot 对话轮次（按创建时间倒序）；before 为上一页最后一条的 created_at。"""
     bot = await container.bots.get(_bot_id(bot_id))
     if limit < 1 or limit > 200:
         raise BadRequestError("limit 必须在 1~200 之间", details={"limit": limit})
     turns = await container.bot_conversation.list_turns(
-        bot.id, limit=limit, before=await _resolve_turn_before(container, bot, before)
+        bot.id,
+        limit=limit,
+        before=await _resolve_turn_before(container, bot, before, cloud_user_id=cloud_user_id),
+        cloud_user_id=cloud_user_id,
+        scoped=True,
     )
     payloads = [await container.bot_conversation.turn_payload(turn) for turn in turns]
     return ok(
@@ -446,13 +520,18 @@ async def get_bot_turn(
     turn_id: str,
     wait: float = Query(default=0, ge=0, le=30),
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """查询一轮对话；`wait` 秒内等待状态变化（长轮询），终态立即返回。"""
     target_bot = _bot_id(bot_id)
     target_turn = _turn_id(turn_id)
     await container.bots.get(target_bot)
     turn = await container.bot_conversation.wait_for_turn(
-        target_bot, target_turn, wait_seconds=wait
+        target_bot,
+        target_turn,
+        wait_seconds=wait,
+        cloud_user_id=cloud_user_id,
+        scoped=True,
     )
     return ok({"turn": await container.bot_conversation.turn_payload(turn)})
 
@@ -463,18 +542,22 @@ async def stream_bot_turn(
     turn_id: str,
     after_seq: int = 0,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> StreamingResponse:
     """一轮对话的 SSE 增量（assistant_start / delta / message / error）。
 
     `bot_turns` 仍是真相源；这里只是把 task_stream 中带同一 turn_id 的事件转发出去。
     回合已结束时先补缓冲再关闭连接，避免客户端连上来后一直等不到收尾。
+    别人的 turn_id 按不存在处理（404），不会建立流。
     """
     target_bot = _bot_id(bot_id)
     target_turn = _turn_id(turn_id)
     if after_seq < 0:
         raise BadRequestError("after_seq 不能为负数", details={"after_seq": after_seq})
     await container.bots.get(target_bot)
-    turn = await container.bot_conversation.get_turn(target_bot, target_turn)
+    turn = await container.bot_conversation.get_turn(
+        target_bot, target_turn, cloud_user_id=cloud_user_id, scoped=True
+    )
     terminal = {"completed", "failed", "cancelled"}
 
     def _format(event: Any) -> str:
@@ -495,7 +578,12 @@ async def stream_bot_turn(
                 continue
             yield _format(event)
             if event.type in ("assistant_message", "assistant_error"):
-                current = await container.bot_conversation.get_turn(target_bot, target_turn)
+                current = await container.bot_conversation.get_turn(
+                    target_bot,
+                    target_turn,
+                    cloud_user_id=cloud_user_id,
+                    scoped=True,
+                )
                 if current.status in terminal:
                     return
 
@@ -516,6 +604,7 @@ async def get_bot_conversation(
     limit: int = 50,
     before_id: str | None = None,
     container: Container = Depends(get_container),
+    cloud_user_id: str | None = Depends(get_current_cloud_user_id),
 ) -> dict[str, object]:
     """Bot 当前对话任务的消息（seq 升序）；还没有对话时返回空列表。
 
@@ -529,14 +618,20 @@ async def get_bot_conversation(
     if before_id:
         if before_id.isdigit():
             before_seq = int(before_id)
-        elif bot.chat_task_id is not None:
-            message = await container.task_repo.get_message(
-                bot.chat_task_id, _parse_message_uuid(before_id)
+        else:
+            # 游标也必须落在「当前人自己的对话任务」上，不能借 bot.chat_task_id
+            # 换算到另一个人的消息 seq。
+            chat_task_id = await container.bot_conversation.chat_task_id_for(
+                bot, cloud_user_id=cloud_user_id
             )
-            if message is not None:
-                before_seq = message.seq
+            if chat_task_id is not None:
+                message = await container.task_repo.get_message(
+                    chat_task_id, _parse_message_uuid(before_id)
+                )
+                if message is not None:
+                    before_seq = message.seq
     chat_task_id, messages = await container.bot_conversation.conversation(
-        bot, limit=limit, before_id=before_seq
+        bot, limit=limit, before_id=before_seq, cloud_user_id=cloud_user_id
     )
     return ok(
         {

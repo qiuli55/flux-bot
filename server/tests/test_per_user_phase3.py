@@ -178,8 +178,14 @@ class _FakeDingTalkSender:
         return None
 
 
-def _wait_turn(client: TestClient, bot_id: str, turn_id: str) -> dict[str, Any]:
-    response = client.get(f"{PREFIX}/bots/{bot_id}/turns/{turn_id}", params={"wait": 5})
+def _wait_turn(
+    client: TestClient, bot_id: str, turn_id: str, *, user: str | None = None
+) -> dict[str, Any]:
+    response = client.get(
+        f"{PREFIX}/bots/{bot_id}/turns/{turn_id}",
+        params={"wait": 5},
+        headers=_auth(user) if user is not None else None,
+    )
     assert response.status_code == 200, response.text
     return response.json()["data"]["turn"]
 
@@ -395,7 +401,7 @@ def test_bound_sender_runs_turn_as_that_user(settings: Settings, db_schema: None
         assert response.status_code == 200, response.text
         turns = asyncio.run(container.bot_conversation.list_turns(bot_id))
         assert len(turns) == 1 and turns[0].cloud_user_id == USER_A
-        done = _wait_turn(client, bot["id"], str(turns[0].id))
+        done = _wait_turn(client, bot["id"], str(turns[0].id), user=USER_A)
         assert done["status"] == "completed", done
 
         call = assistant.calls[-1]
@@ -531,6 +537,7 @@ def test_outbound_decision_cannot_be_resolved_by_another_user(
                 priority=100,
                 project_id=None,
                 agent_id=None,
+                cloud_user_id=USER_A,
             )
             return await container.task_repo.raise_decision(
                 task.id,

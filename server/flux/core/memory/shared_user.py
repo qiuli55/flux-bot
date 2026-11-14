@@ -22,14 +22,22 @@ import hashlib
 import re
 import uuid
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 from flux.core.memory.secrets import ensure_no_secret
 from flux.core.memory.shared_user_repository import SharedUserMemoryRepository
-from flux.errors import NotFoundError, ValidationError
+from flux.core.user_scope import normalize_cloud_user_id
+from flux.errors import NotFoundError, PermissionDeniedError, ValidationError
 from flux.logging import get_logger
 from flux.models.shared_user_memory import UserJournalEntry
 
+if TYPE_CHECKING:  # pragma: no cover - 仅类型标注，避免 core 反向依赖
+    from flux.config import Settings
+
 logger = get_logger(__name__)
+
+#: 无法确定"这是谁"时的稳定错误码（与 devices / memory / keys 一致）。
+CLOUD_LOGIN_REQUIRED = "cloud_login_required"
 
 #: 画像允许的 key（ASCII）：未知 key 一律拒绝，避免把任意键塞进共享上下文。
 PROFILE_KEYS: tuple[str, ...] = (
@@ -74,16 +82,61 @@ def _clip(text: str, limit: int) -> str:
 
 
 class SharedUserMemoryService:
-    def __init__(self, repository: SharedUserMemoryRepository) -> None:
+    def __init__(
+        self, repository: SharedUserMemoryRepository, settings: Settings | None = None
+    ) -> None:
         self._repo = repository
+        self._settings = settings
+
+    # --- 按人隔离 ---
+
+    def _owner(self) -> str | None:
+        return normalize_cloud_user_id(getattr(self._settings, "owner_cloud_user_id", None))
+
+    def _scope(
+        self,
+        cloud_user_id: str | None,
+        owner_cloud_user_id: str | None = None,
+    ) -> tuple[str | None, str | None]:
+        """当前人 + 主用户兜底：显式传入优先，内部调用回退配置的主用户。"""
+        owner = normalize_cloud_user_id(owner_cloud_user_id) or self._owner()
+        current = normalize_cloud_user_id(cloud_user_id) or owner
+        return current, owner
+
+    def _require_scope(
+        self,
+        cloud_user_id: str | None,
+        owner_cloud_user_id: str | None = None,
+    ) -> tuple[str, str | None]:
+        current, owner = self._scope(cloud_user_id, owner_cloud_user_id)
+        if current is None:
+            raise PermissionDeniedError(
+                "该操作需要 Flux 账号登录（或由部署方设置 FLUX_OWNER_CLOUD_USER_ID）",
+                code=CLOUD_LOGIN_REQUIRED,
+                details={
+                    "hint": "请先登录账号云；本机 CLI / 主用户可配置 FLUX_OWNER_CLOUD_USER_ID"
+                },
+            )
+        return current, owner
 
     # --- 画像（唯一写入口；仅供用户侧画像 API 调用）---
 
-    async def get_profile(self) -> dict[str, str]:
-        profile = await self._repo.get_profile()
+    async def get_profile(
+        self, *, cloud_user_id: str | None = None, owner_cloud_user_id: str | None = None
+    ) -> dict[str, str]:
+        current, owner = self._scope(cloud_user_id, owner_cloud_user_id)
+        if current is None:
+            return {}
+        profile = await self._repo.get_profile(cloud_user_id=current, owner_cloud_user_id=owner)
         return {key: profile[key] for key in PROFILE_KEYS if key in profile}
 
-    async def put_profile(self, values: Mapping[str, str]) -> dict[str, str]:
+    async def put_profile(
+        self,
+        values: Mapping[str, str],
+        *,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
+    ) -> dict[str, str]:
         """按键覆盖写入画像；未知 key、空 key、空值、超长值都拒绝。"""
         if not isinstance(values, Mapping):
             raise ValidationError("画像必须是 key/value 映射")
@@ -109,18 +162,30 @@ class SharedUserMemoryService:
                 )
             ensure_no_secret(value, where=f"用户画像 {key}")
             updates[key] = value
+        current, owner = self._require_scope(cloud_user_id, owner_cloud_user_id)
         if not updates:
-            return await self.get_profile()
-        return await self._repo.upsert_profile(updates)
+            return await self.get_profile(cloud_user_id=current, owner_cloud_user_id=owner)
+        return await self._repo.upsert_profile(
+            updates, cloud_user_id=current, owner_cloud_user_id=owner
+        )
 
-    async def delete_profile(self, key: str) -> None:
+    async def delete_profile(
+        self,
+        key: str,
+        *,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
+    ) -> None:
         clean = (key or "").strip()
         if clean not in PROFILE_KEY_SET:
             raise ValidationError(
                 f"未知的画像 key：{clean}",
                 details={"field": "key", "allowed_keys": list(PROFILE_KEYS)},
             )
-        if not await self._repo.delete_profile(clean):
+        current, owner = self._require_scope(cloud_user_id, owner_cloud_user_id)
+        if not await self._repo.delete_profile(
+            clean, cloud_user_id=current, owner_cloud_user_id=owner
+        ):
             raise NotFoundError(f"画像 {clean} 不存在", details={"key": clean})
 
     # --- 共享日志（唯一写入口；永远去重）---
@@ -131,6 +196,8 @@ class SharedUserMemoryService:
         content: str,
         source: str = "user",
         source_bot_id: uuid.UUID | str | None = None,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
     ) -> tuple[UserJournalEntry, bool]:
         """追加一条共享日志；返回 (row, created)，重复内容 created=False。"""
         source_value = source.strip().lower() if isinstance(source, str) else ""
@@ -165,11 +232,14 @@ class SharedUserMemoryService:
                         details={"field": "source_bot_id"},
                     ) from exc
 
+        current, owner = self._require_scope(cloud_user_id, owner_cloud_user_id)
         row, created = await self._repo.insert_journal(
             content=text,
             content_hash=journal_content_hash(text),
             source=source_value,
             source_bot_id=bot_id,
+            cloud_user_id=current,
+            owner_cloud_user_id=owner,
         )
         if created:
             logger.info(
@@ -182,16 +252,52 @@ class SharedUserMemoryService:
             logger.info("共享用户日志去重跳过 id=%s source=%s", row.id, source_value)
         return row, created
 
-    async def list_journal(self, *, limit: int = 20, offset: int = 0) -> list[UserJournalEntry]:
-        return await self._repo.list_journal(limit=limit, offset=offset)
+    async def list_journal(
+        self,
+        *,
+        limit: int = 20,
+        offset: int = 0,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
+    ) -> list[UserJournalEntry]:
+        current, owner = self._scope(cloud_user_id, owner_cloud_user_id)
+        if current is None:
+            return []
+        return await self._repo.list_journal(
+            cloud_user_id=current,
+            owner_cloud_user_id=owner,
+            limit=limit,
+            offset=offset,
+        )
 
-    async def delete_journal(self, entry_id: uuid.UUID) -> None:
-        if not await self._repo.delete_journal(entry_id):
+    async def delete_journal(
+        self,
+        entry_id: uuid.UUID,
+        *,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
+    ) -> None:
+        current, owner = self._require_scope(cloud_user_id, owner_cloud_user_id)
+        if not await self._repo.delete_journal(
+            entry_id, cloud_user_id=current, owner_cloud_user_id=owner
+        ):
             raise NotFoundError(f"共享日志 {entry_id} 不存在", details={"entry_id": str(entry_id)})
 
-    async def combined(self, *, journal_limit: int = 20) -> dict[str, object]:
-        profile = await self.get_profile()
-        journal = await self.list_journal(limit=journal_limit)
+    async def combined(
+        self,
+        *,
+        journal_limit: int = 20,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
+    ) -> dict[str, object]:
+        profile = await self.get_profile(
+            cloud_user_id=cloud_user_id, owner_cloud_user_id=owner_cloud_user_id
+        )
+        journal = await self.list_journal(
+            limit=journal_limit,
+            cloud_user_id=cloud_user_id,
+            owner_cloud_user_id=owner_cloud_user_id,
+        )
         return {
             "profile": profile,
             "journal": [row.to_dict() for row in journal],
@@ -199,10 +305,26 @@ class SharedUserMemoryService:
 
     # --- 注入 ---
 
-    async def render_block(self) -> str:
-        """渲染一段预算内的共享记忆；没有任何内容时返回空串。"""
-        profile = await self.get_profile()
-        journal = await self._repo.list_journal(limit=JOURNAL_RECALL_LIMIT)
+    async def render_block(
+        self,
+        *,
+        cloud_user_id: str | None = None,
+        owner_cloud_user_id: str | None = None,
+    ) -> str:
+        """渲染当前人自己的画像 + 日志；没有任何内容时返回空串。
+
+        只注入这一个用户的条目：别人的画像/日志不会出现在这段上下文里，
+        两个人的共享内容应走 `shared` 空间记忆。
+        """
+        current, owner = self._scope(cloud_user_id, owner_cloud_user_id)
+        if current is None:
+            return ""
+        profile = await self.get_profile(cloud_user_id=current, owner_cloud_user_id=owner)
+        journal = await self._repo.list_journal(
+            cloud_user_id=current,
+            owner_cloud_user_id=owner,
+            limit=JOURNAL_RECALL_LIMIT,
+        )
         if not profile and not journal:
             return ""
 
