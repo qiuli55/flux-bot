@@ -376,14 +376,27 @@ def _dingtalk_settings(settings: Settings, **updates: object) -> Settings:
 
 
 @contextmanager
-def _callback_client(settings: Settings) -> Iterator[tuple[TestClient, Container, dict]]:
-    """起 app、建一个 Bot、把频道指向它，并替换掉真实模型与发送端。"""
+def _callback_client(
+    settings: Settings, *, outbound_rule: bool = True
+) -> Iterator[tuple[TestClient, Container, dict]]:
+    """起 app、建一个 Bot、把频道指向它，并替换掉真实模型与发送端。
+
+    默认插入一条 outbound_message 规则；验证默认零审批的用例传 `outbound_rule=False`。
+    """
     with _app(_dingtalk_settings(settings)) as (client, container):
         asyncio.run(
             container.channel_bindings.bind(
                 channel="dingtalk", external_user_id=STAFF_ID, cloud_user_id="1"
             )
         )
+        if outbound_rule:
+            asyncio.run(
+                container.approval_rules.create(
+                    cloud_user_id="1",
+                    rule_type="outbound_message",
+                    params={"channel": "dingtalk"},
+                )
+            )
         container.assistant = _FakeAssistant()  # type: ignore[assignment]
         created = client.post(f"{PREFIX}/bots", json={"name": "钉钉小助", "description": "接钉钉"})
         assert created.status_code == 200, created.text
@@ -912,7 +925,33 @@ async def test_inbound_media_accepts_image_and_voice_aliases(settings: Settings)
     await channel.aclose()
 
 
-# --- 入站 → 审批草稿 → 允许/拒绝 ---
+def _wait_sent(client: TestClient, task_id: str, timeout: float = 8.0) -> list[dict]:
+    deadline = time.monotonic() + timeout
+    rows: list[dict] = []
+    while time.monotonic() < deadline:
+        data = client.get(f"{PREFIX}/outbound-drafts", params={"channel": "dingtalk"}).json()[
+            "data"
+        ]
+        rows = [row for row in data if row["task_id"] == task_id and row["status"] == "sent"]
+        if rows:
+            return rows
+        time.sleep(0.02)
+    raise AssertionError("等待自动发送超时")
+
+
+def test_no_outbound_rule_auto_sends_without_a_card(settings: Settings, db_schema: None) -> None:
+    with _callback_client(settings, outbound_rule=False) as (client, _container, context):
+        query, raw = _encrypted_request(_message_payload())
+        _assert_encrypted_success(client.post(WEBHOOK, params=query, content=raw))
+        bot = client.get(f"{PREFIX}/bots/{context['bot']['id']}").json()["data"]
+        sent = _wait_sent(client, bot["chat_task_id"])
+        assert context["sender"].messages[0][1] == "echo: 你好"
+        assert sent[0]["decision_id"] is None
+        task = client.get(f"{PREFIX}/tasks/{bot['chat_task_id']}").json()["data"]
+        assert task["pending_decision"] is None
+
+
+# --- 命中出站规则 → 审批草稿 → 允许/拒绝 ---
 
 
 def test_inbound_creates_turn_but_never_sends_automatically(

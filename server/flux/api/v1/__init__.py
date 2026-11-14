@@ -4,6 +4,7 @@ from fastapi import APIRouter
 
 from flux.api.v1 import (
     agents,
+    approval_rules,
     billing,
     bot_subtasks,
     bots,
@@ -55,6 +56,8 @@ api_v1_router.include_router(installations.router)
 api_v1_router.include_router(tasks.router)
 api_v1_router.include_router(bots.router)
 api_v1_router.include_router(outbound_drafts.router)
+# 全局审批规则：按云用户隔离，默认零审批；写入口只对登录用户开放。
+api_v1_router.include_router(approval_rules.router)
 api_v1_router.include_router(bot_subtasks.router)
 api_v1_router.include_router(desktop.router)
 api_v1_router.include_router(devices.router)

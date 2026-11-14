@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from flux.core.mcp.tools.approval_rule_tools import approval_rule_tools
 from flux.core.mcp.tools.base import ToolContext, ToolSpec
 from flux.core.mcp.tools.delivery_tools import delivery_tools
 from flux.core.mcp.tools.design_tools import design_tools
@@ -42,6 +43,8 @@ ALL_TOOLS: tuple[ToolSpec, ...] = (
     *supervisor_tools(),
     *knowledge_tools(),
     *routine_tools(),
+    # Bot 只能新增 / 查看审批规则；没有 update / delete 工具（不允许放宽）。
+    *approval_rule_tools(),
     *permission_tools(),
 )
 

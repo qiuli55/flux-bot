@@ -35,6 +35,10 @@ APPROVAL_KIND_HIGH_RISK = "high_risk_command"
 APPROVAL_KIND_PROTECTED = "protected_access"
 #: Claude Code `--permission-prompt-tool` 转来的工具级审批（正常模式的无头运行）
 APPROVAL_KIND_TOOL_PROMPT = "tool_permission_prompt"
+#: 用户规则命中但命令分类为低风险时使用的通用卡片类型
+APPROVAL_KIND_RULE_MATCH = "rule_match"
+#: 支付规则命中时的卡片类型（未来支付集成直接复用）
+APPROVAL_KIND_PAYMENT_AMOUNT = "payment_amount"
 
 #: 审批卡上的两个选项（label 就是回传给 choose 接口的值）
 APPROVAL_ALLOW = "允许"
@@ -184,11 +188,12 @@ async def raise_approval(
         },
     )
     logger.info(
-        "approval.raised task=%s run=%s kind=%s rule=%s decision=%s",
+        "approval.raised task=%s run=%s kind=%s rule=%s approval_rule=%s decision=%s",
         task_id,
         run_id,
         kind,
         meta.get("rule"),
+        meta.get("approval_rule_id"),
         record["id"],
     )
     return record

@@ -30,6 +30,10 @@ from flux.core.channels.outbound_media import (
 from flux.core.context.budget import history_message_limit
 from flux.core.github.service import normalize_account_key
 from flux.core.github.tools import GITHUB_TOOLS, run_github_tool
+from flux.core.mcp.tools.approval_rule_tools import (
+    APPROVAL_RULE_TOOLS,
+    run_approval_rule_tool,
+)
 from flux.core.mcp.tools.routine_tools import ROUTINE_TOOLS, run_routine_tool
 from flux.core.model_gateway.base import ChatMessage
 from flux.core.task_engine.assistant import AssistantTurn
@@ -556,6 +560,16 @@ class BotConversationService:
                     cloud_user_id=account_key or None,
                 )
 
+            async def _run_approval_rule(name: str, arguments: dict[str, Any]) -> Any:
+                return await run_approval_rule_tool(
+                    container.approval_rules,
+                    subtask_bot,
+                    name,
+                    arguments,
+                    cloud_user_id=account_key or None,
+                    owner_cloud_user_id=self._owner(),
+                )
+
             existing_runner = tool_kwargs.get("tool_runner")
 
             async def _run_bot_tool(name: str, arguments: dict[str, Any]) -> Any:
@@ -567,6 +581,8 @@ class BotConversationService:
                     return await _run_subtask(name, arguments)
                 if name.startswith("routine_"):
                     return await _run_routine(name, arguments)
+                if name.startswith("approval_rule_"):
+                    return await _run_approval_rule(name, arguments)
                 if existing_runner is not None:
                     return await existing_runner(name, arguments)
                 raise BadRequestError(f"当前对话不支持工具 {name}", details={"tool": name})
@@ -575,6 +591,7 @@ class BotConversationService:
                 *tool_kwargs.get("tools", []),
                 *SUBTASK_TOOLS,
                 *ROUTINE_TOOLS,
+                *APPROVAL_RULE_TOOLS,
                 *ATTACH_FILE_TOOLS,
             ]
             tool_kwargs["tool_runner"] = _run_bot_tool
@@ -594,6 +611,13 @@ class BotConversationService:
                 "ISO 8601 时刻，二者都按 Bot 自己的时区解释且不能同时使用；"
                 "只跑一次的用 run_at，不要写成 cron。"
             )
+            approval_rule_note = (
+                "默认情况下任何操作都不需要审批。用户说「某类操作前先问我」"
+                "（例如「支付超过 500 元先问我」「执行 rm 先问我」）时，调用 "
+                "approval_rule_add 为当前 Bot 所属用户添加规则；规则对该用户的所有 Bot "
+                "生效。Bot 只能新增更严格的规则，不能删除、停用或放宽；"
+                "修改前先用 approval_rule_list 查看已有规则，避免重复添加。"
+            )
             attach_note = (
                 "需要把图片或文件发给用户时，调用 attach_file 登记出站附件：path 必须是 "
                 "Bot 工作区内的文件，或提供已上传附件的 upload_id。attach_file 只登记、"
@@ -601,7 +625,15 @@ class BotConversationService:
             )
             existing_note = str(tool_kwargs.get("tools_note") or "").strip()
             notes = [
-                note for note in (existing_note, subtask_note, routine_note, attach_note) if note
+                note
+                for note in (
+                    existing_note,
+                    subtask_note,
+                    routine_note,
+                    approval_rule_note,
+                    attach_note,
+                )
+                if note
             ]
             tool_kwargs["tools_note"] = "\n".join(notes)
         try:

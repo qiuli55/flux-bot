@@ -41,6 +41,11 @@ class Events:
     #: 审批闸门事件：发起（审批卡写入对话）与结果（允许/拒绝/超时）各发一次。
     APPROVAL_REQUESTED = "task.approval_requested"
     APPROVAL_RESOLVED = "task.approval_resolved"
+    #: 全局审批规则（按云用户）：新增 / 修改 / 删除各发一次。载荷只含 id、归属、
+    #: 类型、启用状态与创建者，不含参数原文或任何密钥。
+    APPROVAL_RULE_CREATED = "approval_rule.created"
+    APPROVAL_RULE_UPDATED = "approval_rule.updated"
+    APPROVAL_RULE_DELETED = "approval_rule.deleted"
     CONNECTOR_EXECUTED = "connector.executed"
     WORKSPACE_CHANGED = "workspace.changed"
     #: Apply 整批成功（上下文闭环）：载荷含 batch_id / files / task_id / project_id /

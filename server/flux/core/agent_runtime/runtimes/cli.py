@@ -76,18 +76,25 @@ from flux.core.agent_runtime.runtimes.opencode_server import (
     serve_argv,
 )
 from flux.core.agent_runtime.supervisor import RunSupervisor
+from flux.core.approval_rules.evaluator import (
+    ACTION_TERMINAL_COMMAND,
+    ApprovalAction,
+    ensure_outcome_allowed,
+    evaluate_approval,
+    raise_rule_approval,
+)
 from flux.core.billing.sources import resolve_default_model
 from flux.core.event.bus import EventBus, Events
 from flux.core.mcp.auth import AgentTokenService
 from flux.core.permissions.modes import normalize_mode, scopes_for_mode
-from flux.core.permissions.risk import LEVEL_HIGH, LEVEL_LOW, LEVEL_PROTECTED, classify_command
+from flux.core.permissions.risk import LEVEL_HIGH, LEVEL_PROTECTED, classify_command
 from flux.core.task_engine.approvals import (
     APPROVAL_KIND_HIGH_RISK,
     APPROVAL_KIND_PROTECTED,
+    APPROVAL_KIND_RULE_MATCH,
     APPROVAL_TIMEOUT_SECONDS,
-    raise_approval,
-    wait_for_approval,
 )
+from flux.core.user_scope import normalize_cloud_user_id
 from flux.enums import Capability, DshRunStatus, PermissionMode
 from flux.errors import ConfigurationError
 from flux.logging import get_logger
@@ -2893,9 +2900,9 @@ async def approve_native_command(
 ) -> bool:
     """CLI 原生 shell 的一条命令要不要放行。
 
-    Normal 下高风险命令让用户点；Full 下只有受保护对象才问；
-    Unattended 下全部放行（无人值守，用户明确要求不被打断）；
-    低风险直接放行。拿不到任务或审批链路异常时失败关闭（命令不执行）。
+    默认零审批：只有命中该用户审批规则时才挂卡，规则在所有权限模式下都生效
+    （包括 Full / Unattended）。分类结果只用于命中后的卡片文案。
+    Plan 模式仍是硬拒绝；拿不到任务时同样拒绝（没有归属就无法匹配规则）。
     """
     if container is None or normalize_mode(mode) == PermissionMode.PLAN.value:
         return False
@@ -2907,29 +2914,48 @@ async def approve_native_command(
 
     report = classify_command(command)
     mode_value = normalize_mode(mode)
-    if mode_value == PermissionMode.UNATTENDED.value:
-        # 免审核（无人值守）：原生 shell 也不再打断用户，只留审计日志
-        logger.warning(
-            "native_approval.unattended_allow run=%s rule=%s level=%s command=%s",
-            run_id,
-            report.rule,
-            report.level,
-            command[:200],
+    task = await container.task_repo.get(task_id)
+    cloud_user_id = normalize_cloud_user_id(getattr(task, "cloud_user_id", None))
+    if cloud_user_id is None:
+        cloud_user_id = normalize_cloud_user_id(
+            getattr(container.settings, "owner_cloud_user_id", None)
         )
-        return True
-    if report.level == LEVEL_LOW:
-        return True
-    if report.level == LEVEL_HIGH and mode_value == PermissionMode.FULL.value:
-        # 完全访问：高风险命令不再逐步审批（受保护对象除外）
+    match = await evaluate_approval(
+        container,
+        cloud_user_id=cloud_user_id,
+        action=ApprovalAction(
+            kind=ACTION_TERMINAL_COMMAND,
+            command=command,
+            tool_name="terminal.execute",
+        ),
+    )
+    logger.info(
+        "native_approval.rule_check run=%s mode=%s level=%s rule=%s approval_rule=%s",
+        run_id,
+        mode_value,
+        report.level,
+        report.rule,
+        match.rule.id if match is not None else None,
+    )
+    if match is None:
         return True
 
-    protected = report.level == LEVEL_PROTECTED
-    record = await raise_approval(
+    if report.level == LEVEL_PROTECTED:
+        kind = APPROVAL_KIND_PROTECTED
+        title = "受保护操作 · 需要你确认"
+    elif report.level == LEVEL_HIGH:
+        kind = APPROVAL_KIND_HIGH_RISK
+        title = "高风险命令 · 需要你确认"
+    else:
+        kind = APPROVAL_KIND_RULE_MATCH
+        title = "命令命中审批规则 · 需要你确认"
+    outcome = await raise_rule_approval(
         container,
+        match=match,
         task_id=task_id,
         run_id=run_id,
-        kind=APPROVAL_KIND_PROTECTED if protected else APPROVAL_KIND_HIGH_RISK,
-        title="受保护操作 · 需要你确认" if protected else "高风险命令 · 需要你确认",
+        kind=kind,
+        title=title,
         detail=report.reason,
         meta={
             "command": command,
@@ -2938,20 +2964,15 @@ async def approve_native_command(
             "permission_mode": mode_value,
         },
     )
-    outcome = await wait_for_approval(
-        container,
-        task_id=task_id,
-        decision_id=str(record["id"]),
-        run_id=run_id,
-    )
     logger.info(
-        "native_approval.resolved run=%s decision=%s outcome=%s rule=%s",
+        "native_approval.resolved run=%s outcome=%s rule=%s approval_rule=%s",
         run_id,
-        record["id"],
         outcome,
         report.rule,
+        match.rule.id,
     )
-    return outcome == "allowed"
+    ensure_outcome_allowed(match, outcome)
+    return True
 
 
 def build_cli_runtime(
